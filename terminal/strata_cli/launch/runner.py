@@ -710,6 +710,10 @@ def derive_config(base: dict, s: S.LaunchSettings, *, bool_flags: frozenset[str]
             cfg.pop(key, None)
         else:
             cfg[key] = value
+    if isinstance(prev, dict):
+        for _dc_key in ("disk_cache_path", "disk_cache_gib"):
+            if _dc_key in prev and _dc_key not in cfg:
+                cfg[_dc_key] = prev[_dc_key]
     return cfg
 
 

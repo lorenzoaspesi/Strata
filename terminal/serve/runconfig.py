@@ -40,6 +40,8 @@ EDITABLE = [
     ("open_browser", "bool", "Open the chat page in the browser when the model is ready"),
     ("vram_reserve_mib", ("arg", "--vram-reserve-mib"),
      "VRAM in MiB the engine leaves free for other programs (engine default 700)"),
+    ("disk_cache_gib", "num>=0",
+     "Max disk space in GiB for saved conversation sessions in disk_cache_path (0 = off, default 64)"),
 ]
 SPEC = {k: kind for k, kind, _ in EDITABLE}
 
