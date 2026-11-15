@@ -3914,6 +3914,7 @@ class Service:
         self.keep_awake = None                        # #1727 (opt-in): serve.keepawake.KeepAwake, the config's "prevent_sleep"
         self.fifo = threading.Lock()
         self.slot_save_path = None                    # --slot-save-path: /slots/0?action=save|restore (off when None)
+        self.disk_cache = None                        # --disk-cache-path: automatic token-prefix disk session cache
         self.embeddings = threading.local()           # the current request's image embeddings file (GENI)
         self.api_key = ""                              # when set, /v1/* needs it (Bearer or x-api-key)
         # #458 (opt-in, the config's "effort_position": "end"): a non-default reasoning effort goes in a short system
@@ -4182,6 +4183,8 @@ class Service:
                         r = session_file(self, action, path, SessionRefused)
                     else:
                         r = self.engine.session_file(action, path)
+                    if action == 'restore' and self.disk_cache is not None:
+                        self.disk_cache.invalidate_live()
                 except SessionRefused as e:
                     body = error(e.status, str(e))
                     body[1]["error"]["kind"] = e.kind
@@ -4657,6 +4660,8 @@ class Service:
                     return "busy"
             if idle_for is not None and time.time() - (self.last_request_at or self.started_at) < idle_for:
                 return "busy"
+            if self.disk_cache is not None:
+                self.disk_cache.on_unload_locked(self)
             self.engine.unload()
             if self.vision is not None and hasattr(self.vision, "unload"):
                 self.vision.unload()
@@ -5435,7 +5440,12 @@ class Service:
             opening, force = parser.feed(force), None
         tail = ""                                       # the last characters written (the newlines before a call)
         answered, close_retried = False, False          # #1053: content or a call came out; the thinking was closed
-        nf_retried = False                              # #879: the request was sent again after non-finite logits
+        nf_retried, nonfinite = False, False            # #879: the request was sent again after non-finite logits
+        dc_started, dc_ran = False, False
+        dc_skip = isinstance(sampling, dict) and (
+            sampling.get("strata_checkpoint") is False or sampling.get("cache_prompt") is False
+        )
+        prompt, seg = list(ids), []
         timings, before = None, None                    # this request's timings; the engine's `last` before it
         recovery_count, reasoning_text, repeat_coverage = 0, "", 0.0
         looped, next_loop_check = False, LOOP_CHECK_EVERY       # #728: reasoning that repeats whole passages
@@ -5533,6 +5543,13 @@ class Service:
                     # loaded engine has nothing to start, so it does not wait for the fifo at all
                     if not par:
                         self.ensure_loaded()
+                        if self.disk_cache is not None:
+                            with self.status_lock:
+                                st.update(busy=True, phase="checking disk cache")
+                            if emb or dc_skip:
+                                self.disk_cache.before_multimodal(self)
+                            else:
+                                self.disk_cache.before_generate(self, ids)
                     elif not (self.loaded() and not self._vision_down()):
                         with self._inference_fifo(deadline, cancel):
                             self.ensure_loaded()
@@ -5575,6 +5592,7 @@ class Service:
                             pass_sampling = {k: v for k, v in sampling.items() if k != HOLD_KEY}
                         else:
                             pass_sampling = sampling   # no hold: the engine gets the caller's own sampler object, as before P2
+                        dc_started = True
                         gen = self.engine.generate(prompt, max_new - n, pass_sampling, cancel, embeddings=emb) if emb \
                             else self.engine.generate(prompt, max_new - n, pass_sampling, cancel)
                         recover_prompt = None
@@ -5839,6 +5857,7 @@ class Service:
                             finish = "stop"
                             break
                         prompt = prompt + seg + extra
+                    dc_ran = True
                     if cancel.is_set():
                         finish = "cancel"
                     elif looped:
@@ -5862,6 +5881,18 @@ class Service:
                     finish = "disconnect"
                     raise
                 finally:
+                    if not par and self.disk_cache is not None:
+                        if emb or dc_skip:
+                            if dc_started:
+                                self.disk_cache.invalidate_live()
+                        elif dc_started and not timed_out and not admission_rejected:
+                            _dc_ok = (dc_ran and finish in ("stop", "length") and not nonfinite
+                                      and not cancel.is_set() and self.loaded())
+                            self.disk_cache.after_generate(
+                                self, list(prompt) + list(seg), ok=_dc_ok, prompt_len=len(ids)
+                            )
+                        elif not self.loaded():
+                            self.disk_cache.invalidate_live()
                     # #266: settle this request's status, history and totals while still holding the fifo: once
                     # it is released the next request sets its own status, which this must not record or clear
                     with self.status_lock:
@@ -8333,6 +8364,12 @@ def _main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> i
     ap.add_argument("--slot-save-path", default=None, metavar="DIR",
                     help="enable POST /slots/0?action=save|restore {\"filename\": NAME} (llama-server's API): the "
                          "conversation the engine holds, to or from DIR/NAME (also \"slot_save_path\" in the config)")
+    ap.add_argument("--disk-cache-path", default=None, metavar="DIR",
+                    help="automatic disk session cache directory for single-slot /v1/* conversations "
+                         "(also \"disk_cache_path\" in the config; empty disables)")
+    ap.add_argument("--disk-cache-gib", type=float, default=None, metavar="GIB",
+                    help="max disk space in GiB for --disk-cache-path LRU eviction "
+                         "(also \"disk_cache_gib\" in the config; default 64, 0 disables)")
     ap.add_argument("--replicas", type=int, default=None, metavar="N",
                     help="data-parallel replicas (opt-in): cut the \"gpu\" list into N equal groups and run one engine on "
                          "each, requests spread over them (also \"replicas\" in the config: a number, or "
@@ -8708,6 +8745,23 @@ def _main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> i
             raise SystemExit(f"[strata] {e}")
         print(f"[strata] slot save/restore on: {svc.slot_save_path} (session files are kept until deleted: "
               "about 1.2 GB per 63K-token conversation; restore only files this server wrote)", flush=True)
+    raw_dc_path = a.disk_cache_path if a.disk_cache_path is not None else cfg.get("disk_cache_path")
+    raw_dc_gib = a.disk_cache_gib if a.disk_cache_gib is not None else cfg.get("disk_cache_gib")
+    try:
+        from serve.disk_cache import DiskSessionCache
+        svc.disk_cache = DiskSessionCache.from_config(
+            raw_dc_path, raw_dc_gib,
+            cwd=None if a.disk_cache_path is not None else cfg.get("cwd"),
+            refused_type=SessionRefused,
+        )
+    except ValueError as e:
+        raise SystemExit(f"[strata] config {e}")
+    if svc.disk_cache.enabled:
+        print(f"[strata] disk session cache on: {svc.disk_cache.dir} "
+              f"(budget {svc.disk_cache.budget_bytes / (1 << 30):g} GiB, "
+              f"{len(svc.disk_cache.entries)} saved session(s) indexed)", flush=True)
+    elif "disk_cache_path" in cfg and isinstance(raw_dc_path, str) and not raw_dc_path.strip():
+        print("[strata] disk session cache: off (set \"disk_cache_path\" in the config to enable)", flush=True)
     mode = str(cfg.get("anthropic_thinking") or "model")   # #278: "on_request" = only when the request asks
     if mode not in ("model", "on_request"):
         raise SystemExit(f"[strata] config anthropic_thinking must be \"model\" or \"on_request\", not {mode!r}")
@@ -8868,7 +8922,9 @@ def _main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> i
             # #6055: without --shutdown-timeout there is no wait, but a request that arrives while the engine closes is
             # still refused (503 server_draining, retry elsewhere) instead of being accepted and cut off with 0 tokens
             svc.begin_drain()
-        closers =[httpd.shutdown, getattr(engine, "close", None), vision.shutdown if vision else None,
+        closers = [httpd.shutdown,
+                   (lambda: svc.disk_cache.close(svc)) if svc.disk_cache is not None else None,
+                   getattr(engine, "close", None), vision.shutdown if vision else None,
                    hub.close if hub is not None else None]
         try:
             for close in filter(None, closers):
