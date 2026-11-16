@@ -342,18 +342,18 @@ def main() -> int:
         )
         _atomic_mod.replace(tmp_active, active_path)
 
-        # Clean up superseded local `.10X` control folders that are not active, previous, or in use.
+        # Clean up superseded local `.10X` control folders (and retired `.inuse.`/`.old.` dirs) not active, previous, or in use.
         keep = {version}
         if previous_active and previous_active.get("folder"):
             keep.add(str(previous_active["folder"]))
         for entry_dir in control_root.iterdir():
-            if (
-                entry_dir.is_dir()
-                and not entry_dir.name.startswith(".")
-                and entry_dir.name not in keep
-                and re.match(r"^[0-9]+\.[0-9]+\.[0-9]+\.1[0-9]{2,}$", entry_dir.name)
-                and not folder_use.in_use(entry_dir)
-            ):
+            if not entry_dir.is_dir() or entry_dir.name in keep:
+                continue
+            is_retired_dot = entry_dir.name.startswith(".") and (".inuse." in entry_dir.name or ".old." in entry_dir.name)
+            is_superseded_local = (not entry_dir.name.startswith(".")) and bool(
+                re.match(r"^[0-9]+\.[0-9]+\.[0-9]+\.1[0-9]{2,}$", entry_dir.name)
+            )
+            if (is_retired_dot or is_superseded_local) and not folder_use.in_use(entry_dir):
                 shutil.rmtree(entry_dir, ignore_errors=True)
 
         print(f"==> Activated Control component: {dest} (active.json -> {version})", flush=True)

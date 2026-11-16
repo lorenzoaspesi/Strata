@@ -10,18 +10,23 @@
 
 set -euo pipefail
 
-SCRIPT_DIR="$(cd -- "$(dirname -- "$(readlink -f -- "$0")")" && pwd -P)"
+SCRIPT_PATH="$(readlink -f -- "$0")"
+SCRIPT_DIR="$(cd -- "$(dirname -- "$SCRIPT_PATH")" && pwd -P)"
 STRATA_REPO="${STRATA_REPO:-$(cd -- "$SCRIPT_DIR/.." && pwd -P)}"
 XDG_DATA="${XDG_DATA_HOME:-$HOME/.local/share}"
 STRATA_DATA_DIR="${STRATA_DATA_DIR:-$XDG_DATA/strata}"
 COMPONENTS_DIR="${STRATA_COMPONENTS_DIR:-$STRATA_DATA_DIR/components}"
 BUILDER_IMAGE="${STRATA_BUILDER_IMAGE:-strata-cuda12-builder:12.9.1}"
 CUDA_ARCH="${STRATA_CUDA_ARCH:-61}"
+CUDA_DEV="${STRATA_CUDA_DEVICE:-0}"
+MIN_TEST_VRAM_MIB="${STRATA_MIN_TEST_VRAM_MIB:-384}"
 UPSTREAM_URL="${STRATA_UPSTREAM_URL:-https://github.com/Niko1221/Strata.git}"
 
+ORIG_ARGS=("$@")
 DO_REBASE=0
 DO_PUSH=0
 RUN_TESTS=0
+FORCE_GPU_TESTS=0
 CLEAN_BUILD=0
 REBUILD_IMAGE=0
 BUILD_VISION=1
@@ -31,30 +36,32 @@ usage() {
 Usage: rebuild_local.sh [options]
 
 Options:
-  --rebase         Fetch upstream (Niko1221/Strata) and rebase current branch onto upstream/main
-  --push           Push current branch to origin (--force-with-lease) after build & tests succeed
-  --run-tests      Build and run C++ session/snapshot/vision tests and full Python bundle/control tests
-  --build-vision   Compile strata-vision from source (default: on)
-  --skip-vision    Reuse an existing installed strata-vision binary instead of compiling from source
-  --clean          Remove build-cuda12-sm<ARCH> before configuring (keeps .ccache)
-  --rebuild-image  Rebuild the cached Docker CUDA 12 builder image
-  --arch <N>       Target CUDA compute capability (default: 61 for GTX 1070 / Pascal)
-  -h, --help       Show this help
+  --rebase           Fetch upstream (Niko1221/Strata) and rebase current branch onto upstream/main
+  --push             Push current branch to origin (--force-with-lease) after build & tests succeed
+  --run-tests        Build and run C++ session/snapshot/vision tests and full Python bundle/control tests
+  --force-gpu-tests  Run host GPU C++ tests even when free VRAM is below 384 MiB
+  --build-vision     Compile strata-vision from source (default: on)
+  --skip-vision      Reuse an existing installed strata-vision binary instead of compiling from source
+  --clean            Remove build-cuda12-sm<ARCH> before configuring (keeps .ccache)
+  --rebuild-image    Rebuild the cached Docker CUDA 12 builder image
+  --arch <N>         Target CUDA compute capability (default: 61 for GTX 1070 / Pascal)
+  -h, --help         Show this help
 EOF
 }
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --rebase)        DO_REBASE=1; shift ;;
-        --push)          DO_PUSH=1; shift ;;
-        --run-tests)     RUN_TESTS=1; shift ;;
-        --build-vision)  BUILD_VISION=1; shift ;;
-        --skip-vision)   BUILD_VISION=0; shift ;;
-        --clean)         CLEAN_BUILD=1; shift ;;
-        --rebuild-image) REBUILD_IMAGE=1; shift ;;
-        --arch)          CUDA_ARCH="${2:?--arch requires a value}"; shift 2 ;;
-        -h|--help)       usage; exit 0 ;;
-        *)               echo "Unknown option: $1" >&2; usage >&2; exit 2 ;;
+        --rebase)          DO_REBASE=1; shift ;;
+        --push)            DO_PUSH=1; shift ;;
+        --run-tests)       RUN_TESTS=1; shift ;;
+        --force-gpu-tests) FORCE_GPU_TESTS=1; shift ;;
+        --build-vision)    BUILD_VISION=1; shift ;;
+        --skip-vision)     BUILD_VISION=0; shift ;;
+        --clean)           CLEAN_BUILD=1; shift ;;
+        --rebuild-image)   REBUILD_IMAGE=1; shift ;;
+        --arch)            CUDA_ARCH="${2:?--arch requires a value}"; shift 2 ;;
+        -h|--help)         usage; exit 0 ;;
+        *)                 echo "Unknown option: $1" >&2; usage >&2; exit 2 ;;
     esac
 done
 
@@ -73,9 +80,28 @@ if [[ "$DO_REBASE" -eq 1 ]]; then
         echo "error: $STRATA_REPO has uncommitted changes; commit or stash before --rebase" >&2
         exit 1
     fi
+    SCRIPT_SHA_BEFORE="$(sha256sum "$SCRIPT_PATH" | awk '{print $1}')"
     echo "==> Fetching upstream and rebasing onto upstream/main"
     git -C "$STRATA_REPO" fetch upstream
-    git -C "$STRATA_REPO" rebase upstream/main
+    if ! git -C "$STRATA_REPO" rebase upstream/main; then
+        cat >&2 <<EOF
+error: git rebase onto upstream/main stopped due to conflicts in $STRATA_REPO.
+Resolve conflicts, run:
+  git -C "$STRATA_REPO" rebase --continue
+and then re-run this script without --rebase (or abort with 'git -C "$STRATA_REPO" rebase --abort').
+EOF
+        exit 1
+    fi
+    SCRIPT_SHA_AFTER="$(sha256sum "$SCRIPT_PATH" | awk '{print $1}')"
+    if [[ "$SCRIPT_SHA_BEFORE" != "$SCRIPT_SHA_AFTER" && "${_STRATA_REEXEC:-0}" != "1" ]]; then
+        echo "==> rebuild_local.sh updated during rebase; re-executing updated script"
+        FORWARD_ARGS=()
+        for arg in "${ORIG_ARGS[@]}"; do
+            [[ "$arg" == "--rebase" ]] && continue
+            FORWARD_ARGS+=("$arg")
+        done
+        exec env _STRATA_REEXEC=1 "$SCRIPT_PATH" "${FORWARD_ARGS[@]}"
+    fi
 fi
 
 if [[ "$REBUILD_IMAGE" -eq 1 ]] || ! docker image inspect "$BUILDER_IMAGE" >/dev/null 2>&1; then
@@ -105,6 +131,7 @@ BUILD_ABS="$STRATA_REPO/$BUILD_REL"
 if [[ "$CLEAN_BUILD" -eq 1 && -d "$BUILD_ABS" ]]; then
     echo "==> Cleaning $BUILD_ABS"
     rm -rf "$BUILD_ABS"
+    rm -rf "${BUILD_ABS}-vision"
 fi
 mkdir -p "$STRATA_REPO/.ccache"
 
@@ -114,7 +141,7 @@ if [[ -z "$BASE_VER" ]]; then
     exit 1
 fi
 
-# Compute a valid 4-part version (0.1.60 -> 0.1.60.100, 0.1.60.1 -> 0.1.60.101) accepted by
+# Compute a valid 4-part version (0.1.61 -> 0.1.61.100, 0.1.60.1 -> 0.1.60.101) accepted by
 # both strata_cli/handover.py and strata_control/engine_component.py, sorting above BASE_VER.
 PKG_VER="$(python3 - "$BASE_VER" <<'PY'
 import sys
@@ -149,7 +176,7 @@ if [[ "$BUILD_VISION" -eq 0 && -d "$COMPONENTS_DIR/engine" ]]; then
         fi
         EXISTING_VISION="$cand"
         if [[ -f "$cand_dir/BUILD.json" ]]; then
-            parsed_archs="$(python3 -c '
+            parsed_archs="$(python3 - "$cand_dir/BUILD.json" <<'PY'
 import json, sys
 try:
     d = json.load(open(sys.argv[1], encoding="utf-8-sig"))
@@ -160,7 +187,8 @@ try:
         print(v.strip())
 except Exception:
     pass
-' "$cand_dir/BUILD.json")"
+PY
+)"
             [[ -n "$parsed_archs" ]] && EXISTING_VISION_ARCHS="$parsed_archs"
         fi
     done < <(find "$COMPONENTS_DIR/engine" -maxdepth 2 -mindepth 2 -name strata-vision 2>/dev/null | sort -V)
@@ -274,10 +302,24 @@ docker run --rm \
             "$PKG_VER" "$CUDA_ARCH" "$CUDA_FULL" "$VISION_JSON" > "$STAGE_DIR/BUILD.json"
 
         python3 /src/packaging/collect_libs.py \
-            --binary "/src/$BUILD_REL/strata" \
+            --binary "$STAGE_DIR/strata" \
             --search /usr/local/cuda/lib64 \
             --out "$STAGE_DIR" \
-            --also "libcublasLt.so*"
+            --also "libcublasLt.so*" \
+            --bundle-system "libgomp.so*"
+        cp "$STAGE_DIR/SYSTEM-LIBS.txt" "$STAGE_DIR/.syslibs.acc"
+        for extra_elf in "$STAGE_DIR/strata-vision" "$STAGE_DIR/libstrata_kq.so"; do
+            if [[ -f "$extra_elf" ]]; then
+                python3 /src/packaging/collect_libs.py \
+                    --binary "$extra_elf" \
+                    --search /usr/local/cuda/lib64 \
+                    --out "$STAGE_DIR" \
+                    --bundle-system "libgomp.so*"
+                cat "$STAGE_DIR/SYSTEM-LIBS.txt" >> "$STAGE_DIR/.syslibs.acc"
+            fi
+        done
+        sort -u "$STAGE_DIR/.syslibs.acc" > "$STAGE_DIR/SYSTEM-LIBS.txt"
+        rm -f "$STAGE_DIR/.syslibs.acc"
 
         python3 /src/packaging/package_engine.py \
             --src "$STAGE_DIR" \
@@ -291,7 +333,8 @@ docker run --rm \
             --platform linux-x86_64 \
             --build-id "$BUILD_ID" \
             --include SYSTEM-LIBS.txt \
-            --include "libstrata_kq*"
+            --include "libstrata_kq*" \
+            --include "licenses/*"
 
         PKG_FOLDER="$OUT_DIR/${PKG_VER}-linux-x86_64-cuda-cuda12"
         python3 /src/packaging/package_engine.py --verify "$PKG_FOLDER"
@@ -301,51 +344,37 @@ docker run --rm \
 
 BUILT_PKG="$BUILD_ABS/out-pkg/${PKG_VER}-linux-x86_64-cuda-cuda12"
 DEST_ENGINE_DIR="$COMPONENTS_DIR/engine"
-DEST_PKG="$DEST_ENGINE_DIR/${PKG_VER}-linux-x86_64-cuda-cuda12"
+ENGINE_FOLDER_NAME="${PKG_VER}-linux-x86_64-cuda-cuda12"
+DEST_PKG="$DEST_ENGINE_DIR/$ENGINE_FOLDER_NAME"
 mkdir -p "$DEST_ENGINE_DIR"
 
 if [[ "$RUN_TESTS" -eq 1 ]]; then
-    echo "==> Running GPU conversation_snapshot_test & strata-vision-own-swap-test on host GPU"
-    LD_LIBRARY_PATH="$BUILT_PKG${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
-        "$BUILD_ABS/conversation_snapshot_test"
-    if [[ -x "${BUILD_ABS}-vision/own/strata-vision-own-swap-test" ]]; then
-        LD_LIBRARY_PATH="$BUILT_PKG${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
-            "${BUILD_ABS}-vision/own/strata-vision-own-swap-test"
+    FREE_VRAM_MIB="$(nvidia-smi --query-gpu=memory.free --format=csv,noheader,nounits -i "$CUDA_DEV" 2>/dev/null | head -n 1 | tr -d '[:space:]' || true)"
+    if [[ "$FORCE_GPU_TESTS" -eq 0 && "$FREE_VRAM_MIB" =~ ^[0-9]+$ && "$FREE_VRAM_MIB" -lt "$MIN_TEST_VRAM_MIB" ]]; then
+        echo "==> Skipping host GPU C++ tests (only ${FREE_VRAM_MIB} MiB free on GPU ${CUDA_DEV} < ${MIN_TEST_VRAM_MIB} MiB while Strata is serving; pass --force-gpu-tests or stop strata to run them)"
+    else
+        echo "==> Running GPU conversation_snapshot_test & strata-vision-own-swap-test on host GPU ${CUDA_DEV}"
+        CUDA_VISIBLE_DEVICES="$CUDA_DEV" LD_LIBRARY_PATH="$BUILT_PKG${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
+            "$BUILD_ABS/conversation_snapshot_test"
+        if [[ -x "${BUILD_ABS}-vision/own/strata-vision-own-swap-test" ]]; then
+            CUDA_VISIBLE_DEVICES="$CUDA_DEV" LD_LIBRARY_PATH="$BUILT_PKG${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
+                "${BUILD_ABS}-vision/own/strata-vision-own-swap-test"
+        fi
     fi
 fi
 
 echo "==> Installing engine component to $DEST_PKG"
-TMP_DEST="$DEST_ENGINE_DIR/.${PKG_VER}-linux-x86_64-cuda-cuda12.installing.$$"
+TMP_DEST="$DEST_ENGINE_DIR/.${ENGINE_FOLDER_NAME}.installing.$$"
 rm -rf "$TMP_DEST"
 cp -a "$BUILT_PKG" "$TMP_DEST"
 python3 "$STRATA_REPO/packaging/package_engine.py" --verify "$TMP_DEST"
+OLD_ENGINE_DEST=""
 if [[ -d "$DEST_PKG" ]]; then
-    OLD_DEST="$DEST_ENGINE_DIR/.${PKG_VER}-linux-x86_64-cuda-cuda12.old.$$"
-    mv "$DEST_PKG" "$OLD_DEST"
-    mv "$TMP_DEST" "$DEST_PKG"
-    rm -rf "$OLD_DEST"
-else
-    mv "$TMP_DEST" "$DEST_PKG"
+    OLD_ENGINE_DEST="$DEST_ENGINE_DIR/.${ENGINE_FOLDER_NAME}.old.$$"
+    mv "$DEST_PKG" "$OLD_ENGINE_DEST"
 fi
+mv "$TMP_DEST" "$DEST_PKG"
 rm -rf "$BUILD_ABS/out-pkg"
-
-# Clear any manual engine rollback pin so the newly built engine resolves as active
-STATE_JSON="$COMPONENTS_DIR/.updates/state.json"
-if [[ -f "$STATE_JSON" ]]; then
-    python3 - "$STATE_JSON" <<'PY'
-import json, sys
-from pathlib import Path
-p = Path(sys.argv[1])
-try:
-    data = json.loads(p.read_text(encoding="utf-8-sig"))
-    if isinstance(data.get("engine"), dict) and data["engine"].get("pinned"):
-        print(f"==> Clearing pinned engine ({data['engine']['pinned']}) in {p}")
-        data["engine"]["pinned"] = None
-        p.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
-except Exception:
-    pass
-PY
-fi
 
 echo "==> Staging and activating Control component $PKG_VER from $STRATA_REPO"
 PYTHONDONTWRITEBYTECODE=1 python3 "$STRATA_REPO/packaging/stage_local_control.py" \
@@ -354,6 +383,96 @@ PYTHONDONTWRITEBYTECODE=1 python3 "$STRATA_REPO/packaging/stage_local_control.py
     --commit "$GIT_FULL"
 
 CONTROL_PY="$COMPONENTS_DIR/control/$PKG_VER/python/bin/python3"
+
+# Update .updates/state.json engine record, clear any manual rollback pin, and prune superseded unused local engine builds
+PYTHONNOUSERSITE=1 PYTHONDONTWRITEBYTECODE=1 "$CONTROL_PY" -B - \
+    "$COMPONENTS_DIR" "$ENGINE_FOLDER_NAME" "$PKG_VER" "$OLD_ENGINE_DEST" <<'PY'
+import datetime as dt
+import json
+import os
+import re
+import shutil
+import sys
+import tempfile
+from pathlib import Path
+
+components = Path(sys.argv[1]).resolve()
+new_folder = sys.argv[2]
+pkg_ver = sys.argv[3]
+old_same_ver = Path(sys.argv[4]) if sys.argv[4] else None
+
+sys.path.insert(0, str(components / "control" / pkg_ver))
+from strata_control import atomic, folder_use  # noqa: E402
+
+if old_same_ver is not None and old_same_ver.exists() and not folder_use.in_use(old_same_ver):
+    shutil.rmtree(old_same_ver, ignore_errors=True)
+
+state_path = components / ".updates" / "state.json"
+state_path.parent.mkdir(parents=True, exist_ok=True)
+data = {}
+if state_path.is_file():
+    try:
+        loaded = json.loads(state_path.read_text(encoding="utf-8-sig"))
+        if isinstance(loaded, dict):
+            data = loaded
+    except (OSError, ValueError):
+        data = {}
+
+eng = data.get("engine")
+if not isinstance(eng, dict):
+    eng = {}
+    data["engine"] = eng
+
+if eng.get("pinned"):
+    print(f"==> Clearing pinned engine ({eng['pinned']}) in {state_path}")
+    eng["pinned"] = None
+
+prev_active = eng.get("active")
+if isinstance(prev_active, str) and prev_active and prev_active != new_folder:
+    eng["previous"] = prev_active
+eng["active"] = new_folder
+
+history = data.setdefault("history", [])
+if isinstance(history, list):
+    history.append(
+        {
+            "at": dt.datetime.now(dt.timezone.utc).isoformat(),
+            "action": "stage-local-engine",
+            "from": prev_active,
+            "to": pkg_ver,
+            "ok": True,
+        }
+    )
+    del history[:-30]
+
+fd, tmp = tempfile.mkstemp(prefix=".state-", suffix=".tmp", dir=state_path.parent)
+try:
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        json.dump(data, fh, indent=1, sort_keys=True)
+        fh.write("\n")
+    atomic.replace(tmp, state_path)
+finally:
+    if os.path.exists(tmp):
+        os.unlink(tmp)
+
+# Prune superseded local engine folders (.99 / .10X) and stale dot-folders that are not active, previous, or in use
+keep = {new_folder}
+if isinstance(eng.get("previous"), str) and eng["previous"]:
+    keep.add(eng["previous"])
+
+local_pat = re.compile(r"^[0-9]+\.[0-9]+\.[0-9]+(?:\.[0-9]+)?\.(?:99|1[0-9]{2,})-")
+engine_root = components / "engine"
+if engine_root.is_dir():
+    for entry in sorted(engine_root.iterdir()):
+        if not entry.is_dir() or entry.name in (".rejected", *keep):
+            continue
+        is_stale_dot = entry.name.startswith(".") and any(tag in entry.name for tag in (".old.", ".inuse.", ".installing."))
+        is_superseded_local = (not entry.name.startswith(".")) and bool(local_pat.match(entry.name))
+        if (is_stale_dot or is_superseded_local) and not folder_use.in_use(entry):
+            print(f"==> Pruning superseded unused local engine folder: {entry.name}")
+            shutil.rmtree(entry, ignore_errors=True)
+PY
+
 echo "==> Running DiskSessionCache, VisionSwap & Monitor test suites in staged Control ($PKG_VER)"
 (
     cd "$COMPONENTS_DIR/control/$PKG_VER"
@@ -370,7 +489,10 @@ if [[ "$RUN_TESTS" -eq 1 ]]; then
             serve.test_slots \
             serve.test_session_save_retry \
             serve.test_vision_elastic \
-            serve.test_vram
+            serve.test_vram \
+            serve.test_reader_follows_engine \
+            serve.test_bool_args \
+            serve.test_web_speculation
     )
     (
         cd "$STRATA_REPO"
