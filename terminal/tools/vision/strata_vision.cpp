@@ -67,6 +67,7 @@ int main(int argc, char** argv) {
         if (a == "--mmproj") o.mmproj = next();
         else if (a == "--model") next();             // the text model: llama.cpp's reader needed its tokenizer, ours never tokenizes
         else if (a == "--gpu") o.gpu = true;
+        else if (a == "--swap-vram") o.swap_vram = true;
         else if (a == "--tower") {
             const std::string t = next();
             if (t != "mtmd" && t != "own" && t != "auto") { std::fprintf(stderr, "--tower takes own or auto\n"); return 2; }

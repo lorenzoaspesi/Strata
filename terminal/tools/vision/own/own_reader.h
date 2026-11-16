@@ -14,6 +14,7 @@ namespace strata_vit {
 struct OwnReaderOptions {
     std::string mmproj;
     bool gpu = false;
+    bool swap_vram = false;   // stash GPU weights in host RAM and release VRAM between WAKE and SLEEP
     int threads = 0;          // CPU threads (<= 0: half the hardware threads, at most 16, as the mtmd reader)
     int max_tokens = 0;       // the helper's --max-tokens (0: the tower's own limit); a picture over it by more than an eighth is refused
     int min_tokens = 0;

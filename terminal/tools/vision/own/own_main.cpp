@@ -21,6 +21,7 @@ int main(int argc, char** argv) {
         };
         if (a == "--mmproj") o.mmproj = next();
         else if (a == "--gpu") { o.gpu = true; gpu_hidden = false; }
+        else if (a == "--swap-vram") o.swap_vram = true;
         else if (a == "--threads") o.threads = std::atoi(next().c_str());
         else if (a == "--max-tokens") o.max_tokens = std::atoi(next().c_str());
         else if (a == "--min-tokens") o.min_tokens = std::atoi(next().c_str());

@@ -24,7 +24,7 @@ DO_PUSH=0
 RUN_TESTS=0
 CLEAN_BUILD=0
 REBUILD_IMAGE=0
-BUILD_VISION=0
+BUILD_VISION=1
 
 usage() {
     cat <<'EOF'
@@ -33,8 +33,9 @@ Usage: rebuild_local.sh [options]
 Options:
   --rebase         Fetch upstream (Niko1221/Strata) and rebase current branch onto upstream/main
   --push           Push current branch to origin (--force-with-lease) after build & tests succeed
-  --run-tests      Build and run C++ session/snapshot tests and full Python bundle/control tests
-  --build-vision   Compile strata-vision from source instead of reusing installed strata-vision
+  --run-tests      Build and run C++ session/snapshot/vision tests and full Python bundle/control tests
+  --build-vision   Compile strata-vision from source (default: on)
+  --skip-vision    Reuse an existing installed strata-vision binary instead of compiling from source
   --clean          Remove build-cuda12-sm<ARCH> before configuring (keeps .ccache)
   --rebuild-image  Rebuild the cached Docker CUDA 12 builder image
   --arch <N>       Target CUDA compute capability (default: 61 for GTX 1070 / Pascal)
@@ -48,6 +49,7 @@ while [[ $# -gt 0 ]]; do
         --push)          DO_PUSH=1; shift ;;
         --run-tests)     RUN_TESTS=1; shift ;;
         --build-vision)  BUILD_VISION=1; shift ;;
+        --skip-vision)   BUILD_VISION=0; shift ;;
         --clean)         CLEAN_BUILD=1; shift ;;
         --rebuild-image) REBUILD_IMAGE=1; shift ;;
         --arch)          CUDA_ARCH="${2:?--arch requires a value}"; shift 2 ;;
@@ -237,7 +239,14 @@ docker run --rm \
                 -DSTRATA_PORTABLE=ON \
                 -DGGML_CUDA_NCCL=OFF \
                 "-DCMAKE_CUDA_ARCHITECTURES=${CUDA_ARCH}-real;${CUDA_ARCH}-virtual"
-            cmake --build "$VISION_BUILD" --target strata-vision -j "$(nproc)"
+            VISION_TARGETS=(strata-vision)
+            if [[ "$RUN_TESTS" -eq 1 ]]; then
+                VISION_TARGETS+=(strata-vision-own-test strata-vision-own-swap-test)
+            fi
+            cmake --build "$VISION_BUILD" --target "${VISION_TARGETS[@]}" -j "$(nproc)"
+            if [[ "$RUN_TESTS" -eq 1 ]]; then
+                "$VISION_BUILD/own/strata-vision-own-test"
+            fi
             VISION_BIN="$VISION_BUILD/bin/strata-vision"
             VISION_ARCHS="$CUDA_ARCH"
         elif [[ -n "$CONTAINER_VISION_SRC" && -f "$CONTAINER_VISION_SRC" ]]; then
@@ -296,9 +305,13 @@ DEST_PKG="$DEST_ENGINE_DIR/${PKG_VER}-linux-x86_64-cuda-cuda12"
 mkdir -p "$DEST_ENGINE_DIR"
 
 if [[ "$RUN_TESTS" -eq 1 ]]; then
-    echo "==> Running GPU conversation_snapshot_test on host GPU"
+    echo "==> Running GPU conversation_snapshot_test & strata-vision-own-swap-test on host GPU"
     LD_LIBRARY_PATH="$BUILT_PKG${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
         "$BUILD_ABS/conversation_snapshot_test"
+    if [[ -x "${BUILD_ABS}-vision/own/strata-vision-own-swap-test" ]]; then
+        LD_LIBRARY_PATH="$BUILT_PKG${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
+            "${BUILD_ABS}-vision/own/strata-vision-own-swap-test"
+    fi
 fi
 
 echo "==> Installing engine component to $DEST_PKG"
@@ -341,19 +354,23 @@ PYTHONDONTWRITEBYTECODE=1 python3 "$STRATA_REPO/packaging/stage_local_control.py
     --commit "$GIT_FULL"
 
 CONTROL_PY="$COMPONENTS_DIR/control/$PKG_VER/python/bin/python3"
-echo "==> Running DiskSessionCache test suite in staged Control ($PKG_VER)"
+echo "==> Running DiskSessionCache & VisionSwap test suites in staged Control ($PKG_VER)"
 (
     cd "$COMPONENTS_DIR/control/$PKG_VER"
     PYTHONNOUSERSITE=1 PYTHONDONTWRITEBYTECODE=1 \
-        "$CONTROL_PY" -B -m unittest serve.test_disk_cache
+        "$CONTROL_PY" -B -m unittest serve.test_disk_cache serve.test_vision_swap
 )
 
 if [[ "$RUN_TESTS" -eq 1 ]]; then
-    echo "==> Running Control slot/session/bundle/isolation test suites"
+    echo "==> Running Control slot/session/vision/vram/bundle/isolation test suites"
     (
         cd "$COMPONENTS_DIR/control/$PKG_VER"
         PYTHONNOUSERSITE=1 PYTHONDONTWRITEBYTECODE=1 \
-            "$CONTROL_PY" -B -m unittest serve.test_slots serve.test_session_save_retry
+            "$CONTROL_PY" -B -m unittest \
+            serve.test_slots \
+            serve.test_session_save_retry \
+            serve.test_vision_elastic \
+            serve.test_vram
     )
     (
         cd "$STRATA_REPO"

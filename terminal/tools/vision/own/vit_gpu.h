@@ -69,6 +69,27 @@ public:
     // Bytes of device memory held now (weights + work buffers).
     size_t device_bytes() const;
 
+#if defined(STRATA_VIT_CUDA) || defined(STRATA_VIT_HIP)
+    // Stashes all loaded GPU weights into host RAM (pinned when available, pageable fallback) and frees all GPU
+    // weights + work buffers immediately (putting the tower to sleep).
+    bool enable_swap(std::string& err);
+
+    // Frees the GPU weight slab + work buffers while retaining the host RAM weight snapshot and BLAS handle.
+    bool sleep();
+
+    // Re-uploads the host weight snapshot into a single contiguous GPU slab (`ms` receives elapsed milliseconds).
+    bool wake(double& ms, std::string& err);
+
+    bool is_sleeping() const;
+    size_t swap_slab_bytes() const;
+#else
+    bool enable_swap(std::string& err) { err = "VRAM swap is supported on CUDA/HIP only"; return false; }
+    bool sleep() { return false; }
+    bool wake(double& ms, std::string& err) { ms = 0.0; err = "VRAM swap is supported on CUDA/HIP only"; return false; }
+    bool is_sleeping() const { return false; }
+    size_t swap_slab_bytes() const { return 0; }
+#endif
+
 private:
     std::unique_ptr<VitGpuImpl> impl_;
 };
