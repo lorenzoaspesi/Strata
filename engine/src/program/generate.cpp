@@ -17942,7 +17942,8 @@ int main(int argc, char** argv) {
                         };
                         std::vector<ConvCheckpoint> disk_checks;
                         std::string why;
-                        if (!strata::core::session_save_checkpoints(checks, sl, admit, disk_checks, why)) {
+                        if (!strata::core::session_save_all_checkpoints(
+                                checks, live, live_imgs, sl, admit, disk_checks, why)) {
                             refuse(why, strata::core::SessionError::memory);
                             continue;
                         }

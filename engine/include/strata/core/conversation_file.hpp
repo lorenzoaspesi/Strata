@@ -201,6 +201,14 @@ uint64_t session_save_peak_bytes(const ConversationCheckpoint* deepest, const Se
 bool session_save_checkpoints(const std::vector<ConversationCheckpoint>& chain, const SessionSaveLive& live,
                               const std::function<bool(uint64_t need_bytes, std::string& why)>& admit,
                               std::vector<ConversationCheckpoint>& out, std::string& why);
+// Save ALL valid live-prefix checkpoints in `chain` when `admit` accepts their combined staging peak; if host RAM
+// refuses the full chain, fall back cleanly to the single deepest valid-prefix checkpoint.
+bool session_save_all_checkpoints(const std::vector<ConversationCheckpoint>& chain,
+                                  const std::vector<int32_t>& live_ids,
+                                  const std::vector<ConversationImageKey>& live_imgs,
+                                  const SessionSaveLive& live,
+                                  const std::function<bool(uint64_t need_bytes, std::string& why)>& admit,
+                                  std::vector<ConversationCheckpoint>& out, std::string& why);
 
 // What a read checks before it allocates.  Every count is checked against the bytes left in the payload and against
 // these limits BEFORE its array is allocated; the defaults accept whatever the payload can hold.  The engine sets all

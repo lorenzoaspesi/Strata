@@ -871,12 +871,42 @@ class StrataControlIntegrationTests(unittest.TestCase):
         version: int = 1,
         model_fp: int = 0x3596F3A865B63D1E,
         config_fp: int = 0x8341DE3075756AB1,
-        payload: bytes = b"\x00" * 128,
+        payload: bytes | None = None,
+        live_tokens: list[int] | None = None,
+        checkpoint_lens: list[int] | None = None,
         corrupt_header_hash: bool = False,
         bad_trailer: bool = False,
     ) -> int:
         import struct
         from serve.disk_cache import session_hash64
+
+        if payload is None:
+            if live_tokens is not None or checkpoint_lens is not None:
+                ltoks = list(live_tokens or [1] * 4000)
+                ck_lens = list(checkpoint_lens or [])
+
+                def pack_ckpt(ids_list: list[int]) -> bytes:
+                    parts = [
+                        struct.pack(f"<Q{len(ids_list)}i", len(ids_list), *ids_list),
+                        struct.pack("<Q", 0),  # 0 images
+                    ]
+                    for _ in range(5):
+                        parts.append(struct.pack("<Q", 8) + b"\x00" * 8)
+                    parts.append(struct.pack("<Q", 1))  # used
+                    return b"".join(parts)
+
+                body = [
+                    struct.pack("<18q", *([1] * 18)),  # geometry
+                    struct.pack("<qqQ", 0, 48, 0),     # layer_lo, layer_hi, cvec
+                    pack_ckpt(ltoks),
+                    struct.pack("<Q", len(ck_lens)),
+                ]
+                for cl in ck_lens:
+                    body.append(pack_ckpt(ltoks[:cl]))
+                body.append(struct.pack("<Q", 0))      # 0 kv layers
+                payload = b"".join(body)
+            else:
+                payload = b"\x00" * 128
 
         hdr_prefix = struct.pack(
             "<8sIIQQQQQ",
@@ -1030,6 +1060,131 @@ class StrataControlIntegrationTests(unittest.TestCase):
         self.assertEqual(engine.restore_calls, 0)
         self.assertEqual(svc.disk_cache.entries, [])
         self.assertEqual(list(cache_dir.glob("session-*.bin")), [])
+
+    def test_reconcile_index_backfills_checkpoints_from_existing_bin_files(self):
+        cache_dir = self.root / "backfill-ckpts"
+        cache_dir.mkdir()
+        toks = [10 + (i % 50) for i in range(3600)]
+        sz = self._make_session_bin(
+            cache_dir / "session-112233445566.bin",
+            live_tokens=toks,
+            checkpoint_lens=[512, 1536, 3400],
+        )
+        # Legacy index.json without "checkpoints" field:
+        (cache_dir / "index.json").write_text(
+            json.dumps(
+                {
+                    "version": 1,
+                    "entries": [
+                        {
+                            "id": "112233445566",
+                            "filename": "session-112233445566.bin",
+                            "tokens": toks,
+                            "prompt_len": 3405,
+                            "bytes": sz,
+                            "last_used": 1000.0,
+                            "created_at": 1000.0,
+                        }
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+        cache = DiskSessionCache.from_config(str(cache_dir), 1)
+        self.addCleanup(cache.close)
+        self.assertEqual(cache.entries[0].get("checkpoints"), [512, 1536, 3400])
+
+    def test_checkpoint_aware_restore_skips_unreachable_lcp_and_reports_true_reuse(self):
+        from types import SimpleNamespace
+
+        # 1) Single-checkpoint .bin (ckpt only at 3800): prompt with LCP=2000 (< 3800) CANNOT resume -> must NOT restore!
+        dir1 = self.root / "single-ckpt"
+        dir1.mkdir()
+        base_toks = [20 + (i % 40) for i in range(4000)]
+        sz1 = self._make_session_bin(
+            dir1 / "session-aaaaaaaa0001.bin",
+            live_tokens=base_toks,
+            checkpoint_lens=[3800],
+        )
+        (dir1 / "index.json").write_text(
+            json.dumps(
+                {
+                    "version": 1,
+                    "entries": [
+                        {
+                            "id": "aaaaaaaa0001",
+                            "filename": "session-aaaaaaaa0001.bin",
+                            "tokens": base_toks,
+                            "prompt_len": 3805,
+                            "bytes": sz1,
+                            "last_used": 1000.0,
+                            "created_at": 1000.0,
+                        }
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+        cache1 = DiskSessionCache.from_config(str(dir1), 1)
+        self.addCleanup(cache1.close)
+
+        restore_calls: list[str] = []
+
+        def fake_session_file(action: str, path: str) -> dict:
+            if action == "restore":
+                restore_calls.append(path)
+                return {"tokens": 4000, "bytes": sz1, "ms": 12.0}
+            raise ValueError(action)
+
+        svc1 = SimpleNamespace(
+            engine=SimpleNamespace(gen=1, batch=0, session_file=fake_session_file),
+            fifo=threading.Lock(),
+            status_lock=threading.Lock(),
+            status={"busy": False, "queued": 0},
+            loaded=lambda: True,
+        )
+        mid_edited_prompt = base_toks[:2000] + [999] * 2100
+        res1 = cache1.before_generate(svc1, mid_edited_prompt)
+        self.assertIsNone(res1)
+        self.assertEqual(restore_calls, [])
+        self.assertEqual(cache1.restores, 0)
+
+        # 2) Multi-checkpoint .bin (ckpts at [800, 1600, 3800]): same LCP=2000 -> restores and reports exact reuse=1600!
+        dir2 = self.root / "multi-ckpt"
+        dir2.mkdir()
+        sz2 = self._make_session_bin(
+            dir2 / "session-bbbbbbbb0002.bin",
+            live_tokens=base_toks,
+            checkpoint_lens=[800, 1600, 3800],
+        )
+        (dir2 / "index.json").write_text(
+            json.dumps(
+                {
+                    "version": 1,
+                    "entries": [
+                        {
+                            "id": "bbbbbbbb0002",
+                            "filename": "session-bbbbbbbb0002.bin",
+                            "tokens": base_toks,
+                            "prompt_len": 3805,
+                            "bytes": sz2,
+                            "last_used": 1000.0,
+                            "created_at": 1000.0,
+                        }
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+        cache2 = DiskSessionCache.from_config(str(dir2), 1)
+        self.addCleanup(cache2.close)
+        res2 = cache2.before_generate(svc1, mid_edited_prompt)
+        self.assertIsNotNone(res2)
+        self.assertEqual(len(restore_calls), 1)
+        self.assertEqual(cache2.restores, 1)
+        self.assertEqual(cache2.restored_tokens, 1600)
+        self.assertEqual(cache2.metrics_view()["last_event"]["reused_tokens"], 1600)
+        self.assertEqual(cache2.metrics_view()["last_event"]["tokens"], 4000)
 
 
 if __name__ == "__main__":

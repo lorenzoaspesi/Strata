@@ -345,6 +345,8 @@ class ConversationCacheCard(unittest.TestCase):
                    "dc-card", "dc-sum", "dc-space-text", "dc-live-text", "dc-facts", "dc-sessions", "dc-note"):
             self.assertIn(f'id="{el}"', html)
             self.assertIn(f'"{el}"', js)
+        self.assertIn("ev.reused_tokens", js)
+        self.assertIn("tok reused", js)
 
     def test_disk_cache_metrics_view(self):
         from serve.disk_cache import DiskSessionCache

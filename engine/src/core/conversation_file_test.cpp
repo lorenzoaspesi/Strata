@@ -666,6 +666,35 @@ int main() {
         check(session_save_checkpoints(chain, live, agree, out, why) && out.size() == 1 &&
               same_checkpoint(out[0], chain[1]), "save: admitted, the deepest checkpoint is copied");
         check(session_save_checkpoints({}, live, agree, out, why) && out.empty(), "save: no checkpoints, none copied");
+        // session_save_all_checkpoints: keeps all valid prefix checkpoints, filters out divergent branches, and falls
+        // back to the deepest valid prefix checkpoint when full-chain RAM admission is tight
+        {
+            std::vector<int32_t> live_ids = {10, 20, 30, 40, 50, 60};
+            std::vector<ConversationImageKey> live_imgs;
+            ConversationCheckpoint c1, c2_bad, c3;
+            c1.ids = {10, 20}; c1.gdn.assign(1024, 0x11);
+            c2_bad.ids = {10, 99, 30}; c2_bad.gdn.assign(1024, 0x22);   // divergent non-prefix checkpoint
+            c3.ids = {10, 20, 30, 40, 50}; c3.gdn.assign(1024, 0x33);
+            std::vector<ConversationCheckpoint> mixed = {c1, c2_bad, c3};
+            std::vector<ConversationCheckpoint> all_out;
+            std::string w_all;
+            check(session_save_all_checkpoints(mixed, live_ids, live_imgs, live, agree, all_out, w_all) &&
+                  all_out.size() == 2 && same_checkpoint(all_out[0], c1) && same_checkpoint(all_out[1], c3),
+                  "save_all: keeps all live-prefix checkpoints in order and drops non-prefixes");
+            const uint64_t single_peak = session_save_peak_bytes(&c3, live);
+            const auto tight = [&](uint64_t need, std::string& w) {
+                if (need <= single_peak) return true;
+                w = "only room for one";
+                return false;
+            };
+            check(session_save_all_checkpoints(mixed, live_ids, live_imgs, live, tight, all_out, w_all) &&
+                  all_out.size() == 1 && same_checkpoint(all_out[0], c3),
+                  "save_all: falls back to deepest prefix checkpoint when RAM only admits one");
+            const auto none = [](uint64_t, std::string& w) { w = "no RAM"; return false; };
+            check(!session_save_all_checkpoints(mixed, live_ids, live_imgs, live, none, all_out, w_all) &&
+                  all_out.empty() && w_all == "no RAM",
+                  "save_all: refuses cleanly when even single checkpoint exceeds RAM");
+        }
 #if defined(__linux__) && !defined(__SANITIZE_ADDRESS__) && !defined(STRATA_NO_RLIMIT_TEST)
         // under a real address-space limit that cannot hold one more copy: the refusal comes first, no bad_alloc;
         // and the same limit with an admitting preflight does fail at the copy (the test can see the difference)

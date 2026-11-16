@@ -1155,6 +1155,55 @@ bool session_save_checkpoints(const std::vector<ConversationCheckpoint>& chain, 
     return true;
 }
 
+bool session_save_all_checkpoints(const std::vector<ConversationCheckpoint>& chain,
+                                  const std::vector<int32_t>& live_ids,
+                                  const std::vector<ConversationImageKey>& live_imgs,
+                                  const SessionSaveLive& live,
+                                  const std::function<bool(uint64_t need_bytes, std::string& why)>& admit,
+                                  std::vector<ConversationCheckpoint>& out, std::string& why) {
+    out.clear();
+    std::vector<const ConversationCheckpoint*> valid;
+    valid.reserve(chain.size());
+    for (const auto& c : chain) {
+        if (!c.stage_parts.empty() || c.ids.empty() || c.ids.size() > live_ids.size()) continue;
+        if (!std::equal(c.ids.begin(), c.ids.end(), live_ids.begin())) continue;
+        size_t img_i = 0;
+        bool imgs_ok = true;
+        for (const auto& key : live_imgs) {
+            if ((uint64_t) key.start >= c.ids.size()) break;
+            if (img_i >= c.imgs.size() || !(c.imgs[img_i++] == key)) {
+                imgs_ok = false;
+                break;
+            }
+        }
+        if (!imgs_ok || img_i != c.imgs.size()) continue;
+        valid.push_back(&c);
+    }
+    if (valid.empty()) {
+        if (admit && !admit(session_save_peak_bytes(nullptr, live), why)) return false;
+        return true;
+    }
+    if (valid.size() > 1) {
+        uint64_t all_peak = session_save_peak_bytes(nullptr, live);
+        for (const auto* cp : valid) all_peak = sat_add(all_peak, sat_mul(2, cp->bytes()));
+        std::string all_why;
+        if (!admit || admit(all_peak, all_why)) {
+            out.reserve(valid.size());
+            for (const auto* cp : valid) out.push_back(*cp);
+            return true;
+        }
+    }
+    // Single valid checkpoint, or host RAM only fits the single deepest valid checkpoint:
+    const ConversationCheckpoint* deepest = nullptr;
+    bool any_pinned = false;
+    for (const auto* cp : valid) any_pinned = any_pinned || cp->pinned;
+    for (const auto* cp : valid)
+        if ((!any_pinned || cp->pinned) && (!deepest || cp->ids.size() > deepest->ids.size())) deepest = cp;
+    if (admit && !admit(session_save_peak_bytes(deepest, live), why)) return false;
+    if (deepest) out.push_back(*deepest);
+    return true;
+}
+
 int64_t session_phase_limit_s(uint64_t bytes) {
     return std::min<int64_t>(3600, 60 + (int64_t) std::min<uint64_t>(bytes >> 22, 3600));
 }

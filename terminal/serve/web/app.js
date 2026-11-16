@@ -444,12 +444,15 @@ function renderDiskCache(dc) {
   let evText = null;
   if (dc.last_event) {
     const ev = dc.last_event;
-    const verb = ev.kind === "saved" ? "Saved" : "Restored";
     const why = ev.reason ? ` · ${ev.reason}` : "";
-    evText = `${verb} ${fmt(ev.tokens)} tokens (${sizeText(ev.bytes)} in ${fmt(ev.ms)} ms${why}), ${since(ev.at)}`;
+    const ck = ev.kind === "saved" && ev.checkpoints ? ` · ${fmt(ev.checkpoints)} ckpt` : "";
+    const tokPart = ev.kind === "restored" && ev.reused_tokens != null && ev.reused_tokens < ev.tokens
+      ? `Restored ${fmt(ev.reused_tokens)} of ${fmt(ev.tokens)} tokens`
+      : `${ev.kind === "saved" ? "Saved" : "Restored"} ${fmt(ev.tokens)} tokens`;
+    evText = `${tokPart}${ck} (${sizeText(ev.bytes)} in ${fmt(ev.ms)} ms${why}), ${since(ev.at)}`;
   }
   const xfer = `${fmt(dc.saves)} saved · ${fmt(dc.restores)} restored` +
-               (dc.restored_tokens ? ` (${kfmt(dc.restored_tokens)} tok)` : "") +
+               (dc.restored_tokens ? ` (${kfmt(dc.restored_tokens)} tok reused)` : "") +
                (dc.evictions ? ` · ${fmt(dc.evictions)} evicted` : "");
   facts($("dc-facts"), [
     ["Saved / restored", xfer],
@@ -460,9 +463,10 @@ function renderDiskCache(dc) {
   const entries = dc.entries || [];
   const box = $("dc-sessions");
   box.hidden = !entries.length;
-  box.innerHTML = entries.map((e) =>
-    `<span class="chip" title="Session ${esc(e.id)} · ${fmt(e.tokens)} tokens">${esc(`${kfmt(e.tokens)} tok · ${sizeText(e.bytes)} · ${since(e.last_used)}`)}</span>`
-  ).join("");
+  box.innerHTML = entries.map((e) => {
+    const ckTip = e.checkpoints != null ? ` · ${fmt(e.checkpoints)} ckpt` : "";
+    return `<span class="chip" title="Session ${esc(e.id)} · ${fmt(e.tokens)} tokens${esc(ckTip)}">${esc(`${kfmt(e.tokens)} tok · ${sizeText(e.bytes)} · ${since(e.last_used)}`)}</span>`;
+  }).join("");
   $("dc-note").textContent = "Saves automatically on conversation switch, after 30 s idle, every 16K new tokens, before unload, and on shutdown; oldest sessions evict when the budget fills.";
 }
 
