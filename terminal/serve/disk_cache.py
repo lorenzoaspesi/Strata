@@ -137,6 +137,91 @@ def _session_bin_compatible(path: str | Path, want_ver: int, want_model: int, wa
         return False
 
 
+def read_session_bin_checkpoints(path: str | Path) -> list[int] | None:
+    """Read exact saved checkpoint token lengths `[len(c.ids)]` from a format-v1 `.bin` file via seeks (~0.05 ms).
+
+    Returns `None` if `path` is not a format-v1 `STRSESS\\x01` file (e.g. synthetic unit-test mock blobs).
+    """
+    try:
+        st = os.lstat(path)
+        min_sz = SESSION_HEADER_BYTES + 18 * 8 + 24 + 8 + SESSION_TRAILER_BYTES
+        if not stat.S_ISREG(st.st_mode) or st.st_size < min_sz:
+            return None
+        with open(path, "rb") as fh:
+            hdr = fh.read(SESSION_HEADER_BYTES)
+            if len(hdr) != SESSION_HEADER_BYTES:
+                return None
+            magic, ver, hsize, _m, _c, payload, r0, r1, _hh = struct.unpack("<8sIIQQQQQQ", hdr)
+            if (
+                magic != SESSION_MAGIC
+                or ver != 1
+                or hsize != SESSION_HEADER_BYTES
+                or r0 != 0
+                or r1 != 0
+                or SESSION_HEADER_BYTES + payload + SESSION_TRAILER_BYTES != st.st_size
+            ):
+                return None
+            payload_end = SESSION_HEADER_BYTES + payload
+            fh.seek(SESSION_HEADER_BYTES + 18 * 8 + 24)
+
+            def skip_ckpt() -> int:
+                buf = fh.read(8)
+                if len(buf) != 8:
+                    raise ValueError("truncated ids count")
+                (n_ids,) = struct.unpack("<Q", buf)
+                fh.seek(n_ids * 4, os.SEEK_CUR)
+                buf = fh.read(8)
+                if len(buf) != 8:
+                    raise ValueError("truncated imgs count")
+                (n_imgs,) = struct.unpack("<Q", buf)
+                fh.seek(n_imgs * 16, os.SEEK_CUR)
+                for _ in range(5):
+                    buf = fh.read(8)
+                    if len(buf) != 8:
+                        raise ValueError("truncated state count")
+                    (nb,) = struct.unpack("<Q", buf)
+                    fh.seek(nb, os.SEEK_CUR)
+                fh.seek(8, os.SEEK_CUR)  # used: u64
+                if fh.tell() > payload_end:
+                    raise ValueError("checkpoint past payload")
+                return int(n_ids)
+
+            skip_ckpt()  # s.live
+            buf = fh.read(8)
+            if len(buf) != 8:
+                return None
+            (n_ck,) = struct.unpack("<Q", buf)
+            if n_ck > 1024:
+                return None
+            ckpts = sorted({skip_ckpt() for _ in range(n_ck)})
+            return ckpts
+    except (OSError, ValueError, struct.error):
+        return None
+
+
+def entry_resumable_tokens(entry: dict, prompt_ids: Sequence[int]) -> tuple[int, int]:
+    """Return `(resumable_tokens, raw_lcp)` for `entry` against `prompt_ids`.
+
+    Hybrid GDN+QSA models can only resume at `len(entry["tokens"])` (live end) or at an explicit saved
+    checkpoint length `ck <= raw_lcp`. When `entry["checkpoints"]` is `None` (unit-test mock blobs), any
+    `raw_lcp` is treated as resumable.
+    """
+    tokens = entry["tokens"]
+    raw_lcp = lcp_len(tokens, prompt_ids)
+    if raw_lcp <= 0:
+        return 0, 0
+    if raw_lcp >= len(tokens):
+        return len(tokens), raw_lcp
+    ckpts = entry.get("checkpoints")
+    if ckpts is None:
+        return raw_lcp, raw_lcp
+    best = 0
+    for ck in ckpts:
+        if ck <= raw_lcp and ck > best:
+            best = ck
+    return best, raw_lcp
+
+
 def lcp_len(a: Sequence[int], b: Sequence[int]) -> int:
     """Length of the longest common token prefix between `a` and `b`."""
     i = 0
@@ -180,6 +265,8 @@ class DiskSessionCache:
         self.entries: list[dict] = []
         self.live_tokens: list[int] = []
         self.live_prompt_len: int = 0
+        self.live_checkpoints: list[int] | None = []
+        self.live_unindexed_ram_ckpts: bool = False
         self.live_dirty: bool = False
         self.last_saved_len: int = 0
         self.live_gen: int = 0
@@ -350,21 +437,32 @@ class DiskSessionCache:
                 created_at = float(item.get("created_at") or st.st_mtime)
                 if not (math.isfinite(last_used) and math.isfinite(created_at)):
                     raise ValueError("non-finite timestamp in index")
+                raw_ckpts = item.get("checkpoints")
+                ckpts: list[int] | None
+                if isinstance(raw_ckpts, list) and all(
+                    isinstance(c, int) and not isinstance(c, bool) and c >= 0 for c in raw_ckpts
+                ):
+                    ckpts = sorted(set(raw_ckpts))
+                else:
+                    ckpts = read_session_bin_checkpoints(bpath)
+                    if ckpts is not None:
+                        dirty_index = True
             except (TypeError, ValueError):
                 _safe_unlink(bpath)
                 dirty_index = True
                 continue
-            valid.append(
-                {
-                    "id": str(item.get("id") or fname[len(SESSION_PREFIX) : -len(SESSION_SUFFIX)]),
-                    "filename": fname,
-                    "tokens": coerced_tokens,
-                    "prompt_len": prompt_len,
-                    "bytes": int(st.st_size),
-                    "last_used": last_used,
-                    "created_at": created_at,
-                }
-            )
+            entry_rec: dict = {
+                "id": str(item.get("id") or fname[len(SESSION_PREFIX) : -len(SESSION_SUFFIX)]),
+                "filename": fname,
+                "tokens": coerced_tokens,
+                "prompt_len": prompt_len,
+                "bytes": int(st.st_size),
+                "last_used": last_used,
+                "created_at": created_at,
+            }
+            if ckpts is not None:
+                entry_rec["checkpoints"] = ckpts
+            valid.append(entry_rec)
             referenced_files.add(fname)
 
         self.entries = valid
@@ -469,6 +567,7 @@ class DiskSessionCache:
             {
                 "id": str(e.get("id") or ""),
                 "tokens": len(e.get("tokens") or ()),
+                "checkpoints": len(e["checkpoints"]) if isinstance(e.get("checkpoints"), list) else None,
                 "bytes": int(e.get("bytes") or 0),
                 "last_used": float(e.get("last_used") or 0.0),
             }
@@ -512,6 +611,8 @@ class DiskSessionCache:
         if cur_gen != self.live_gen:
             self.live_tokens = []
             self.live_prompt_len = 0
+            self.live_checkpoints = []
+            self.live_unindexed_ram_ckpts = False
             self.live_dirty = False
             self.last_saved_len = 0
             self.live_gen = cur_gen
@@ -520,11 +621,29 @@ class DiskSessionCache:
     def invalidate_live(self) -> None:
         self.live_tokens = []
         self.live_prompt_len = 0
+        self.live_checkpoints = []
+        self.live_unindexed_ram_ckpts = False
         self.live_dirty = False
         self.last_saved_len = 0
         with self._cv:
             self._idle_deadline = None
         self._publish_view()
+
+    def _live_resumable_tokens(self, prompt_ids: Sequence[int]) -> tuple[int, int]:
+        if not self.live_tokens:
+            return 0, 0
+        raw_lcp = lcp_len(self.live_tokens, prompt_ids)
+        if raw_lcp <= 0:
+            return 0, 0
+        if raw_lcp >= len(self.live_tokens):
+            return len(self.live_tokens), raw_lcp
+        if self.live_checkpoints is None:
+            return raw_lcp, raw_lcp
+        best = max((ck for ck in self.live_checkpoints if ck <= raw_lcp), default=0)
+        if self.live_unindexed_ram_ckpts and self.live_prompt_len > 0:
+            if raw_lcp >= max(0, self.live_prompt_len - THINK_STRIP_SLACK):
+                best = max(best, min(raw_lcp, self.live_prompt_len))
+        return best, raw_lcp
 
     def _recover_engine_if_dead(self, svc, exc: BaseException) -> bool:
         engine_died = (not svc.loaded()) or exc.__class__.__name__ in ("EngineDied", "EngineSilent")
@@ -566,24 +685,24 @@ class DiskSessionCache:
             self._idle_deadline = None
 
         self._sync_engine_gen(svc)
-        live_lcp = lcp_len(self.live_tokens, prompt_ids)
+        live_reuse, live_lcp = self._live_resumable_tokens(prompt_ids)
 
-        ranked: list[tuple[int, dict]] = []
+        ranked: list[tuple[int, int, dict]] = []
         for entry in self.entries:
-            match_len = lcp_len(entry["tokens"], prompt_ids)
-            if match_len >= MIN_RESTORE_GAIN:
-                ranked.append((match_len, entry))
-        ranked.sort(key=lambda pair: (pair[0], -len(pair[1]["tokens"]), pair[1]["last_used"]), reverse=True)
+            reuse_len, raw_lcp = entry_resumable_tokens(entry, prompt_ids)
+            if reuse_len >= MIN_RESTORE_GAIN:
+                ranked.append((reuse_len, raw_lcp, entry))
+        ranked.sort(key=lambda item: (item[0], item[1], -len(item[2]["tokens"]), item[2]["last_used"]), reverse=True)
 
-        if ranked and (ranked[0][0] - live_lcp) >= MIN_RESTORE_GAIN:
+        if ranked and (ranked[0][0] - live_reuse) >= MIN_RESTORE_GAIN:
             if self.live_dirty and len(self.live_tokens) >= MIN_SAVE_TOKENS:
                 self._save_live_locked(svc, reason="switch", recover_dead=True)
-                live_lcp = lcp_len(self.live_tokens, prompt_ids)
+                live_reuse, live_lcp = self._live_resumable_tokens(prompt_ids)
 
             stale_files: set[str] = set()
             restored_summary: dict | None = None
-            for match_len, entry in ranked:
-                if (match_len - live_lcp) < MIN_RESTORE_GAIN:
+            for reuse_len, match_len, entry in ranked:
+                if (reuse_len - live_reuse) < MIN_RESTORE_GAIN:
                     break
                 bpath = self._bin_path(entry["filename"])
                 try:
@@ -620,28 +739,38 @@ class DiskSessionCache:
                 entry["last_used"] = now_ts
                 self.live_tokens = list(entry["tokens"])
                 self.live_prompt_len = int(entry.get("prompt_len") or len(self.live_tokens))
+                entry_ckpts = entry.get("checkpoints")
+                self.live_checkpoints = list(entry_ckpts) if isinstance(entry_ckpts, list) else None
+                self.live_unindexed_ram_ckpts = False
                 self.live_dirty = False
-                self.last_saved_len = match_len
+                self.last_saved_len = reuse_len
                 self.live_gen = int(getattr(svc.engine, "gen", 0) or 0)
                 n_tok = int(res.get("tokens", len(self.live_tokens)))
                 n_bytes = int(res.get("bytes", entry["bytes"]))
                 ms = float(res.get("ms", 0.0))
                 self.restores += 1
-                self.restored_tokens += match_len
+                self.restored_tokens += reuse_len
                 self.last_event = {
                     "kind": "restored",
                     "tokens": n_tok,
+                    "reused_tokens": reuse_len,
                     "matched_tokens": match_len,
                     "bytes": n_bytes,
                     "ms": round(ms, 1),
                     "at": now_ts,
                 }
                 print(
-                    f"[strata] disk cache: restored {n_tok} tokens ({n_bytes / (1 << 20):.1f} MiB in {ms:.0f} ms, "
-                    f"prefix match {match_len} tokens)",
+                    f"[strata] disk cache: restored {reuse_len} of {n_tok} tokens "
+                    f"({n_bytes / (1 << 20):.1f} MiB in {ms:.0f} ms, prefix match {match_len} tokens)",
                     flush=True,
                 )
-                restored_summary = {"filename": entry["filename"], "tokens": n_tok, "bytes": n_bytes, "lcp": match_len}
+                restored_summary = {
+                    "filename": entry["filename"],
+                    "tokens": n_tok,
+                    "reused": reuse_len,
+                    "bytes": n_bytes,
+                    "lcp": match_len,
+                }
                 break
 
             if stale_files:
@@ -697,6 +826,7 @@ class DiskSessionCache:
         self.live_prompt_len = (
             len(self.live_tokens) if prompt_len is None else max(0, min(int(prompt_len), len(self.live_tokens)))
         )
+        self.live_unindexed_ram_ckpts = True
         self.last_saved_len = saved_base
         unsaved = len(self.live_tokens) - self.last_saved_len
         self.live_dirty = len(self.live_tokens) >= MIN_SAVE_TOKENS and unsaved >= MIN_SAVE_GAIN
@@ -801,21 +931,25 @@ class DiskSessionCache:
         if superseded:
             self.entries = [e for e in self.entries if e["filename"] not in superseded]
 
+        saved_ckpts = read_session_bin_checkpoints(bpath)
         now = time.time()
-        self.entries.append(
-            {
-                "id": sid,
-                "filename": fname,
-                "tokens": list(self.live_tokens),
-                "prompt_len": int(cur_prompt_len),
-                "bytes": int(actual_bytes),
-                "last_used": now,
-                "created_at": now,
-            }
-        )
+        new_entry: dict = {
+            "id": sid,
+            "filename": fname,
+            "tokens": list(self.live_tokens),
+            "prompt_len": int(cur_prompt_len),
+            "bytes": int(actual_bytes),
+            "last_used": now,
+            "created_at": now,
+        }
+        if saved_ckpts is not None:
+            new_entry["checkpoints"] = saved_ckpts
+        self.entries.append(new_entry)
         self._evict_to_budget()
         self._write_index()
 
+        self.live_checkpoints = list(saved_ckpts) if saved_ckpts is not None else None
+        self.live_unindexed_ram_ckpts = False
         self.live_dirty = False
         self.last_saved_len = len(self.live_tokens)
         with self._cv:
@@ -826,6 +960,7 @@ class DiskSessionCache:
         self.last_event = {
             "kind": "saved",
             "tokens": len(self.live_tokens),
+            "checkpoints": len(saved_ckpts) if saved_ckpts is not None else None,
             "bytes": int(actual_bytes),
             "ms": round(ms, 1),
             "reason": reason,
