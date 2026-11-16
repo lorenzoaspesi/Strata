@@ -240,6 +240,7 @@ a.st-header__brand:hover { color: var(--st-accent-text); text-decoration: none; 
   .chat { padding: var(--st-s-5) var(--st-s-4); }
   .composer-wrap { padding: 0 var(--st-s-3) var(--st-s-3); }
   .monitor, .about { padding: var(--st-s-4); }
+  .cc-bars { grid-template-columns: 1fr; }
   .facts { grid-template-columns: 1fr; gap: 2px; }
   .facts dd { margin-bottom: var(--st-s-2); }
   .cfg-form .st-input { max-width: none; }

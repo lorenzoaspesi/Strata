@@ -354,11 +354,11 @@ PYTHONDONTWRITEBYTECODE=1 python3 "$STRATA_REPO/packaging/stage_local_control.py
     --commit "$GIT_FULL"
 
 CONTROL_PY="$COMPONENTS_DIR/control/$PKG_VER/python/bin/python3"
-echo "==> Running DiskSessionCache & VisionSwap test suites in staged Control ($PKG_VER)"
+echo "==> Running DiskSessionCache, VisionSwap & Monitor test suites in staged Control ($PKG_VER)"
 (
     cd "$COMPONENTS_DIR/control/$PKG_VER"
     PYTHONNOUSERSITE=1 PYTHONDONTWRITEBYTECODE=1 \
-        "$CONTROL_PY" -B -m unittest serve.test_disk_cache serve.test_vision_swap
+        "$CONTROL_PY" -B -m unittest serve.test_disk_cache serve.test_vision_swap serve.test_monitor
 )
 
 if [[ "$RUN_TESTS" -eq 1 ]]; then

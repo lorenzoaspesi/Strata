@@ -377,7 +377,8 @@ function render(m) {
   modelButton(live);
   if (!modelOp && !localLoad && live.queued > 0) setPill("queued", tr("pill.queued", "{n} queued", {n: live.queued}));
   if (tab === "monitor") renderMonitor(live, hw, st, eng, h, last, m.requests || [], m.totals, m.requests_kept);
-  if (tab === "monitor") renderConvCache(m.conversation_cache);
+  if (tab === "monitor") renderConvCache(m.conversation_cache, m.disk_cache);
+  if (tab === "monitor") renderDiskCache(m.disk_cache);
   if (tab === "about") renderAbout(eng, hw, st);
 }
 
@@ -388,7 +389,7 @@ function since(t) {
   const s = Math.max(0, Date.now() / 1000 - t);
   return s < 60 ? "just now" : s < 3600 ? `${fmt(s / 60)} min ago` : `${fmt(s / 3600, 1)} h ago`;
 }
-function renderConvCache(c) {
+function renderConvCache(c, dc) {
   $("cc-card").hidden = !c;
   if (!c) return;                                  // an older server
   const pct = (a, b) => (b ? `${Math.min(100, (100 * a) / b)}%` : "0%");
@@ -411,7 +412,58 @@ function renderConvCache(c) {
   ]);
   $("cc-note").textContent = c.enabled
     ? "A request that continues a parked conversation gets its state back instead of reading it again; the oldest goes when the slots or the memory are full."
-    : "The engine keeps the last conversation's state, so a follow-up reads only what is new. To keep several conversations (agents taking turns), add \"--conversation-cache-mib\", \"8192\" to the run config's args (docs/DETAILS.md).";
+    : (dc && dc.enabled)
+      ? "The engine keeps the active conversation in live memory; multi-conversation parking and reboot persistence are handled on disk below."
+      : "The engine keeps the last conversation's state, so a follow-up reads only what is new. To keep several conversations (agents taking turns), add \"--conversation-cache-mib\", \"8192\" to the run config's args (docs/DETAILS.md).";
+}
+
+function renderDiskCache(dc) {
+  const card = $("dc-card");
+  if (!card) return;
+  const active = Boolean(dc && dc.enabled);
+  card.hidden = !active;
+  if (!active) return;
+  const pct = (a, b) => (b ? `${Math.min(100, (100 * a) / b)}%` : "0%");
+  const sizeText = (b) => (b >= 1073741824 ? `${gb(b, 2)} GB` : `${fmt(b / 1048576, b >= 104857600 ? 0 : 1)} MB`);
+  $("dc-sum").textContent = `${fmt(dc.sessions)} saved ${dc.sessions === 1 ? "session" : "sessions"} · ${kfmt(dc.total_tokens || 0)} tok on disk`;
+  $("dc-space-text").textContent = `${gb(dc.used_bytes, 2)} / ${gb(dc.budget_bytes, 1)} GB`;
+  $("dc-space-bar").style.width = pct(dc.used_bytes, dc.budget_bytes);
+
+  const periodic = dc.periodic_save_tokens || 16384;
+  if (!dc.live_tokens) {
+    $("dc-live-text").textContent = "Empty";
+    $("dc-live-bar").style.width = "0%";
+  } else if (dc.live_dirty) {
+    $("dc-live-text").textContent = `${kfmt(dc.live_tokens)} tok (+${kfmt(dc.live_unsaved_tokens)} unsaved)`;
+    $("dc-live-bar").style.width = pct(dc.live_unsaved_tokens, periodic);
+  } else {
+    $("dc-live-text").textContent = `${kfmt(dc.live_tokens)} tok (synced)`;
+    $("dc-live-bar").style.width = "100%";
+  }
+
+  let evText = null;
+  if (dc.last_event) {
+    const ev = dc.last_event;
+    const verb = ev.kind === "saved" ? "Saved" : "Restored";
+    const why = ev.reason ? ` · ${ev.reason}` : "";
+    evText = `${verb} ${fmt(ev.tokens)} tokens (${sizeText(ev.bytes)} in ${fmt(ev.ms)} ms${why}), ${since(ev.at)}`;
+  }
+  const xfer = `${fmt(dc.saves)} saved · ${fmt(dc.restores)} restored` +
+               (dc.restored_tokens ? ` (${kfmt(dc.restored_tokens)} tok)` : "") +
+               (dc.evictions ? ` · ${fmt(dc.evictions)} evicted` : "");
+  facts($("dc-facts"), [
+    ["Saved / restored", xfer],
+    ["Last disk transfer", evText],
+    ["Cache folder", dc.dir || null],
+  ]);
+
+  const entries = dc.entries || [];
+  const box = $("dc-sessions");
+  box.hidden = !entries.length;
+  box.innerHTML = entries.map((e) =>
+    `<span class="chip" title="Session ${esc(e.id)} · ${fmt(e.tokens)} tokens">${esc(`${kfmt(e.tokens)} tok · ${sizeText(e.bytes)} · ${since(e.last_used)}`)}</span>`
+  ).join("");
+  $("dc-note").textContent = "Saves automatically on conversation switch, after 30 s idle, every 16K new tokens, before unload, and on shutdown; oldest sessions evict when the budget fills.";
 }
 
 function renderTotals(t) {

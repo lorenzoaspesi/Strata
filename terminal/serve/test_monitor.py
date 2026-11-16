@@ -341,9 +341,43 @@ class ConversationCacheCard(unittest.TestCase):
     def test_the_card_is_on_the_page(self):
         web = Path(__file__).parent / "web"
         html, js = (web / "index.html").read_text(encoding="utf-8"), (web / "app.js").read_text(encoding="utf-8")
-        for el in ("cc-card", "cc-slots-text", "cc-mem-text", "cc-facts", "cc-note"):
+        for el in ("cc-card", "cc-slots-text", "cc-mem-text", "cc-facts", "cc-note",
+                   "dc-card", "dc-sum", "dc-space-text", "dc-live-text", "dc-facts", "dc-sessions", "dc-note"):
             self.assertIn(f'id="{el}"', html)
             self.assertIn(f'"{el}"', js)
+
+    def test_disk_cache_metrics_view(self):
+        from serve.disk_cache import DiskSessionCache
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as d:
+            tok = ByteTokenizer()
+            engine = MockEngine(tok, "Thought.</think>\nHello.", max_context=4096)
+            engine.session_file = lambda action, path: (
+                Path(path).write_bytes(b"x" * 4096),
+                {"tokens": 1500, "bytes": 4096, "ms": 3.0},
+            )[1]
+            svc = Service(engine, tok, ChatTemplate(Path(__file__).parent / "chat_template.jinja"))
+            svc.disk_cache = DiskSessionCache.from_config(str(Path(d) / "dc"), 2, idle_save_s=300.0)
+            self.addCleanup(svc.disk_cache.close, svc)
+            with svc.fifo:
+                svc.disk_cache.after_generate(svc, [10 + i for i in range(1500)], ok=True, prompt_len=1400)
+                svc.disk_cache._save_live_locked(svc, reason="switch")
+            httpd = serve(svc, port=0)
+            base = f"http://127.0.0.1:{httpd.server_address[1]}"
+            try:
+                with urllib.request.urlopen(base + "/metrics", timeout=10) as r:
+                    dc = json.loads(r.read())["disk_cache"]
+                self.assertTrue(dc["enabled"])
+                self.assertEqual(dc["sessions"], 1)
+                self.assertEqual(dc["saves"], 1)
+                self.assertEqual(dc["used_bytes"], 4096)
+                self.assertEqual(dc["last_event"]["kind"], "saved")
+                self.assertEqual(len(dc["entries"]), 1)
+                self.assertEqual(dc["entries"][0]["tokens"], 1500)
+            finally:
+                httpd.shutdown()
+                httpd.server_close()
 
 
 if __name__ == "__main__":

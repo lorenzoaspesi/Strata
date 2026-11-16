@@ -82,6 +82,14 @@ class DiskSessionCache:
         self.last_saved_len: int = 0
         self.live_gen: int = 0
 
+        self._stats_lock = threading.Lock()
+        self.saves: int = 0
+        self.restores: int = 0
+        self.evictions: int = 0
+        self.restored_tokens: int = 0
+        self.last_event: dict | None = None
+        self._cached_view: dict = {}
+
         self._cv = threading.Condition()
         self._idle_deadline: float | None = None
         self._closing = False
@@ -90,6 +98,7 @@ class DiskSessionCache:
 
         if self.enabled and self.dir is not None:
             self._load_and_reconcile_index()
+        self._publish_view()
 
     @classmethod
     def from_config(
@@ -315,8 +324,49 @@ class DiskSessionCache:
             )
         if evicted_ids:
             self.entries = [e for e in self.entries if e["filename"] not in evicted_ids]
+            self.evictions += len(evicted_ids)
             return True
         return False
+
+    def _publish_view(self) -> None:
+        used_bytes = sum(int(e.get("bytes") or 0) for e in self.entries)
+        total_tokens = sum(len(e.get("tokens") or ()) for e in self.entries)
+        ordered = sorted(self.entries, key=lambda e: (e.get("last_used", 0.0), e.get("created_at", 0.0)), reverse=True)
+        entry_summaries = [
+            {
+                "id": str(e.get("id") or ""),
+                "tokens": len(e.get("tokens") or ()),
+                "bytes": int(e.get("bytes") or 0),
+                "last_used": float(e.get("last_used") or 0.0),
+            }
+            for e in ordered[:12]
+        ]
+        live_len = len(self.live_tokens)
+        unsaved = max(0, live_len - self.last_saved_len) if self.live_dirty else 0
+        view = {
+            "enabled": bool(self.enabled),
+            "dir": self.dir,
+            "budget_bytes": int(self.budget_bytes),
+            "used_bytes": int(used_bytes),
+            "sessions": len(self.entries),
+            "total_tokens": int(total_tokens),
+            "live_tokens": int(live_len),
+            "live_dirty": bool(self.live_dirty),
+            "live_unsaved_tokens": int(unsaved),
+            "periodic_save_tokens": PERIODIC_SAVE_TOKENS,
+            "saves": int(self.saves),
+            "restores": int(self.restores),
+            "evictions": int(self.evictions),
+            "restored_tokens": int(self.restored_tokens),
+            "last_event": dict(self.last_event) if self.last_event is not None else None,
+            "entries": entry_summaries,
+        }
+        with self._stats_lock:
+            self._cached_view = view
+
+    def metrics_view(self) -> dict:
+        with self._stats_lock:
+            return dict(self._cached_view)
 
     def _remember_service(self, svc) -> None:
         try:
@@ -332,6 +382,7 @@ class DiskSessionCache:
             self.live_dirty = False
             self.last_saved_len = 0
             self.live_gen = cur_gen
+            self._publish_view()
 
     def invalidate_live(self) -> None:
         self.live_tokens = []
@@ -340,6 +391,7 @@ class DiskSessionCache:
         self.last_saved_len = 0
         with self._cv:
             self._idle_deadline = None
+        self._publish_view()
 
     def _recover_engine_if_dead(self, svc, exc: BaseException) -> bool:
         engine_died = (not svc.loaded()) or exc.__class__.__name__ in ("EngineDied", "EngineSilent")
@@ -431,7 +483,8 @@ class DiskSessionCache:
                         print(f"[strata] disk cache: restore failed ({exc})", flush=True)
                     break
 
-                entry["last_used"] = time.time()
+                now_ts = time.time()
+                entry["last_used"] = now_ts
                 self.live_tokens = list(entry["tokens"])
                 self.live_prompt_len = int(entry.get("prompt_len") or len(self.live_tokens))
                 self.live_dirty = False
@@ -440,6 +493,16 @@ class DiskSessionCache:
                 n_tok = int(res.get("tokens", len(self.live_tokens)))
                 n_bytes = int(res.get("bytes", entry["bytes"]))
                 ms = float(res.get("ms", 0.0))
+                self.restores += 1
+                self.restored_tokens += match_len
+                self.last_event = {
+                    "kind": "restored",
+                    "tokens": n_tok,
+                    "matched_tokens": match_len,
+                    "bytes": n_bytes,
+                    "ms": round(ms, 1),
+                    "at": now_ts,
+                }
                 print(
                     f"[strata] disk cache: restored {n_tok} tokens ({n_bytes / (1 << 20):.1f} MiB in {ms:.0f} ms, "
                     f"prefix match {match_len} tokens)",
@@ -450,8 +513,10 @@ class DiskSessionCache:
 
             if stale_files:
                 self.entries = [e for e in self.entries if e["filename"] not in stale_files]
+                self.evictions += len(stale_files)
             if stale_files or restored_summary is not None:
                 self._write_index()
+                self._publish_view()
             return restored_summary
 
         # Switching away from a dirty long conversation when no disk session was restored.
@@ -507,6 +572,7 @@ class DiskSessionCache:
             self._save_live_locked(svc, reason="checkpoint")
         elif self.live_dirty:
             self._arm_idle()
+        self._publish_view()
 
     def on_unload_locked(self, svc) -> None:
         if not self.enabled:
@@ -545,7 +611,9 @@ class DiskSessionCache:
                     oldest = min(self.entries, key=lambda e: (e["last_used"], e["created_at"]))
                     _safe_unlink(self._bin_path(oldest["filename"]))
                     self.entries = [e for e in self.entries if e["filename"] != oldest["filename"]]
+                    self.evictions += 1
                     self._write_index()
+                    self._publish_view()
                     res = self._call_engine_save(svc, bpath)
                 else:
                     raise
@@ -621,6 +689,16 @@ class DiskSessionCache:
             self._idle_deadline = None
 
         ms = float(res.get("ms", 0.0))
+        self.saves += 1
+        self.last_event = {
+            "kind": "saved",
+            "tokens": len(self.live_tokens),
+            "bytes": int(actual_bytes),
+            "ms": round(ms, 1),
+            "reason": reason,
+            "at": now,
+        }
+        self._publish_view()
         print(
             f"[strata] disk cache: saved {len(self.live_tokens)} tokens "
             f"({actual_bytes / (1 << 20):.1f} MiB in {ms:.0f} ms, reason={reason})",

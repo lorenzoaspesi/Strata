@@ -198,6 +198,19 @@
         <p class="muted small cc-note" id="cc-note"></p>
       </div>
 
+      <div class="st-card cc-card" id="dc-card" hidden>
+        <div class="req-head"><span class="card-title">Disk session cache</span><span class="muted small" id="dc-sum"></span></div>
+        <div class="cc-bars" id="dc-bars">
+          <div><div class="bar-row"><span>Disk space used</span><span class="muted" id="dc-space-text">&ndash;</span></div>
+            <div class="st-progress"><div class="st-progress__bar" id="dc-space-bar" style="width:0%"></div></div></div>
+          <div><div class="bar-row"><span>Live conversation</span><span class="muted" id="dc-live-text">&ndash;</span></div>
+            <div class="st-progress"><div class="st-progress__bar" id="dc-live-bar" style="width:0%"></div></div></div>
+        </div>
+        <dl class="facts" id="dc-facts"></dl>
+        <div class="mcp-server__tools" id="dc-sessions" hidden></div>
+        <p class="muted small cc-note" id="dc-note"></p>
+      </div>
+
       <div class="st-card mcp-card" id="mcp-card" hidden>
         <div class="req-head"><span class="card-title">MCP servers</span><span class="muted small" id="mcp-sum"></span></div>
         <div class="mcp-list" id="mcp-list"></div>
