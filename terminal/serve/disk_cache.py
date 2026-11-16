@@ -13,8 +13,10 @@ from __future__ import annotations
 import json
 import math
 import os
+import re
 import secrets
 import stat
+import struct
 import tempfile
 import threading
 import time
@@ -33,6 +35,106 @@ CLOSE_WAIT_S = 30.0
 SESSION_PREFIX = "session-"
 SESSION_SUFFIX = ".bin"
 INDEX_NAME = "index.json"
+
+SESSION_MAGIC = b"STRSESS\x01"
+SESSION_END_MAGIC = b"STRSEND\x01"
+SESSION_HEADER_BYTES = 64
+SESSION_TRAILER_BYTES = 16
+_SESSION_FP_RE = re.compile(r"^v([0-9]+):([0-9a-fA-F]{16}):([0-9a-fA-F]{16})$")
+
+_MASK64 = (1 << 64) - 1
+_P1 = 0x9E3779B185EBCA87
+_P2 = 0xC2B2AE3D27D4EB4F
+_P3 = 0x165667B19E3779F9
+_P4 = 0x85EBCA77C2B2AE63
+_P5 = 0x27D4EB2F165667C5
+
+
+def _rotl64(x: int, r: int) -> int:
+    x &= _MASK64
+    return ((x << r) | (x >> (64 - r))) & _MASK64
+
+
+def _round1_64(acc: int, w: int) -> int:
+    return (_rotl64((acc + ((w * _P2) & _MASK64)) & _MASK64, 31) * _P1) & _MASK64
+
+
+def session_hash64(data: bytes | memoryview, seed: int = 0) -> int:
+    """Exact port of `strata::core::session_hash64` (`src/core/conversation_file.cpp`)."""
+    lane0 = (seed + _P1 + _P2) & _MASK64
+    lane1 = (seed + _P2) & _MASK64
+    lane2 = seed & _MASK64
+    lane3 = (seed - _P1) & _MASK64
+    mv = memoryview(data)
+    n = len(mv)
+    off = 0
+    while off + 32 <= n:
+        w0, w1, w2, w3 = struct.unpack_from("<4Q", mv, off)
+        lane0 = _round1_64(lane0, w0)
+        lane1 = _round1_64(lane1, w1)
+        lane2 = _round1_64(lane2, w2)
+        lane3 = _round1_64(lane3, w3)
+        off += 32
+    h = (_rotl64(lane0, 1) + _rotl64(lane1, 7) + _rotl64(lane2, 12) + _rotl64(lane3, 18)) & _MASK64
+    for lv in (lane0, lane1, lane2, lane3):
+        h ^= _round1_64(0, lv)
+        h = (h * _P1 + _P4) & _MASK64
+    h = (h + n) & _MASK64
+    while off + 8 <= n:
+        (w,) = struct.unpack_from("<Q", mv, off)
+        h ^= _round1_64(0, w)
+        h = (_rotl64(h, 27) * _P1 + _P4) & _MASK64
+        off += 8
+    while off < n:
+        h ^= (mv[off] * _P5) & _MASK64
+        h = (_rotl64(h, 11) * _P1) & _MASK64
+        off += 1
+    h ^= h >> 33
+    h = (h * _P2) & _MASK64
+    h ^= h >> 29
+    h = (h * _P3) & _MASK64
+    h ^= h >> 32
+    return h
+
+
+def _parse_session_fp(raw: object) -> tuple[int, int, int] | None:
+    if not isinstance(raw, str):
+        return None
+    m = _SESSION_FP_RE.match(raw.strip())
+    if not m:
+        return None
+    return int(m.group(1)), int(m.group(2), 16), int(m.group(3), 16)
+
+
+def _session_bin_compatible(path: str | Path, want_ver: int, want_model: int, want_cfg: int) -> bool:
+    try:
+        st = os.lstat(path)
+        if not stat.S_ISREG(st.st_mode) or st.st_size < SESSION_HEADER_BYTES + SESSION_TRAILER_BYTES:
+            return False
+        with open(path, "rb") as fh:
+            hdr = fh.read(SESSION_HEADER_BYTES)
+            if len(hdr) != SESSION_HEADER_BYTES:
+                return False
+            magic, ver, hsize, model_fp, cfg_fp, payload, r0, r1, hh = struct.unpack("<8sIIQQQQQQ", hdr)
+            if (
+                magic != SESSION_MAGIC
+                or hsize != SESSION_HEADER_BYTES
+                or r0 != 0
+                or r1 != 0
+                or SESSION_HEADER_BYTES + payload + SESSION_TRAILER_BYTES != st.st_size
+                or ver != want_ver
+                or model_fp != want_model
+                or cfg_fp != want_cfg
+                or session_hash64(hdr[:56], 0) != hh
+            ):
+                return False
+            fh.seek(-SESSION_TRAILER_BYTES, os.SEEK_END)
+            trl = fh.read(SESSION_TRAILER_BYTES)
+            if len(trl) != SESSION_TRAILER_BYTES or trl[8:16] != SESSION_END_MAGIC:
+                return False
+        return True
+    except OSError:
+        return False
 
 
 def lcp_len(a: Sequence[int], b: Sequence[int]) -> int:
@@ -327,6 +429,37 @@ class DiskSessionCache:
             self.evictions += len(evicted_ids)
             return True
         return False
+
+    def prune_incompatible(self, engine_info: dict | None) -> int:
+        """Delete indexed `.bin` files whose header/trailer or `(version, model, config)` fingerprint does not match the live engine."""
+        if not self.enabled or self.dir is None or not isinstance(engine_info, dict):
+            return 0
+        fp = _parse_session_fp(engine_info.get("session_fp"))
+        if fp is None or not self.entries:
+            return 0
+        want_ver, want_model, want_cfg = fp
+        kept: list[dict] = []
+        pruned = 0
+        freed_bytes = 0
+        for entry in self.entries:
+            bpath = self._bin_path(entry["filename"])
+            if _session_bin_compatible(bpath, want_ver, want_model, want_cfg):
+                kept.append(entry)
+            else:
+                _safe_unlink(bpath)
+                pruned += 1
+                freed_bytes += int(entry.get("bytes") or 0)
+        if pruned:
+            self.entries = kept
+            self.evictions += pruned
+            self._write_index()
+            self._publish_view()
+            print(
+                f"[strata] disk cache: pruned {pruned} incompatible session file(s) "
+                f"({freed_bytes / (1 << 20):.1f} MiB)",
+                flush=True,
+            )
+        return pruned
 
     def _publish_view(self) -> None:
         used_bytes = sum(int(e.get("bytes") or 0) for e in self.entries)

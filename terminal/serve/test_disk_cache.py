@@ -864,6 +864,173 @@ class StrataControlIntegrationTests(unittest.TestCase):
             list(svc.run(unexecuted_ids, False, None, 16, {}, threading.Event()))
         self.assertNotEqual(svc.disk_cache.live_tokens, unexecuted_ids)
 
+    @staticmethod
+    def _make_session_bin(
+        path: Path,
+        *,
+        version: int = 1,
+        model_fp: int = 0x3596F3A865B63D1E,
+        config_fp: int = 0x8341DE3075756AB1,
+        payload: bytes = b"\x00" * 128,
+        corrupt_header_hash: bool = False,
+        bad_trailer: bool = False,
+    ) -> int:
+        import struct
+        from serve.disk_cache import session_hash64
+
+        hdr_prefix = struct.pack(
+            "<8sIIQQQQQ",
+            b"STRSESS\x01",
+            version,
+            64,
+            model_fp,
+            config_fp,
+            len(payload),
+            0,
+            0,
+        )
+        hh = session_hash64(hdr_prefix, 0)
+        if corrupt_header_hash:
+            hh ^= 1
+        hdr = hdr_prefix + struct.pack("<Q", hh)
+        ph = session_hash64(payload, 0)
+        trailer = struct.pack("<Q8s", ph, b"BADEND!!\x00"[:8] if bad_trailer else b"STRSEND\x01")
+        blob = hdr + payload + trailer
+        path.write_bytes(blob)
+        return len(blob)
+
+    def test_prune_incompatible_removes_mismatched_and_corrupt_bins_and_keeps_matching(self):
+        cache_dir = self.root / "prune-cache"
+        cache_dir.mkdir()
+        specs = [
+            ("aaaa11111111", {"model_fp": 0x3596F3A865B63D1E, "config_fp": 0x8341DE3075756AB1}),
+            ("bbbb22222222", {"model_fp": 0x3596F3A865B63D1E, "config_fp": 0xC24C8F80CC204E4C}),
+            ("cccc33333333", {"model_fp": 0x1111111111111111, "config_fp": 0x8341DE3075756AB1}),
+            ("dddd44444444", {"version": 2}),
+            ("eeee55555555", {"corrupt_header_hash": True}),
+            ("ffff66666666", {"bad_trailer": True}),
+        ]
+        entries = []
+        for sid, kw in specs:
+            fname = f"session-{sid}.bin"
+            sz = self._make_session_bin(cache_dir / fname, **kw)
+            entries.append(
+                {
+                    "id": sid,
+                    "filename": fname,
+                    "tokens": [10, 20, 30] * 500,
+                    "prompt_len": 1500,
+                    "bytes": sz,
+                    "last_used": 1000.0,
+                    "created_at": 1000.0,
+                }
+            )
+        (cache_dir / "index.json").write_text(json.dumps({"version": 1, "entries": entries}), encoding="utf-8")
+
+        cache = DiskSessionCache.from_config(str(cache_dir), 1)
+        self.addCleanup(cache.close)
+        self.assertEqual(len(cache.entries), 6)
+
+        pruned = cache.prune_incompatible({"session_fp": "v1:3596f3a865b63d1e:8341de3075756ab1"})
+        self.assertEqual(pruned, 5)
+        self.assertEqual([e["id"] for e in cache.entries], ["aaaa11111111"])
+        self.assertEqual([p.name for p in sorted(cache_dir.glob("session-*.bin"))], ["session-aaaa11111111.bin"])
+        saved_idx = json.loads((cache_dir / "index.json").read_text(encoding="utf-8"))
+        self.assertEqual([e["id"] for e in saved_idx["entries"]], ["aaaa11111111"])
+        self.assertEqual(cache.metrics_view()["sessions"], 1)
+
+    def test_prune_incompatible_noop_when_engine_info_lacks_session_fp(self):
+        cache_dir = self.root / "noop-prune"
+        cache = DiskSessionCache.from_config(str(cache_dir), 1)
+        self.addCleanup(cache.close)
+        bpath = cache_dir / "session-123456789abc.bin"
+        bpath.write_bytes(b"mock-bytes" * 20)
+        cache.entries = [
+            {
+                "id": "123456789abc",
+                "filename": "session-123456789abc.bin",
+                "tokens": [1] * 1200,
+                "prompt_len": 1200,
+                "bytes": bpath.stat().st_size,
+                "last_used": 1000.0,
+                "created_at": 1000.0,
+            }
+        ]
+        self.assertEqual(cache.prune_incompatible(None), 0)
+        self.assertEqual(cache.prune_incompatible({}), 0)
+        self.assertEqual(len(cache.entries), 1)
+        self.assertTrue(bpath.is_file())
+
+    def test_service_ensure_loaded_prunes_incompatible_sessions_on_reload(self):
+        from serve.frontend import ChatTemplate
+        from serve import server as srv
+
+        tok = srv.ByteTokenizer()
+        cache_dir = self.root / "reload-prune"
+        cache_dir.mkdir()
+        stale_tokens = [65 + (i % 26) for i in range(1400)]
+        sz = self._make_session_bin(
+            cache_dir / "session-deadbeef0001.bin",
+            model_fp=0x3596F3A865B63D1E,
+            config_fp=0xC24C8F80CC204E4C,  # stale 0.1.60 fingerprint
+        )
+        (cache_dir / "index.json").write_text(
+            json.dumps(
+                {
+                    "version": 1,
+                    "entries": [
+                        {
+                            "id": "deadbeef0001",
+                            "filename": "session-deadbeef0001.bin",
+                            "tokens": stale_tokens,
+                            "prompt_len": len(stale_tokens),
+                            "bytes": sz,
+                            "last_used": 1000.0,
+                            "created_at": 1000.0,
+                        }
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        class LazyFpEngine(srv.MockEngine):
+            def __init__(self):
+                super().__init__(tok, ["ok"], max_context=65536)
+                self.gen = 0
+                self.batch = 0
+                self.unloaded = True
+                self.session_save_reclaim = False
+                self.info = {}
+                self.restore_calls = 0
+
+            def alive(self) -> bool:
+                return not self.unloaded
+
+            def restart(self) -> None:
+                self.unloaded = False
+                self.gen += 1
+                self.info = {"session_fp": "v1:3596f3a865b63d1e:8341de3075756ab1"}
+
+            def session_file(self, action: str, path: str) -> dict:
+                if action == "restore":
+                    self.restore_calls += 1
+                return {"tokens": 0, "bytes": 0, "ms": 1.0}
+
+        engine = LazyFpEngine()
+        svc = srv.Service(engine, tok, ChatTemplate(Path(srv.__file__).resolve().parent / "chat_template.jinja"))
+        svc.disk_cache = DiskSessionCache.from_config(
+            str(cache_dir), 1, refused_type=srv.SessionRefused, idle_save_s=300.0
+        )
+        self.addCleanup(svc.disk_cache.close, svc)
+        self.assertEqual(len(svc.disk_cache.entries), 1)
+
+        events = list(svc.run(stale_tokens + [90] * 100, False, None, 16, {}, threading.Event()))
+        self.assertEqual(events[-1][0], "done")
+        self.assertEqual(engine.restore_calls, 0)
+        self.assertEqual(svc.disk_cache.entries, [])
+        self.assertEqual(list(cache_dir.glob("session-*.bin")), [])
+
 
 if __name__ == "__main__":
     unittest.main()

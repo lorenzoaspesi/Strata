@@ -15523,6 +15523,23 @@ int main(int argc, char** argv) {
                     slots_all += remote_experts[(size_t) r].resident();
                     mib_all += (int64_t) (remote_experts[(size_t) r].gib() * 1024.0);
                 }
+            std::string extra_info;
+            if (o.batch > 0) {
+                extra_info += " batch_slots=" + std::to_string(o.batch) +
+                              " slot_cache=" + std::to_string(o.prompt_cache > 0 ? 1 : 0) +
+                              " batch_groups=" + std::to_string(o.batch_groups) +
+                              " slot_read=" + std::to_string(slot_read_cap ? 1 : 0);
+            }
+            if (stages.empty() && !multi_gpu && o.peer_device < 1 && o.batch <= 0 && o.prompt_cache > 0) {
+                strata::core::SessionFileIdentity sid;
+                std::string sid_err;
+                if (session_identity(sid, sid_err, {})) {
+                    char fp_buf[64];
+                    std::snprintf(fp_buf, sizeof(fp_buf), " session_fp=v1:%016llx:%016llx",
+                                  (unsigned long long) sid.model, (unsigned long long) sid.config);
+                    extra_info += fp_buf;
+                }
+            }
             // (#5012: experts = every routed (layer, expert) pair, so the Monitor shows "slots / experts" as a share)
             std::printf("INFO logit_bias=1 context=%lld kv=%s kv_resident=%lld expert_slots=%lld experts=%lld expert_cache_mib=%lld "
                         "expert_slots_primary=%lld expert_cache_primary_mib=%lld spec=%d "
@@ -15548,10 +15565,7 @@ int main(int argc, char** argv) {
                         (long long) o.prefill_chunk, sp.stage_count(),
                         (long long) strata::prefill::Prefill::stream_all_min_tokens(),
                         strata::prefill::Prefill::pipe_setting(),
-                        o.batch > 0 ? (" batch_slots=" + std::to_string(o.batch) +
-                                       " slot_cache=" + std::to_string(o.prompt_cache > 0 ? 1 : 0) +
-                                       " batch_groups=" + std::to_string(o.batch_groups) +
-                                       " slot_read=" + std::to_string(slot_read_cap ? 1 : 0)).c_str() : "");
+                        extra_info.c_str());
             if (strata::core::manifest::enabled()) {   // STRATA_MANIFEST: engine choice and budgets (a diagnostic; off by default)
                 auto& M = strata::core::manifest::instance();
                 M.engine("version", STRATA_VERSION);
