@@ -34,6 +34,9 @@
 #define cudaMemcpy hipMemcpy
 #define cudaMemcpyHostToDevice hipMemcpyHostToDevice
 #define cudaMemcpyDeviceToHost hipMemcpyDeviceToHost
+#define cudaHostAlloc hipHostMalloc
+#define cudaFreeHost hipHostFree
+#define cudaHostAllocPortable hipHostMallocPortable
 #define cudaMemset hipMemset
 #define cudaGetLastError hipGetLastError
 #define cudaDeviceSynchronize hipDeviceSynchronize
@@ -445,6 +448,20 @@ struct VitGpuImpl {
     std::vector<void*> work;        // the work buffers (a prefix of allocs is weights, the rest are these)
     size_t n_weight_allocs = 0;
 
+    struct WeightSlot {
+        char* slot_storage = nullptr;   // address of the member pointer (`float*` or `void*`), accessed via memcpy
+        size_t offset = 0;
+        size_t nbytes = 0;
+    };
+    std::vector<WeightSlot> weight_slots;
+    void* d_weight_slab = nullptr;
+    void* h_pinned = nullptr;
+    std::vector<uint8_t> h_pageable;
+    uint8_t* h_slab = nullptr;
+    size_t slab_bytes = 0;
+    bool sleeping = false;
+    bool host_pinned_used = false;
+
     float *patch_w = nullptr, *patch_b = nullptr, *pos = nullptr, *post_w = nullptr, *post_b = nullptr, *mm0_b = nullptr, *mm2_b = nullptr;
     DevW mm0, mm2;
     std::vector<DevLayer> layers;
@@ -670,17 +687,56 @@ struct VitGpuImpl {
         lt_close();
 #endif
         for (void* p : allocs) (void) cudaFree(p);
+        if (d_weight_slab) (void) cudaFree(d_weight_slab);
+        if (h_pinned) (void) cudaFreeHost(h_pinned);
         if (blas) cublasDestroy(blas);
+    }
+    bool alloc_raw(void*& p, size_t nbytes, std::string& err, bool weight) {
+        void* q = nullptr;
+        const cudaError_t e = cudaMalloc(&q, nbytes);
+        if (e != cudaSuccess) { err = std::string("GPU memory: ") + cudaGetErrorString(e); (void) cudaGetLastError(); return false; }
+        p = q;
+        allocs.push_back(q);
+        bytes += nbytes;
+        if (weight) {
+            weight_slots.push_back(WeightSlot{reinterpret_cast<char*>(&p), slab_bytes, nbytes});
+            slab_bytes = (slab_bytes + nbytes + 4095u) & ~size_t(4095u);
+        } else {
+            work_bytes += nbytes;
+        }
+        return true;
     }
     template <class T> bool alloc(T*& p, size_t n, std::string& err, bool weight) {
         void* q = nullptr;
-        const cudaError_t e = cudaMalloc(&q, n * sizeof(T));
+        const size_t nbytes = n * sizeof(T);
+        const cudaError_t e = cudaMalloc(&q, nbytes);
         if (e != cudaSuccess) { err = std::string("GPU memory: ") + cudaGetErrorString(e); (void) cudaGetLastError(); return false; }
         p = (T*) q;
         allocs.push_back(q);
-        bytes += n * sizeof(T);
-        if (!weight) work_bytes += n * sizeof(T);
+        bytes += nbytes;
+        if (weight) {
+            static_assert(sizeof(T*) == sizeof(void*), "device pointer size mismatch");
+            weight_slots.push_back(WeightSlot{reinterpret_cast<char*>(&p), slab_bytes, nbytes});
+            // Match cudaMalloc page/cacheline alignment (4096 B) so cuBLAS selects identical kernels after wake.
+            slab_bytes = (slab_bytes + nbytes + 4095u) & ~size_t(4095u);
+        } else {
+            work_bytes += nbytes;
+        }
         return true;
+    }
+    void free_work_buffers() {
+        for (size_t i = allocs.size(); i > n_weight_allocs; --i) { (void) cudaFree(allocs[i - 1]); }
+        bytes = bytes >= work_bytes ? (bytes - work_bytes) : 0;
+        work_bytes = 0;
+        allocs.resize(n_weight_allocs);
+        cap_patches = 0;
+        d_x = d_y = d_ctx = d_out = nullptr;
+        d_a = d_f16 = d_q16 = d_k16 = d_v16 = nullptr;
+        d_S = nullptr;
+#if defined(STRATA_VIT_HIP)
+        d_y16 = d_pv16 = nullptr;
+        y16_elems = pv16_elems = 0;
+#endif
     }
     bool upload_f32(float*& dst, const Gguf& gg, const std::string& name, std::string& err) {
         const GgufTensorInfo* t = gg.tensor(name);
@@ -731,12 +787,10 @@ struct VitGpuImpl {
                 std::memcpy(&raw[i * 2], &u, 2);
             }
         }
-        uint16_t* dev = nullptr;
-        if (!alloc(dev, n, err, true)) return false;
-        w.p = dev;
+        if (!alloc_raw(w.p, n * 2, err, true)) return false;
         if (cudaMemcpy(w.p, raw.data(), n * 2, cudaMemcpyHostToDevice) != cudaSuccess) { err = "GPU copy failed"; return false; }
         if (w.kind == K_HF) {
-            k_bf16_to_f16<<<blocks_for(n), 256>>>(dev, n);
+            k_bf16_to_f16<<<blocks_for(n), 256>>>((uint16_t*) w.p, n);
             if (cudaGetLastError() != cudaSuccess) { err = "the BF16 to F16 conversion failed on the GPU"; return false; }
         }
         return true;
@@ -856,6 +910,117 @@ static cudaError_t set_device_retrying(int device) {
 VitGpu::VitGpu() : impl_(new VitGpuImpl()) {}
 VitGpu::~VitGpu() = default;
 size_t VitGpu::device_bytes() const { return impl_->bytes; }
+bool VitGpu::is_sleeping() const { return impl_->sleeping; }
+size_t VitGpu::swap_slab_bytes() const { return impl_->slab_bytes; }
+
+bool VitGpu::enable_swap(std::string& err) {
+    VitGpuImpl& m = *impl_;
+    if (m.layers.empty() || m.weight_slots.empty() || m.slab_bytes == 0) {
+        err = "the vision tower has no loaded weights to stash";
+        return false;
+    }
+    if (m.h_slab != nullptr) return sleep();
+    if (cudaSetDevice(m.device) != cudaSuccess || cudaDeviceSynchronize() != cudaSuccess) {
+        err = std::string("GPU sync before swap failed: ") + cudaGetErrorString(cudaGetLastError());
+        return false;
+    }
+    void* pinned = nullptr;
+    if (cudaHostAlloc(&pinned, m.slab_bytes, cudaHostAllocPortable) == cudaSuccess && pinned != nullptr) {
+        m.h_pinned = pinned;
+        m.h_slab = (uint8_t*) pinned;
+        m.host_pinned_used = true;
+    } else {
+        (void) cudaGetLastError();
+        try {
+            m.h_pageable.assign(m.slab_bytes, 0);
+        } catch (...) {
+            err = "not enough host RAM to stash vision encoder weights";
+            return false;
+        }
+        m.h_slab = m.h_pageable.data();
+        m.host_pinned_used = false;
+    }
+    std::memset(m.h_slab, 0, m.slab_bytes);
+    for (const VitGpuImpl::WeightSlot& s : m.weight_slots) {
+        void* dev_ptr = nullptr;
+        if (s.slot_storage) std::memcpy(&dev_ptr, s.slot_storage, sizeof(void*));
+        if (!dev_ptr) { err = "missing device weight pointer during swap setup"; return false; }
+        if (cudaMemcpy(m.h_slab + s.offset, dev_ptr, s.nbytes, cudaMemcpyDeviceToHost) != cudaSuccess) {
+            err = std::string("copying weights to host RAM failed: ") + cudaGetErrorString(cudaGetLastError());
+            return false;
+        }
+    }
+    if (cudaDeviceSynchronize() != cudaSuccess) {
+        err = std::string("GPU sync after host stash failed: ") + cudaGetErrorString(cudaGetLastError());
+        return false;
+    }
+    // Free initial per-tensor weight allocations; future wakes allocate one contiguous d_weight_slab.
+    m.free_work_buffers();
+    for (size_t i = 0; i < m.n_weight_allocs; ++i) {
+        (void) cudaFree(m.allocs[i]);
+    }
+    m.allocs.clear();
+    m.n_weight_allocs = 0;
+    const void* null_ptr = nullptr;
+    for (const VitGpuImpl::WeightSlot& s : m.weight_slots) {
+        std::memcpy(s.slot_storage, &null_ptr, sizeof(void*));
+    }
+    m.bytes = 0;
+    m.sleeping = true;
+    return true;
+}
+
+bool VitGpu::sleep() {
+    VitGpuImpl& m = *impl_;
+    if (m.h_slab == nullptr) return false;
+    if (m.sleeping) return true;
+    (void) cudaSetDevice(m.device);
+    (void) cudaDeviceSynchronize();
+    m.free_work_buffers();
+    if (m.d_weight_slab != nullptr) {
+        (void) cudaFree(m.d_weight_slab);
+        m.d_weight_slab = nullptr;
+    }
+    const void* null_ptr = nullptr;
+    for (const VitGpuImpl::WeightSlot& s : m.weight_slots) {
+        std::memcpy(s.slot_storage, &null_ptr, sizeof(void*));
+    }
+    m.bytes = 0;
+    m.sleeping = true;
+    return true;
+}
+
+bool VitGpu::wake(double& ms, std::string& err) {
+    VitGpuImpl& m = *impl_;
+    if (!m.sleeping) { ms = 0.0; return true; }
+    if (m.h_slab == nullptr || m.slab_bytes == 0) { err = "swap-vram is not initialized"; return false; }
+    const auto t0 = std::chrono::steady_clock::now();
+    if (cudaSetDevice(m.device) != cudaSuccess) {
+        err = std::string("cannot use GPU: ") + cudaGetErrorString(cudaGetLastError());
+        return false;
+    }
+    void* slab = nullptr;
+    if (cudaMalloc(&slab, m.slab_bytes) != cudaSuccess) {
+        err = std::string("GPU memory for vision wake: ") + cudaGetErrorString(cudaGetLastError());
+        (void) cudaGetLastError();
+        return false;
+    }
+    if (cudaMemcpy(slab, m.h_slab, m.slab_bytes, cudaMemcpyHostToDevice) != cudaSuccess ||
+        cudaDeviceSynchronize() != cudaSuccess) {
+        err = std::string("GPU weight upload failed: ") + cudaGetErrorString(cudaGetLastError());
+        (void) cudaFree(slab);
+        return false;
+    }
+    m.d_weight_slab = slab;
+    for (const VitGpuImpl::WeightSlot& s : m.weight_slots) {
+        void* p = (uint8_t*) slab + s.offset;
+        std::memcpy(s.slot_storage, &p, sizeof(void*));
+    }
+    m.bytes = m.slab_bytes;
+    m.sleeping = false;
+    ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    return true;
+}
 
 bool VitGpu::available(std::string& why) {
     int n = 0;
@@ -997,6 +1162,10 @@ bool VitGpu::encode(const PreparedImage& img, std::vector<float>& rows, int& nx,
     VitGpuImpl& m = *impl_;
     const VitGeometry& g = m.g;
     if (m.layers.empty()) { err = "the tower is not loaded"; return false; }
+    if (m.sleeping) {
+        double wms = 0.0;
+        if (!wake(wms, err)) return false;
+    }
     if (img.w <= 0 || img.h <= 0 || img.w % g.align() != 0 || img.h % g.align() != 0) { err = "the picture size is not a multiple of patch * merge"; return false; }
     if (g.head_dim > 96 || g.head_dim % 4 != 0) { err = "this head size is not handled by the GPU attention kernel"; return false; }
     const int P = g.patch, D = g.width, H = g.heads, HD = g.head_dim, F = g.ffn;

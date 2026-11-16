@@ -99,6 +99,8 @@ int own_reader_run(const OwnReaderOptions& o) {
         if (fast) return fast->encode(prep, threads, rows, nx, ny, e);
         return cpu->encode(prep, threads, rows, nx, ny, e);
     };
+    size_t swap_peak_mib = 0;
+    bool swap_ready = false;
 #ifdef STRATA_VIT_GPU
     if (gpu) {   // warm up at the largest picture before READY: the work buffers are taken now, not at the first real picture
         const auto w0 = clock::now();
@@ -110,20 +112,50 @@ int own_reader_run(const OwnReaderOptions& o) {
         int nx = 0, ny = 0;
         err.clear();
         if (own_reader_inject_failure("warmup")) err = "out of GPU memory" + injected;
-        if (err.empty() && prepare_image(gray, geo, o.min_tokens, o.max_tokens, wp, err) && encode(wp, rows, nx, ny, err))
+        if (err.empty() && prepare_image(gray, geo, o.min_tokens, o.max_tokens, wp, err) && encode(wp, rows, nx, ny, err)) {
+            const size_t peak_bytes = gpu->device_bytes();
             std::fprintf(stderr, "strata-vision: warmed up at %d image tokens in %.1f s, %.0f MiB of GPU memory\n", nx * ny,
-                         std::chrono::duration<double>(clock::now() - w0).count(), (double) gpu->device_bytes() / 1048576.0);
-        else
+                         std::chrono::duration<double>(clock::now() - w0).count(), (double) peak_bytes / 1048576.0);
+            if (o.swap_vram) {
+                std::string serr;
+                if (gpu->enable_swap(serr)) {
+                    swap_peak_mib = (peak_bytes + (1u << 20) - 1u) >> 20;
+                    swap_ready = true;
+                    std::fprintf(stderr, "strata-vision: swap-vram ready: %.0f MiB weights stashed in host RAM, GPU freed before READY (peak %zu MiB)\n",
+                                 (double) gpu->swap_slab_bytes() / 1048576.0, swap_peak_mib);
+                } else {
+                    std::fprintf(stderr, "strata-vision: swap-vram disabled (%s); keeping weights on GPU\n", serr.c_str());
+                }
+            }
+        } else {
             return fail("the vision encoder failed its warm-up (" + err + ")", 1);
+        }
     }
 #endif
-    std::printf("READY %d own\n", geo.out_dim);   // the third word names the reader (a server reads only the start: "READY")
+    if (swap_ready) std::printf("READY %d own swap %zu\n", geo.out_dim, swap_peak_mib);
+    else std::printf("READY %d own\n", geo.out_dim);   // the third word names the reader (a server reads only the start: "READY")
     std::fflush(stdout);
 
     std::string line;
     while (std::getline(std::cin, line)) {
         while (!line.empty() && (line.back() == '\r' || line.back() == '\n')) line.pop_back();
         if (line == "QUIT") break;
+#ifdef STRATA_VIT_GPU
+        if (line == "SLEEP") {
+            if (gpu && gpu->sleep()) std::printf("OK\n");
+            else std::printf("ERR swap-vram is not active\n");
+            std::fflush(stdout);
+            continue;
+        }
+        if (line == "WAKE") {
+            double wms = 0.0;
+            err.clear();
+            if (gpu && gpu->wake(wms, err)) std::printf("OK %.1f\n", wms);
+            else std::printf("ERR %s\n", err.empty() ? "swap-vram is not active" : err.c_str());
+            std::fflush(stdout);
+            continue;
+        }
+#endif
         std::string img, out;
         if (!parse_enc(line, img, out)) { std::printf("ERR expected: ENC <image> <output>\n"); std::fflush(stdout); continue; }
         const auto t0 = clock::now();

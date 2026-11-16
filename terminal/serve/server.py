@@ -2895,8 +2895,13 @@ class Vision:
         # first picture and stops after elastic_idle_s without one; while it runs, the engine's expert cache keeps
         # elastic_mib of VRAM free for it (Service._vision_up / _vision_idle_down)
         self.max_tokens = self.token_limit(cfg)
-        self.elastic = cfg.get("elastic") is True
+        self.swap_vram = bool(cfg.get("gpu") and cfg.get("swap_vram") is True)
+        self.swap_supported = False
+        self.sleeping = False
+        self._explicit_swap_mib = bool(cfg.get("swap_mib"))
+        self.elastic = (cfg.get("elastic") is True) and not self.swap_vram
         self.elastic_mib = self.elastic_ask_mib(cfg, self.max_tokens)
+        self.swap_mib = int(cfg["swap_mib"]) if self._explicit_swap_mib else self.elastic_mib
         self.elastic_idle_s = float(cfg.get("elastic_idle_s") or 120)
         if not lazy and not self.elastic:
             self._start()
@@ -2931,6 +2936,8 @@ class Vision:
         args = [absolute(cfg["exe"]), "--mmproj", absolute(cfg["mmproj"]), "--model", absolute(cfg["model"])]
         if cfg.get("gpu"):
             args.append("--gpu")
+            if cfg.get("swap_vram") is True:
+                args.append("--swap-vram")
         if cfg.get("threads"):
             args += ["--threads", str(cfg["threads"])]
         limit = Vision.token_limit(cfg)
@@ -3058,6 +3065,12 @@ class Vision:
         # Since 0.2.16 strata-vision has no other reader to fall back on: a GPU reader that does not start is replaced by the CPU reader (_start).
         words = line.split()
         self.reader = words[2] if len(words) > 2 else None
+        self.swap_supported = "swap" in words[3:]
+        self.sleeping = self.swap_supported
+        if self.swap_supported:
+            idx = words.index("swap", 3)
+            if idx + 1 < len(words) and words[idx + 1].isdigit() and not self._explicit_swap_mib:
+                self.swap_mib = int(words[idx + 1]) + 256
 
     #: how long a reader that has already ended may still hold its output pipe open (a debugger attached to it, a child it started) before the start is
     #: judged: the pipe's end does not come, the process's end is what counts.
@@ -3145,9 +3158,54 @@ class Vision:
         """Stop the encoder process (its VRAM or RAM goes back); the encoded images stay cached on disk."""
         self.close()
         self.stopped = True
-        if self.elastic and self.on_cpu:                # the next start tries the card again
+        self.sleeping = False
+        if (self.elastic or self.swap_vram) and self.on_cpu:   # the next start tries the card again
             self.spawn, self.fallback, self.on_cpu = self.gpu_spawn, self.cpu_spawn, False
             self.cpu_note = None
+
+    def wake(self) -> float:
+        """Upload stashed host-RAM vision weights back to the GPU before encoding; returns elapsed ms."""
+        if not self.swap_supported or self.on_cpu:
+            return 0.0
+        with self.lock:
+            if not self.sleeping:
+                return 0.0
+            if self.proc is None or self.proc.stdin is None:
+                raise RuntimeError("the picture reader is not running")
+            self.proc.stdin.write("WAKE\n")
+            self.proc.stdin.flush()
+            try:
+                line = self._readline(VISION_ENCODE_S, "the vision encoder did not wake").strip()
+            except RuntimeError:
+                self.stopped = True
+                self.sleeping = False
+                raise
+            if not line.startswith("OK"):
+                msg = line[4:] if line.startswith("ERR ") else (line or "the vision encoder stopped")
+                raise RuntimeError(f"vision encoder wake failed: {msg}")
+            self.sleeping = False
+            parts = line.split()
+            try:
+                return float(parts[1]) if len(parts) > 1 else 0.0
+            except ValueError:
+                return 0.0
+
+    def sleep(self) -> None:
+        """Release GPU weights and work buffers back to free VRAM right after encoding."""
+        if not self.swap_supported or self.on_cpu:
+            return
+        with self.lock:
+            if self.sleeping or self.proc is None or self.proc.stdin is None or self.stopped:
+                return
+            try:
+                self.proc.stdin.write("SLEEP\n")
+                self.proc.stdin.flush()
+                line = self._readline(30.0, "the vision encoder did not sleep").strip()
+                if line.startswith("OK"):
+                    self.sleeping = True
+            except (OSError, ValueError, RuntimeError):
+                self.stopped = True
+                self.sleeping = False
 
     def all_cached(self, sources: list) -> bool:
         """Every picture of `sources` was encoded already (a conversation sends its pictures with each turn): no reader has to run."""
@@ -4257,6 +4315,75 @@ class Service:
         has no such command: it answered "VRAM n" with its usage text ("expected: GEN <max_new> ..."), 0.2.15 release test."""
         return "vram_elastic" in (getattr(self.engine, "info", None) or {})
 
+    @contextlib.contextmanager
+    def _vision_swap_scope(self, *, active: bool = True):
+        """Manage per-request VRAM swap (`vision.swap_vram: true`, caller holds `self.fifo`).
+
+        Shrinks the engine's segmented expert cache, wakes `strata-vision` from pinned host RAM, yields so all
+        images of the request are encoded on GPU, then puts `strata-vision` back to sleep and restores 100% of
+        the engine's expert cache BEFORE prefill/decode begins.
+        """
+        v = self.vision
+        if not active or v is None:
+            yield
+            return
+        if not getattr(v, "swap_vram", False):
+            self._vision_up()
+            yield
+            return
+
+        shrunk = False
+        wake_ms = 0.0
+        try:
+            if not v.alive():
+                if hasattr(self.engine, "vram") and self.loaded() and not self.vision_no_shrink:
+                    try:
+                        self.engine.vram((self._engine_reserve() or 0) + v.swap_mib)
+                        shrunk = True
+                        time.sleep(0.1)
+                    except ValueError as e:
+                        self.vision_no_shrink = "--vram-elastic" in str(e)
+                try:
+                    v.restart()
+                except Exception as e:
+                    raise EngineDied(f"the image encoder failed to start: {e}") from e
+
+            if getattr(v, "swap_supported", False) and not getattr(v, "on_cpu", False):
+                if not shrunk and hasattr(self.engine, "vram") and self.loaded() and not self.vision_no_shrink:
+                    try:
+                        self.engine.vram((self._engine_reserve() or 0) + v.swap_mib)
+                        shrunk = True
+                    except ValueError as e:
+                        self.vision_no_shrink = "--vram-elastic" in str(e)
+                        if not self.vision_no_shrink_said:
+                            print(f"[strata] images: expert cache could not make swap room ({e})", flush=True)
+                            self.vision_no_shrink_said = True
+                try:
+                    wake_ms = v.wake()
+                except RuntimeError as e:
+                    if shrunk and "GPU memory" in str(e) and hasattr(self.engine, "vram") and self.loaded():
+                        v.swap_mib += 256
+                        self.engine.vram((self._engine_reserve() or 0) + v.swap_mib)
+                        if not v.alive():
+                            v.restart()
+                        wake_ms = v.wake()
+                    else:
+                        raise EngineDied(f"the image encoder could not wake: {e}") from e
+            yield
+        finally:
+            if getattr(v, "swap_supported", False) and not getattr(v, "on_cpu", False):
+                v.sleep()
+            if shrunk and hasattr(self.engine, "vram") and self.loaded():
+                try:
+                    out = self.engine.vram(self._engine_reserve())
+                    print(
+                        f"[strata] images: vision weights swapped in ({wake_ms:.0f} ms) and out of VRAM; "
+                        f"expert cache restored ({out.get('expert_cache_mib')} of {out.get('expert_cache_full_mib')} MiB)",
+                        flush=True,
+                    )
+                except ValueError as e:
+                    print(f"[strata] images: expert cache did not grow back ({e})", flush=True)
+
     def _vision_up(self):
         """The image turn's start for an elastic encoder that is not running (the caller holds self.fifo): the expert
         cache first keeps the encoder's elastic_mib of VRAM free on top of the reserve, then the encoder starts (load and
@@ -4463,10 +4590,25 @@ class Service:
         vision_started = False
         if self._vision_down():                         # first, as at a start: a GPU encoder takes its VRAM before
             print("[strata] starting the vision encoder ...", flush=True)   # the engine sizes its cache
+            restart_shrunk = False
+            if (getattr(self.vision, "swap_vram", False) and self.loaded()
+                    and hasattr(self.engine, "vram") and not self.vision_no_shrink):
+                try:
+                    self.engine.vram((self._engine_reserve() or 0) + self.vision.swap_mib)
+                    restart_shrunk = True
+                    time.sleep(0.1)
+                except ValueError as e:
+                    self.vision_no_shrink = "--vram-elastic" in str(e)
             try:
                 self.vision.restart()
             except Exception as e:
                 raise EngineDied(f"the vision encoder failed to start: {e}") from e
+            finally:
+                if restart_shrunk and self.loaded() and hasattr(self.engine, "vram"):
+                    try:
+                        self.engine.vram(self._engine_reserve())
+                    except ValueError:
+                        pass
             vision_started = True
         if self.loaded():
             return
@@ -5001,8 +5143,9 @@ class Service:
                         if src.startswith(("http://", "https://")):
                             src = fetched[item["source"]] = Vision.download(src)   # outside the FIFO, as in prepare()
                         with self._turn(cancel):  # the encoder takes its turn with the requests (see below)
-                            self._vision_up()         # an elastic encoder is not running until a picture needs it
-                            self.vision.encode(src)
+                            need_gpu = not (hasattr(self.vision, "all_cached") and self.vision.all_cached([src]))
+                            with self._vision_swap_scope(active=need_gpu):
+                                self.vision.encode(src)
                     except (ValueError, OSError, RuntimeError) as e:    # RuntimeError: the encoder did not start
                         why = str(e)
                 if why is not None:
@@ -5068,13 +5211,13 @@ class Service:
             # "reading the prompt" with CPU and GPU busy, for good (reproduced).  So encoding takes its turn in the
             # same FIFO as the requests.
             with self._turn(cancel):
-                if not (hasattr(self.vision, "all_cached") and self.vision.all_cached(images)):
-                    self._vision_up()
-                try:
-                    encoded = (self.vision.encode_all(images, cancel) if hasattr(self.vision, "encode_all")
-                               else [self.vision.encode(src) for src in images])
-                finally:
-                    self.last_image_at = time.time()
+                need_gpu = not (hasattr(self.vision, "all_cached") and self.vision.all_cached(images))
+                with self._vision_swap_scope(active=need_gpu):
+                    try:
+                        encoded = (self.vision.encode_all(images, cancel) if hasattr(self.vision, "encode_all")
+                                   else [self.vision.encode(src) for src in images])
+                    finally:
+                        self.last_image_at = time.time()
             # one <|image_pad|> per image -> one per image token.  Only the markers the template writes for an image
             # (right after <|vision_start|>) are images: the same text inside a message (an agent reading these docs,
             # #150) is kept as plain text, or it took an image's place and the counts no longer matched.
@@ -8142,6 +8285,11 @@ def apply_vision_defaults(cfg: dict) -> dict:
     A config that says "vram_elastic" itself, and AMD (no shrinking expert cache on HIP), keep the room in the reserve as before: the reserve
     setup writes for a GPU reader that stays on the card (700 MiB, or none) becomes VISION_RESERVE_MIB; a reserve the person or the app chose
     (any other number) is kept."""
+    vis = cfg.get("vision")
+    if isinstance(vis, dict) and vis.get("gpu") is True and vis.get("swap_vram") is True:
+        if VISION_NO_RESERVE_BY_DEFAULT and cfg.get("backend") != "hip" and "vram_elastic" not in cfg:
+            cfg = {**cfg, "vram_elastic": True}
+        return cfg
     if not vision_on_demand_by_default(cfg):
         return cfg
     cfg["vision"] = {**cfg["vision"], "elastic": True}

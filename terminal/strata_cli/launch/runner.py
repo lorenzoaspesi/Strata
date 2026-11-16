@@ -711,9 +711,13 @@ def derive_config(base: dict, s: S.LaunchSettings, *, bool_flags: frozenset[str]
         else:
             cfg[key] = value
     if isinstance(prev, dict):
-        for _dc_key in ("disk_cache_path", "disk_cache_gib"):
+        for _dc_key in ("disk_cache_path", "disk_cache_gib", "vram_elastic"):
             if _dc_key in prev and _dc_key not in cfg:
                 cfg[_dc_key] = prev[_dc_key]
+        if isinstance(prev.get("vision"), dict) and isinstance(cfg.get("vision"), dict):
+            for _vk in ("swap_vram", "swap_mib"):
+                if _vk in prev["vision"] and _vk not in cfg["vision"]:
+                    cfg["vision"][_vk] = prev["vision"][_vk]
     return cfg
 
 
