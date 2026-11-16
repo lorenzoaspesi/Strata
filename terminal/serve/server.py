@@ -4672,6 +4672,8 @@ class Service:
                 raise EngineDied(f"the engine could not be started: {e}") from e
             raise
         print("[strata] the engine is running again", flush=True)
+        if self.disk_cache is not None and self.disk_cache.enabled:
+            self.disk_cache.prune_incompatible(getattr(self.engine, "info", None))
         if self.restore_after_load:                      # an image job unloaded it: its conversation comes back
             images_api.restore_session(self)
         if self.vram_reserve is not None and hasattr(self.engine, "vram"):   # #533: the reserve asked for last
@@ -8906,6 +8908,8 @@ def _main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> i
     except ValueError as e:
         raise SystemExit(f"[strata] config {e}")
     if svc.disk_cache.enabled:
+        if svc.loaded():
+            svc.disk_cache.prune_incompatible(getattr(engine, "info", None))
         print(f"[strata] disk session cache on: {svc.disk_cache.dir} "
               f"(budget {svc.disk_cache.budget_bytes / (1 << 30):g} GiB, "
               f"{len(svc.disk_cache.entries)} saved session(s) indexed)", flush=True)
