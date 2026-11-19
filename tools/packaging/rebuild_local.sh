@@ -12,7 +12,7 @@ set -euo pipefail
 
 SCRIPT_PATH="$(readlink -f -- "$0")"
 SCRIPT_DIR="$(cd -- "$(dirname -- "$SCRIPT_PATH")" && pwd -P)"
-STRATA_REPO="${STRATA_REPO:-$(cd -- "$SCRIPT_DIR/.." && pwd -P)}"
+STRATA_REPO="${STRATA_REPO:-$(cd -- "$SCRIPT_DIR/../.." && pwd -P)}"
 XDG_DATA="${XDG_DATA_HOME:-$HOME/.local/share}"
 STRATA_DATA_DIR="${STRATA_DATA_DIR:-$XDG_DATA/strata}"
 COMPONENTS_DIR="${STRATA_COMPONENTS_DIR:-$STRATA_DATA_DIR/components}"
@@ -135,9 +135,9 @@ if [[ "$CLEAN_BUILD" -eq 1 && -d "$BUILD_ABS" ]]; then
 fi
 mkdir -p "$STRATA_REPO/.ccache"
 
-BASE_VER="$(sed -n 's/^[[:space:]]*project([^)]*VERSION[[:space:]]*\([0-9][0-9.]*\).*/\1/p' "$STRATA_REPO/CMakeLists.txt" | head -n 1)"
+BASE_VER="$(sed -n 's/^[[:space:]]*project([^)]*VERSION[[:space:]]*\([0-9][0-9.]*\).*/\1/p' "$STRATA_REPO/engine/CMakeLists.txt" | head -n 1)"
 if [[ -z "$BASE_VER" ]]; then
-    echo "error: could not parse project VERSION from $STRATA_REPO/CMakeLists.txt" >&2
+    echo "error: could not parse project VERSION from $STRATA_REPO/engine/CMakeLists.txt" >&2
     exit 1
 fi
 
@@ -226,7 +226,7 @@ docker run --rm \
             CMAKE_CONV_TESTS="ON"
         fi
 
-        cmake -G Ninja -S /src -B "/src/$BUILD_REL" \
+        cmake -G Ninja -S /src/engine -B "/src/$BUILD_REL" \
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
             -DCMAKE_CUDA_COMPILER_LAUNCHER=ccache \
@@ -237,11 +237,9 @@ docker run --rm \
             -DSTRATA_NATIVE_EXPERTS=ON \
             -DSTRATA_PORTABLE=ON \
             -DSTRATA_Q6K_EXPERTS=ON \
-            -DSTRATA_MMQ_KQUANTS=ON \
-            -DSTRATA_MMQ=ON \
             "-DCMAKE_CUDA_ARCHITECTURES=${CUDA_ARCH}-real;${CUDA_ARCH}-virtual"
 
-        . /src/packaging/engine_targets.sh
+        . /src/tools/packaging/engine_targets.sh
         TARGETS="$(engine_targets cmake "/src/$BUILD_REL")"
         EXTRA_TARGETS=()
         if [[ "$RUN_TESTS" -eq 1 ]]; then
@@ -259,13 +257,12 @@ docker run --rm \
         VISION_ARCHS=""
         if [[ "$BUILD_VISION" -eq 1 ]]; then
             VISION_BUILD="/src/${BUILD_REL}-vision"
-            cmake -G Ninja -S /src/tools/vision -B "$VISION_BUILD" \
+            cmake -G Ninja -S /src/terminal/tools/vision -B "$VISION_BUILD" \
                 -DCMAKE_BUILD_TYPE=Release \
                 -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
                 -DCMAKE_CUDA_COMPILER_LAUNCHER=ccache \
                 -DSTRATA_VISION_CUDA=ON \
                 -DSTRATA_PORTABLE=ON \
-                -DGGML_CUDA_NCCL=OFF \
                 "-DCMAKE_CUDA_ARCHITECTURES=${CUDA_ARCH}-real;${CUDA_ARCH}-virtual"
             VISION_TARGETS=(strata-vision)
             if [[ "$RUN_TESTS" -eq 1 ]]; then
@@ -298,10 +295,10 @@ docker run --rm \
             VISION_JSON=", \"vision_archs\": \"${VISION_ARCHS}\""
         fi
 
-        printf "{\"version\": \"%s\", \"source\": \"packaging/rebuild_local.sh\", \"archs\": [%s], \"ptx\": true, \"cuda\": \"%s\", \"portable\": true%s}\n" \
+        printf "{\"version\": \"%s\", \"source\": \"tools/packaging/rebuild_local.sh\", \"archs\": [%s], \"ptx\": true, \"cuda\": \"%s\", \"portable\": true%s}\n" \
             "$PKG_VER" "$CUDA_ARCH" "$CUDA_FULL" "$VISION_JSON" > "$STAGE_DIR/BUILD.json"
 
-        python3 /src/packaging/collect_libs.py \
+        python3 /src/tools/packaging/collect_libs.py \
             --binary "$STAGE_DIR/strata" \
             --search /usr/local/cuda/lib64 \
             --out "$STAGE_DIR" \
@@ -310,7 +307,7 @@ docker run --rm \
         cp "$STAGE_DIR/SYSTEM-LIBS.txt" "$STAGE_DIR/.syslibs.acc"
         for extra_elf in "$STAGE_DIR/strata-vision" "$STAGE_DIR/libstrata_kq.so"; do
             if [[ -f "$extra_elf" ]]; then
-                python3 /src/packaging/collect_libs.py \
+                python3 /src/tools/packaging/collect_libs.py \
                     --binary "$extra_elf" \
                     --search /usr/local/cuda/lib64 \
                     --out "$STAGE_DIR" \
@@ -321,7 +318,7 @@ docker run --rm \
         sort -u "$STAGE_DIR/.syslibs.acc" > "$STAGE_DIR/SYSTEM-LIBS.txt"
         rm -f "$STAGE_DIR/.syslibs.acc"
 
-        python3 /src/packaging/package_engine.py \
+        python3 /src/tools/packaging/package_engine.py \
             --src "$STAGE_DIR" \
             --backend cuda \
             --version "$PKG_VER" \
@@ -337,8 +334,8 @@ docker run --rm \
             --include "licenses/*"
 
         PKG_FOLDER="$OUT_DIR/${PKG_VER}-linux-x86_64-cuda-cuda12"
-        python3 /src/packaging/package_engine.py --verify "$PKG_FOLDER"
-        python3 /src/packaging/binary_deps.py "$PKG_FOLDER"
+        python3 /src/tools/packaging/package_engine.py --verify "$PKG_FOLDER"
+        python3 /src/tools/packaging/binary_deps.py "$PKG_FOLDER"
         rm -rf "$STAGE_DIR"
     '
 
@@ -367,7 +364,7 @@ echo "==> Installing engine component to $DEST_PKG"
 TMP_DEST="$DEST_ENGINE_DIR/.${ENGINE_FOLDER_NAME}.installing.$$"
 rm -rf "$TMP_DEST"
 cp -a "$BUILT_PKG" "$TMP_DEST"
-python3 "$STRATA_REPO/packaging/package_engine.py" --verify "$TMP_DEST"
+python3 "$STRATA_REPO/tools/packaging/package_engine.py" --verify "$TMP_DEST"
 OLD_ENGINE_DEST=""
 if [[ -d "$DEST_PKG" ]]; then
     OLD_ENGINE_DEST="$DEST_ENGINE_DIR/.${ENGINE_FOLDER_NAME}.old.$$"
@@ -377,7 +374,7 @@ mv "$TMP_DEST" "$DEST_PKG"
 rm -rf "$BUILD_ABS/out-pkg"
 
 echo "==> Staging and activating Control component $PKG_VER from $STRATA_REPO"
-PYTHONDONTWRITEBYTECODE=1 python3 "$STRATA_REPO/packaging/stage_local_control.py" \
+PYTHONDONTWRITEBYTECODE=1 python3 "$STRATA_REPO/tools/packaging/stage_local_control.py" \
     --components "$COMPONENTS_DIR" \
     --version "$PKG_VER" \
     --commit "$GIT_FULL"
@@ -495,7 +492,7 @@ if [[ "$RUN_TESTS" -eq 1 ]]; then
             serve.test_web_speculation
     )
     (
-        cd "$STRATA_REPO"
+        cd "$STRATA_REPO/terminal"
         PYTHONNOUSERSITE=1 PYTHONDONTWRITEBYTECODE=1 \
             "$CONTROL_PY" -B -m unittest \
             tests/terminal/test_no_acquisition.py \

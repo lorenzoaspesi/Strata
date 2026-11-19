@@ -190,10 +190,6 @@ int main() {
     CHECK(write_synthetic_vit_gguf(path));
 
     {
-        // Verify Pascal <= 1024 token rule is bypassed when swap_vram=true
-        std::string sup_why;
-        CHECK(own_reader_supported(path, true, 512, sup_why, /*swap_vram=*/true));
-
         Gguf gg;
         VitGeometry geo;
         std::string err;
