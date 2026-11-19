@@ -22,7 +22,8 @@ import tempfile
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-ROOT = HERE.parent
+REPO = HERE.parents[1]
+ROOT = REPO / "terminal"
 if str(HERE) not in sys.path:
     sys.path.insert(0, str(HERE))
 if str(ROOT) not in sys.path:
@@ -100,7 +101,7 @@ def _find_reusable_runtime(
 
 def _copy_payload(stage: Path, target: str, version: str, commit: str | None) -> dict:
     for item in pt.PAYLOAD:
-        src = ROOT / item
+        src = pt.source_of(item)
         dst = stage / item
         if not src.exists():
             raise SystemExit(f"missing payload item: {item}")
@@ -293,12 +294,12 @@ def main() -> int:
                 "sha256": want_py_sha,
             },
             "lock": {
-                "file": lock.relative_to(ROOT).as_posix(),
+                "file": lock.relative_to(REPO).as_posix(),
                 "sha256": want_lock_sha,
                 "install": "pip install --require-hashes --no-deps --only-binary=:all: (build time only)",
             },
             "installed": installed,
-            "source": "packaging/stage_local_control.py",
+            "source": "tools/packaging/stage_local_control.py",
             "commit": commit,
             "acquires_at_runtime": False,
             "installer": installer,
