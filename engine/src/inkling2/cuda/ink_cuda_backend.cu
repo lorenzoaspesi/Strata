@@ -490,10 +490,15 @@ public:
         strata::ink::k_ink_sconv_slot_copy<<<dim3(strata::ink::kInkVisits, 4), 256, 0, runner_->st>>>(
             runner_->d_sconv_pool_arr, d_sconv_snap_, 0, runner_->max_slots, true);
 
-        // 2. True W=4 Multi-Branch Sparse-MoE Bayes-Optimal Adaptive Beam Tree (M* in {3,4,5,6,8,10,12})!
+        // 2. True W=4 Multi-Branch Sparse-MoE Bayes-Optimal Adaptive Beam Tree (tunable via STRATA_INK_DSPARK_*)!
         strata::ink::InkTreeSpec tr{};
-        const int max_nodes = std::min(12, runner_->tree_cap);
-        dspark_->draft_beam_tree(anchor_tok, anchor_pos, /*beam_w=*/4, max_nodes, tr, /*adaptive_moe_ratio=*/4.2f);
+        int beam_w = 4;
+        int max_nodes = std::min(12, runner_->tree_cap);
+        float moe_ratio = 4.2f;
+        if (const char* eb = std::getenv("STRATA_INK_DSPARK_BEAM")) beam_w = std::clamp(std::atoi(eb), 1, 4);
+        if (const char* em = std::getenv("STRATA_INK_DSPARK_MAX_NODES")) max_nodes = std::clamp(std::atoi(em), 2, runner_->tree_cap);
+        if (const char* er = std::getenv("STRATA_INK_DSPARK_MOE_RATIO")) moe_ratio = std::max(0.0f, std::strtof(er, nullptr));
+        dspark_->draft_beam_tree(anchor_tok, anchor_pos, beam_w, max_nodes, tr, moe_ratio);
 
         // 3. Single CUDA-Graph 48-visit tree verify + exact GPU screened argmax (ZERO 6.4 MB logits D2H!)
         runner_->forward_tree_verify(tr, anchor_pos, 0, true);

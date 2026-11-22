@@ -207,9 +207,9 @@ struct InkCudaModel {
                 order.resize(n_total);
                 for (int i = 0; i < n_total; ++i) order[i] = (uint16_t)i;
             }
-            // Reserve full headroom (1.66 GiB for runner+DSpark+cuBLAS+Graph + 256 MiB for ping-pong DMA + promo ring)!
-            const size_t hyb_post_res = std::max(reserve, (size_t)(1664ull << 20));
-            const size_t hyb_reserve = hyb_post_res + (256ull << 20);
+            // Reserve exact headroom for runner+KV+DSpark fixed buffers (host-mapped DSpark/KV overflow saves ~1 GiB on 8 GB cards!)
+            const size_t hyb_post_res = std::max(reserve, (size_t)(vtot <= (10ull << 30) ? (960ull << 20) : (1664ull << 20)));
+            const size_t hyb_reserve = hyb_post_res + (vtot <= (10ull << 30) ? (192ull << 20) : (256ull << 20));
             const size_t vram_budget = (vfree > hyb_reserve) ? (vfree - hyb_reserve) : 0;
             size_t vram_used = 0, host_used = 0, max_exp_bytes = 0;
             std::vector<uint8_t> in_vram(n_total, 0);

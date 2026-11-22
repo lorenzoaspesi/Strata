@@ -678,6 +678,31 @@ __global__ void __launch_bounds__(256) k_ink_collect_cpu_y(
     }
 }
 
+// Batched CPU-GPU split staging buffer for M=2..16 (DSpark verify!)
+struct alignas(64) InkBatchCpuBuf {
+    static constexpr int kMaxJobs = 16 * kInkTopK;  // 128
+    int32_t out_slot[kMaxJobs];   // m * kInkTopK + k
+    float   y[kMaxJobs][kInkHidden];
+};
+
+__global__ void __launch_bounds__(256) k_ink_collect_batch_cpu_y(
+    const InkBatchCpuBuf* buf,
+    int nj,
+    const float* __restrict__ topk_w,   // [M * 8]
+    float* __restrict__ y_pair) {       // [M * 8, 2304]
+    const int j = blockIdx.x;
+    if (j >= nj) return;
+    const int tid = threadIdx.x;
+    const int slot = buf->out_slot[j];
+    const float rw = topk_w[slot];
+    const float4* src = reinterpret_cast<const float4*>(buf->y[j]);
+    float4* dst = reinterpret_cast<float4*>(y_pair + (size_t)slot * kInkHidden);
+    for (int i = tid; i < (kInkHidden / 4); i += 256) {
+        const float4 v = __ldcv(src + i);
+        dst[i] = make_float4(v.x * rw, v.y * rw, v.z * rw, v.w * rw);
+    }
+}
+
 __global__ void __launch_bounds__(256) k_ink_decay_use_cnt(float* __restrict__ cnt, int n, float decay) {
     const int i = blockIdx.x * 256 + threadIdx.x;
     if (i < n) cnt[i] *= decay;
@@ -733,10 +758,19 @@ struct InkHybridEngine {
     std::thread master_thr;
     int n_threads = 0;
 
-    // PCIe GPU streaming + CPU parallel split for M=1 decode (STRATA_INK_PCIE_SHARE, default 0.55)
-    float pcie_share = 0.55f;
+    // PCIe GPU streaming + optional CPU split (STRATA_INK_PCIE_SHARE, default 1.0 = 100% PCIe DMA on GTX 1070+)
+    float pcie_share = 1.0f;
     int32_t* h_topk_pin = nullptr;
+    float*   h_x_batch_pin = nullptr;
+    InkBatchCpuBuf* h_batch_buf = nullptr;
+    InkBatchCpuBuf* d_batch_buf = nullptr;
     uint32_t host_ring_seq = 0;
+    // Direct batch-mode CPU dispatch state (used by M=2..16 verify split)
+    bool    batch_mode = false;
+    int     batch_layer = 0;
+    int     batch_nj = 0;
+    int32_t batch_tok_m[InkBatchCpuBuf::kMaxJobs] = {};
+    int32_t batch_eid[InkBatchCpuBuf::kMaxJobs] = {};
 
     bool pcie_decode_enabled() const noexcept {
         return active && pcie_share > 0.0f && d_pf_stage[0] != nullptr && pf_stage_bytes > 0;
@@ -744,11 +778,24 @@ struct InkHybridEngine {
 
     // Submit CPU-side host experts directly from host thread (used in M=1 PCIe+CPU split decode)
     uint32_t submit_cpu_jobs_async(int layer, int nj) noexcept {
+        batch_mode = false;
         h_bell->layer = layer;
         h_bell->n_jobs = nj;
         std::atomic_thread_fence(std::memory_order_release);
         const uint32_t seq = ++host_ring_seq;
-        // Avoid colliding with GPU-side ring sequence (which starts at 1..); use high bit for host-submitted jobs
+        const uint32_t tagged = seq | 0x80000000u;
+        h_bell->ring = tagged;
+        std::atomic_thread_fence(std::memory_order_seq_cst);
+        return tagged;
+    }
+
+    // Submit batched M=2..16 CPU-side cold expert evaluations in parallel with GPU PCIe DMA!
+    uint32_t submit_batch_cpu_jobs_async(int layer, int nj) noexcept {
+        batch_mode = true;
+        batch_layer = layer;
+        batch_nj = nj;
+        std::atomic_thread_fence(std::memory_order_release);
+        const uint32_t seq = ++host_ring_seq;
         const uint32_t tagged = seq | 0x80000000u;
         h_bell->ring = tagged;
         std::atomic_thread_fence(std::memory_order_seq_cst);
@@ -774,7 +821,11 @@ struct InkHybridEngine {
         INK_CK(cudaHostAlloc(&h_bell, sizeof(InkMappedDoorbell), cudaHostAllocMapped));
         std::memset(h_bell, 0, sizeof(InkMappedDoorbell));
         INK_CK(cudaHostGetDevicePointer(&d_bell, h_bell, 0));
-        h_topk_pin = halloc_pinned<int32_t>(kInkTopK);
+        h_topk_pin = halloc_pinned<int32_t>(16 * kInkTopK);
+        h_x_batch_pin = halloc_pinned<float>(16ull * kInkHidden);
+        INK_CK(cudaHostAlloc(&h_batch_buf, sizeof(InkBatchCpuBuf), cudaHostAllocMapped));
+        std::memset(h_batch_buf, 0, sizeof(InkBatchCpuBuf));
+        INK_CK(cudaHostGetDevicePointer(&d_batch_buf, h_batch_buf, 0));
         d_seq     = dalloc<uint32_t>(1);
         d_cur_seq = dalloc<uint32_t>(1);
         INK_CK(cudaMemset(d_seq, 0, 4));
@@ -809,9 +860,19 @@ struct InkHybridEngine {
                         continue;
                     }
                     seen = g;
-                    for (int j = t; j < cur_nj; j += n_threads) {
-                        const int key = cur_layer * n_experts + cur_eid[j];
-                        host_eval::eval_expert_f32_h(host_meta[key], cur_x, const_cast<float*>(h_bell->y[cur_slot_k[j]]));
+                    if (batch_mode) {
+                        for (int j = t; j < batch_nj; j += n_threads) {
+                            const int key = batch_layer * n_experts + batch_eid[j];
+                            host_eval::eval_expert_f32_h(
+                                host_meta[key],
+                                h_x_batch_pin + (size_t)batch_tok_m[j] * kInkHidden,
+                                h_batch_buf->y[j]);
+                        }
+                    } else {
+                        for (int j = t; j < cur_nj; j += n_threads) {
+                            const int key = cur_layer * n_experts + cur_eid[j];
+                            host_eval::eval_expert_f32_h(host_meta[key], cur_x, const_cast<float*>(h_bell->y[cur_slot_k[j]]));
+                        }
                     }
                     work_done.fetch_add(1, std::memory_order_release);
                     last_t = std::chrono::steady_clock::now();
@@ -831,23 +892,40 @@ struct InkHybridEngine {
                 }
                 seen = seq;
                 std::atomic_thread_fence(std::memory_order_acquire);
-                cur_layer = h_bell->layer;
-                cur_nj    = std::min((int)h_bell->n_jobs, kInkTopK);
-                for (int j = 0; j < cur_nj; ++j) {
-                    cur_slot_k[j] = h_bell->slot_k[j];
-                    cur_eid[j]    = h_bell->expert_id[j];
-                }
-                std::memcpy(cur_x, const_cast<const float*>(h_bell->x), kInkHidden * sizeof(float));
-                work_done.store(0, std::memory_order_relaxed);
-                if (n_threads > 1 && cur_nj > 1) {
-                    work_gen.fetch_add(1, std::memory_order_release);
-                }
-                for (int j = 0; j < cur_nj; j += (cur_nj > 1 ? n_threads : 1)) {
-                    const int key = cur_layer * n_experts + cur_eid[j];
-                    host_eval::eval_expert_f32_h(host_meta[key], cur_x, const_cast<float*>(h_bell->y[cur_slot_k[j]]));
-                }
-                if (n_threads > 1 && cur_nj > 1) {
-                    while (work_done.load(std::memory_order_acquire) < n_threads - 1) std::this_thread::yield();
+                if (batch_mode) {
+                    work_done.store(0, std::memory_order_relaxed);
+                    if (n_threads > 1 && batch_nj > 1) {
+                        work_gen.fetch_add(1, std::memory_order_release);
+                    }
+                    for (int j = 0; j < batch_nj; j += (batch_nj > 1 ? n_threads : 1)) {
+                        const int key = batch_layer * n_experts + batch_eid[j];
+                        host_eval::eval_expert_f32_h(
+                            host_meta[key],
+                            h_x_batch_pin + (size_t)batch_tok_m[j] * kInkHidden,
+                            h_batch_buf->y[j]);
+                    }
+                    if (n_threads > 1 && batch_nj > 1) {
+                        while (work_done.load(std::memory_order_acquire) < n_threads - 1) std::this_thread::yield();
+                    }
+                } else {
+                    cur_layer = h_bell->layer;
+                    cur_nj    = std::min((int)h_bell->n_jobs, kInkTopK);
+                    for (int j = 0; j < cur_nj; ++j) {
+                        cur_slot_k[j] = h_bell->slot_k[j];
+                        cur_eid[j]    = h_bell->expert_id[j];
+                    }
+                    std::memcpy(cur_x, const_cast<const float*>(h_bell->x), kInkHidden * sizeof(float));
+                    work_done.store(0, std::memory_order_relaxed);
+                    if (n_threads > 1 && cur_nj > 1) {
+                        work_gen.fetch_add(1, std::memory_order_release);
+                    }
+                    for (int j = 0; j < cur_nj; j += (cur_nj > 1 ? n_threads : 1)) {
+                        const int key = cur_layer * n_experts + cur_eid[j];
+                        host_eval::eval_expert_f32_h(host_meta[key], cur_x, const_cast<float*>(h_bell->y[cur_slot_k[j]]));
+                    }
+                    if (n_threads > 1 && cur_nj > 1) {
+                        while (work_done.load(std::memory_order_acquire) < n_threads - 1) std::this_thread::yield();
+                    }
                 }
                 std::atomic_thread_fence(std::memory_order_seq_cst);
                 h_bell->ack = seq;
@@ -871,9 +949,9 @@ struct InkHybridEngine {
             INK_CK(cudaMalloc(&d_pf_stage[1], pf_stage_bytes));
             vram_avail -= 2 * pf_stage_bytes;
         }
-        // Remaining spare VRAM (> 256 MiB headroom) becomes dynamic decayed-frequency promotion ring!
-        if (vram_avail > (320ull << 20) && align_b > 0) {
-            const size_t ring_bytes = std::min<size_t>(256ull << 20, vram_avail - (256ull << 20));
+        // Remaining spare VRAM (> 64 MiB headroom) becomes dynamic decayed-frequency promotion ring!
+        if (vram_avail > (96ull << 20) && align_b > 0) {
+            const size_t ring_bytes = std::min<size_t>(256ull << 20, vram_avail - (64ull << 20));
             n_promo_slots = (int)(ring_bytes / align_b);
             if (n_promo_slots >= 4) {
                 INK_CK(cudaMalloc(&d_promo_pool, (size_t)n_promo_slots * align_b));
@@ -965,6 +1043,8 @@ struct InkHybridEngine {
         }
         if (h_bell) { cudaFreeHost(h_bell); h_bell = nullptr; d_bell = nullptr; }
         if (h_topk_pin) { cudaFreeHost(h_topk_pin); h_topk_pin = nullptr; }
+        if (h_x_batch_pin) { cudaFreeHost(h_x_batch_pin); h_x_batch_pin = nullptr; }
+        if (h_batch_buf) { cudaFreeHost(h_batch_buf); h_batch_buf = nullptr; d_batch_buf = nullptr; }
         if (h_sec4_pinned) { cudaFreeHost(h_sec4_pinned); h_sec4_pinned = nullptr; h_sec4_bytes = 0; }
         if (promo_st) { cudaStreamDestroy(promo_st); promo_st = nullptr; }
         if (pf_dma_st) { cudaStreamDestroy(pf_dma_st); pf_dma_st = nullptr; }
@@ -1110,22 +1190,60 @@ inline void launch_ink_moe_hybrid(
             k_ink_collect_cpu_y<<<eff_cpu, 256, 0, st>>>(hyb.d_bell, eff_cpu, ws.topk_w, ws.y_pair);
         }
     } else {
-        // Double-Buffered Ping-Pong Async DMA Streaming overlapped with Blackwell sm_120a / INT8 Tensor Cores!
+        // Double-Buffered Ping-Pong Async DMA Streaming overlapped with GPU + parallel CPU AVX2 split for M<=16!
         // Step A: Collect which host experts in layer `ip` are needed (all host experts for M>16; exact hit set for M<=16!)
         std::vector<int> host_list;
         host_list.reserve(kInkExperts);
+        int cpu_batch_nj = 0;
+        uint32_t cpu_batch_seq = 0;
         if (M <= 16) {
-            int32_t h_idx[16 * kInkTopK];
-            INK_CK(cudaMemcpyAsync(h_idx, ws.topk_idx, (size_t)M * kInkTopK * 4, cudaMemcpyDeviceToHost, st));
+            const bool split_cpu = (hyb.pcie_share < 0.99f && hyb.h_x_batch_pin && hyb.h_batch_buf);
+            INK_CK(cudaMemcpyAsync(hyb.h_topk_pin, ws.topk_idx, (size_t)M * kInkTopK * 4, cudaMemcpyDeviceToHost, st));
+            if (split_cpu) {
+                INK_CK(cudaMemcpyAsync(hyb.h_x_batch_pin, x_f32, (size_t)M * kInkHidden * sizeof(float), cudaMemcpyDeviceToHost, st));
+            }
             INK_CK(cudaStreamSynchronize(st));
-            uint8_t seen[kInkExperts] = {};
+            uint8_t hit_cnt[kInkExperts] = {};
             for (int i = 0; i < M * kInkTopK; ++i) {
-                const int e = h_idx[i];
+                const int e = hyb.h_topk_pin[i];
                 const int key = ip * kInkExperts + e;
-                if (!seen[e] && hyb.host_meta[key].body != nullptr &&
+                if (hyb.host_meta[key].body != nullptr &&
                     (hyb.key_to_slot.empty() || hyb.key_to_slot[key] < 0)) {
-                    seen[e] = 1;
-                    host_list.push_back(e);
+                    ++hit_cnt[e];
+                }
+            }
+            // Experts shared by >= 2 tokens ALWAYS go to GPU over PCIe (1 transfer amortizes across multiple tokens!).
+            // Single-token cold experts are split between GPU PCIe and CPU AVX2 workers in parallel!
+            std::vector<int> single_eids;
+            single_eids.reserve(kInkExperts);
+            for (int e = 0; e < kInkExperts; ++e) {
+                if (hit_cnt[e] >= 2) host_list.push_back(e);
+                else if (hit_cnt[e] == 1) single_eids.push_back(e);
+            }
+            const int total_uniq = (int)host_list.size() + (int)single_eids.size();
+            const int max_cpu_singles = split_cpu
+                ? std::min<int>((int)single_eids.size(), std::max(0, (int)std::lround((float)total_uniq * (1.0f - hyb.pcie_share))))
+                : 0;
+            const int gpu_singles = (int)single_eids.size() - max_cpu_singles;
+            for (int i = 0; i < gpu_singles; ++i) host_list.push_back(single_eids[i]);
+
+            if (max_cpu_singles > 0) {
+                uint8_t is_cpu_e[kInkExperts] = {};
+                for (int i = gpu_singles; i < (int)single_eids.size(); ++i) is_cpu_e[single_eids[i]] = 1;
+                for (int m = 0; m < M; ++m) {
+                    for (int k = 0; k < kInkTopK; ++k) {
+                        const int slot = m * kInkTopK + k;
+                        const int e = hyb.h_topk_pin[slot];
+                        if (is_cpu_e[e] && cpu_batch_nj < InkBatchCpuBuf::kMaxJobs) {
+                            hyb.h_batch_buf->out_slot[cpu_batch_nj] = slot;
+                            hyb.batch_tok_m[cpu_batch_nj] = m;
+                            hyb.batch_eid[cpu_batch_nj] = e;
+                            ++cpu_batch_nj;
+                        }
+                    }
+                }
+                if (cpu_batch_nj > 0) {
+                    cpu_batch_seq = hyb.submit_batch_cpu_jobs_async(ip, cpu_batch_nj);
                 }
             }
         } else {
@@ -1195,6 +1313,10 @@ inline void launch_ink_moe_hybrid(
             launch_ink_moe_dispatch_only(st, hyb.d_pf_stage[buf], hyb.d_pf_exp_tmp[buf], info, x_f32, M, ws, force_exact_dec, true);
             INK_CK(cudaEventRecord(hyb.pf_ev_done[buf], st));
             hyb.pf_buf_busy[buf] = true;
+        }
+        if (cpu_batch_nj > 0) {
+            hyb.wait_cpu_jobs(cpu_batch_seq);
+            k_ink_collect_batch_cpu_y<<<cpu_batch_nj, 256, 0, st>>>(hyb.d_batch_buf, cpu_batch_nj, ws.topk_w, ws.y_pair);
         }
     }
 
