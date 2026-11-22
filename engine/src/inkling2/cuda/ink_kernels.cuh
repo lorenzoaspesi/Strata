@@ -1849,6 +1849,131 @@ __global__ void __launch_bounds__(128) k_ink_gemv_sk_dp4a(
     }
 }
 
+// Fused 4-lane dp4a_i8 S_K Unembed + Per-CTA Argmax Reduction (eliminates ~19 MB/step d_logits + softcap traffic!)
+template <int FMT, int MAX_M>
+__global__ void __launch_bounds__(128) k_ink_gemv_sk_dp4a_argmax(
+    const uint8_t* __restrict__ raw,
+    const InkQ8_1_G64* __restrict__ x_sk,  // [M, K / 64]
+    float* __restrict__ part_val,          // [M, gridDim.x]
+    int32_t* __restrict__ part_idx,        // [M, gridDim.x]
+    int M, int N, int K) {
+    constexpr int SB = ink_sb_bytes(FMT);
+    constexpr float HALF = ink_sk_half(FMT);
+    constexpr bool HAS_HALF = (FMT != FMT_S8_K);
+    const int tid = threadIdx.x;
+    const int sub = tid >> 2;  // 0..31 rows per CTA
+    const int g   = tid & 3;   // 0..3 subgroup inside 256-elem superblock
+    const int row = blockIdx.x * 32 + sub;
+    const int nsb = K >> 8;
+    const int ng_row = K >> 6;
+
+    __shared__ alignas(16) InkQ8_1_G64 s_xq[MAX_M][4];  // <= 5,120 B for MAX_M=16!
+    __shared__ float   s_v[32];
+    __shared__ int32_t s_i[32];
+    float acc[MAX_M] = {};
+
+    const uint8_t* rptr = (row < N) ? (raw + (size_t)row * nsb * SB) : nullptr;
+    const int tot_u4 = M * 20;
+
+    for (int s = 0; s < nsb; ++s) {
+        for (int idx = tid; idx < tot_u4; idx += 128) {
+            const int m   = idx / 20;
+            const int rem = idx - m * 20;
+            const int gg  = rem / 5;
+            const int u4i = rem - gg * 5;
+            const uint4* src = reinterpret_cast<const uint4*>(&x_sk[(size_t)m * ng_row + s * 4 + gg]);
+            uint4* dst = reinterpret_cast<uint4*>(&s_xq[m][gg]);
+            dst[u4i] = src[u4i];
+        }
+        __syncthreads();
+
+        if (row < N) {
+            const uint8_t* blk = rptr + (size_t)s * SB;
+            const float eff = f16_to_f32(ld16_u(blk)) * ((float)blk[2 + g] * (1.0f / 255.0f));
+            uint32_t w[16];
+            sk_unpack64_g_to_u32<FMT>(blk + 6, g, w);
+#pragma unroll
+            for (int m = 0; m < MAX_M; ++m) {
+                if (m < M) {
+                    const InkQ8_1_G64& xb = s_xq[m][g];
+                    const int32_t isum = dp64_i8_smem(w, xb);
+                    if constexpr (HAS_HALF) {
+                        acc[m] = fmaf(eff, xb.d * (float)isum - HALF * xb.s, acc[m]);
+                    } else {
+                        acc[m] = fmaf(eff, xb.d * (float)isum, acc[m]);
+                    }
+                }
+            }
+        }
+        if (s + 1 < nsb) __syncthreads();
+    }
+
+    const int n_blocks = gridDim.x;
+#pragma unroll
+    for (int m = 0; m < MAX_M; ++m) {
+        if (m < M) {
+            float v = acc[m];
+            v += __shfl_xor_sync(0xFFFFFFFFu, v, 2);
+            v += __shfl_xor_sync(0xFFFFFFFFu, v, 1);
+            if (g == 0) {
+                s_v[sub] = (row < N) ? v : -3.0e38f;
+                s_i[sub] = (row < N) ? row : 0x7FFFFFFF;
+            }
+            __syncthreads();
+            if (tid < 32) {
+                float bv = s_v[tid];
+                int32_t bi = s_i[tid];
+#pragma unroll
+                for (int o = 16; o >= 1; o >>= 1) {
+                    const float ov = __shfl_xor_sync(0xFFFFFFFFu, bv, o);
+                    const int32_t oi = __shfl_xor_sync(0xFFFFFFFFu, bi, o);
+                    if (ov > bv || (ov == bv && oi < bi)) { bv = ov; bi = oi; }
+                }
+                if (tid == 0) {
+                    part_val[(size_t)m * n_blocks + blockIdx.x] = bv;
+                    part_idx[(size_t)m * n_blocks + blockIdx.x] = bi;
+                }
+            }
+            if (m + 1 < M) __syncthreads();
+        }
+    }
+}
+
+__global__ void __launch_bounds__(256) k_ink_argmax_part_reduce(
+    const float* __restrict__ part_val,    // [M, n_parts]
+    const int32_t* __restrict__ part_idx,  // [M, n_parts]
+    int n_parts,
+    int32_t* __restrict__ out) {           // [M]
+    const int m = blockIdx.x;
+    const int tid = threadIdx.x;
+    const float* pv = part_val + (size_t)m * n_parts;
+    const int32_t* pi = part_idx + (size_t)m * n_parts;
+    float bv = -3.0e38f;
+    int32_t bi = 0x7FFFFFFF;
+    for (int i = tid; i < n_parts; i += 256) {
+        const float v = pv[i];
+        const int32_t idx = pi[i];
+        if (v > bv || (v == bv && idx < bi)) { bv = v; bi = idx; }
+    }
+#pragma unroll
+    for (int o = 16; o >= 1; o >>= 1) {
+        const float ov = __shfl_xor_sync(0xFFFFFFFFu, bv, o);
+        const int32_t oi = __shfl_xor_sync(0xFFFFFFFFu, bi, o);
+        if (ov > bv || (ov == bv && oi < bi)) { bv = ov; bi = oi; }
+    }
+    __shared__ float sv[8];
+    __shared__ int32_t si[8];
+    if ((tid & 31) == 0) { sv[tid >> 5] = bv; si[tid >> 5] = bi; }
+    __syncthreads();
+    if (tid == 0) {
+        float mv = sv[0]; int32_t mi = si[0];
+        for (int w = 1; w < 8; ++w) {
+            if (sv[w] > mv || (sv[w] == mv && si[w] < mi)) { mv = sv[w]; mi = si[w]; }
+        }
+        out[m] = mi;
+    }
+}
+
 // ============================================================================
 // 7. Exact 2-Stage Cauchy-Schwarz Screened Unembed (0.25 ms on RTX 5090, 100.000% Bit-Exact Argmax!)
 //    Coarse plane: symmetric INT8 per-row quantized unembed [V, 2304] (460 MB) + per-row scale sc[V] + exact L2 error eps[V]!

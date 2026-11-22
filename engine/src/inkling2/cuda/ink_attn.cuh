@@ -549,8 +549,8 @@ __global__ void __launch_bounds__(128) k_ink_flash_gqa_splitk(
                 kv4 = make_float4(kf0.x, kf0.y, kf1.x, kf1.y);
                 vv4 = make_float4(vf0.x, vf0.y, vf1.x, vf1.y);
             } else {
-                const float sk = *ink_kv_sc_ptr(kv, true,  sl, p_idx, kh);
-                const float sv = *ink_kv_sc_ptr(kv, false, sl, p_idx, kh);
+                const float sk = __shfl_sync(0xFFFFFFFFu, (lane == 0) ? *ink_kv_sc_ptr(kv, true,  sl, p_idx, kh) : 0.0f, 0);
+                const float sv = __shfl_sync(0xFFFFFFFFu, (lane == 0) ? *ink_kv_sc_ptr(kv, false, sl, p_idx, kh) : 0.0f, 0);
                 const uint32_t k4 = *(const uint32_t*)(ink_kv_f8_ptr(kv, true,  sl, p_idx, kh) + lane * 4);
                 const uint32_t v4 = *(const uint32_t*)(ink_kv_f8_ptr(kv, false, sl, p_idx, kh) + lane * 4);
                 const float2 kf0 = e4m3x2_to_f32x2((uint16_t)(k4 & 0xFFFFu));
@@ -662,14 +662,13 @@ __global__ void __launch_bounds__(256) k_ink_flash_gqa_splitk_tree(
     const int s_beg  = sp * per_sp;
     const int s_end  = min(tp0, s_beg + per_sp);
 
-    // 16 KiB shared tile: 16 KV positions x 128 dims (K and V), loaded ONCE per split across all 8 warps!
-    __shared__ float s_k[16][kInkHeadDim];
-    __shared__ float s_v[16][kInkHeadDim];
+    // 16 KiB double-buffered 8-token tile (1 token/warp): overlaps next-tile PCIe loads with current-tile online softmax!
+    __shared__ float s_k[2][8][kInkHeadDim];
+    __shared__ float s_v[2][8][kInkHeadDim];
 
-    for (int k0 = s_beg; k0 < s_end; k0 += 16) {
-        const int kt = min(16, s_end - k0);
-        for (int t = warp; t < kt; t += 8) {
-            const int kp = k0 + t;
+    auto load_tile8 = [&](int k0, int buf) {
+        const int kp = k0 + warp;
+        if (kp < s_end) {
             float4 kv4, vv4;
             if (!kv.is_fp8) {
                 const uint2 k2 = *(const uint2*)(ink_kv_f16_ptr(kv, true,  slot0, kp, kh) + lane * 4);
@@ -681,8 +680,8 @@ __global__ void __launch_bounds__(256) k_ink_flash_gqa_splitk_tree(
                 kv4 = make_float4(kf0.x, kf0.y, kf1.x, kf1.y);
                 vv4 = make_float4(vf0.x, vf0.y, vf1.x, vf1.y);
             } else {
-                const float sk = *ink_kv_sc_ptr(kv, true,  slot0, kp, kh);
-                const float sv = *ink_kv_sc_ptr(kv, false, slot0, kp, kh);
+                const float sk = __shfl_sync(0xFFFFFFFFu, (lane == 0) ? *ink_kv_sc_ptr(kv, true,  slot0, kp, kh) : 0.0f, 0);
+                const float sv = __shfl_sync(0xFFFFFFFFu, (lane == 0) ? *ink_kv_sc_ptr(kv, false, slot0, kp, kh) : 0.0f, 0);
                 const uint32_t k4 = *(const uint32_t*)(ink_kv_f8_ptr(kv, true,  slot0, kp, kh) + lane * 4);
                 const uint32_t v4 = *(const uint32_t*)(ink_kv_f8_ptr(kv, false, slot0, kp, kh) + lane * 4);
                 const float2 kf0 = e4m3x2_to_f32x2((uint16_t)(k4 & 0xFFFFu));
@@ -692,14 +691,40 @@ __global__ void __launch_bounds__(256) k_ink_flash_gqa_splitk_tree(
                 kv4 = make_float4(kf0.x * sk, kf0.y * sk, kf1.x * sk, kf1.y * sk);
                 vv4 = make_float4(vf0.x * sv, vf0.y * sv, vf1.x * sv, vf1.y * sv);
             }
-            *(float4*)(&s_k[t][lane * 4]) = kv4;
-            *(float4*)(&s_v[t][lane * 4]) = vv4;
+            *(float4*)(&s_k[buf][warp][lane * 4]) = kv4;
+            *(float4*)(&s_v[buf][warp][lane * 4]) = vv4;
         }
+    };
+
+    if (s_beg < s_end) {
+        load_tile8(s_beg, 0);
         __syncthreads();
+    }
+    int cur = 0;
+    for (int k0 = s_beg; k0 < s_end; k0 += 8) {
+        const int kt = min(8, s_end - k0);
+        const int nxt = 1 - cur;
+        const int k_next = k0 + 8;
+        uint32_t k4_n = 0, v4_n = 0;
+        uint2 k2_n = {0, 0}, v2_n = {0, 0};
+        float sk_n = 0.0f, sv_n = 0.0f;
+        const int kp_n = k_next + warp;
+        const bool has_next = (kp_n < s_end);
+        if (has_next) {
+            if (!kv.is_fp8) {
+                k2_n = *(const uint2*)(ink_kv_f16_ptr(kv, true,  slot0, kp_n, kh) + lane * 4);
+                v2_n = *(const uint2*)(ink_kv_f16_ptr(kv, false, slot0, kp_n, kh) + lane * 4);
+            } else {
+                sk_n = __shfl_sync(0xFFFFFFFFu, (lane == 0) ? *ink_kv_sc_ptr(kv, true,  slot0, kp_n, kh) : 0.0f, 0);
+                sv_n = __shfl_sync(0xFFFFFFFFu, (lane == 0) ? *ink_kv_sc_ptr(kv, false, slot0, kp_n, kh) : 0.0f, 0);
+                k4_n = *(const uint32_t*)(ink_kv_f8_ptr(kv, true,  slot0, kp_n, kh) + lane * 4);
+                v4_n = *(const uint32_t*)(ink_kv_f8_ptr(kv, false, slot0, kp_n, kh) + lane * 4);
+            }
+        }
 
         for (int t = 0; t < kt; ++t) {
-            const float4 kv4 = *(const float4*)(&s_k[t][lane * 4]);
-            const float4 vv4 = *(const float4*)(&s_v[t][lane * 4]);
+            const float4 kv4 = *(const float4*)(&s_k[cur][t][lane * 4]);
+            const float4 vv4 = *(const float4*)(&s_v[cur][t][lane * 4]);
             const int kp = k0 + t;
 #pragma unroll
             for (int pi = 0; pi < MAX_PAIRS; ++pi) {
@@ -719,7 +744,28 @@ __global__ void __launch_bounds__(256) k_ink_flash_gqa_splitk_tree(
                 }
             }
         }
-        __syncthreads();
+        if (has_next) {
+            float4 kv4, vv4;
+            if (!kv.is_fp8) {
+                const float2 kf0 = __half22float2(*reinterpret_cast<const __half2*>(&k2_n.x));
+                const float2 kf1 = __half22float2(*reinterpret_cast<const __half2*>(&k2_n.y));
+                const float2 vf0 = __half22float2(*reinterpret_cast<const __half2*>(&v2_n.x));
+                const float2 vf1 = __half22float2(*reinterpret_cast<const __half2*>(&v2_n.y));
+                kv4 = make_float4(kf0.x, kf0.y, kf1.x, kf1.y);
+                vv4 = make_float4(vf0.x, vf0.y, vf1.x, vf1.y);
+            } else {
+                const float2 kf0 = e4m3x2_to_f32x2((uint16_t)(k4_n & 0xFFFFu));
+                const float2 kf1 = e4m3x2_to_f32x2((uint16_t)(k4_n >> 16));
+                const float2 vf0 = e4m3x2_to_f32x2((uint16_t)(v4_n & 0xFFFFu));
+                const float2 vf1 = e4m3x2_to_f32x2((uint16_t)(v4_n >> 16));
+                kv4 = make_float4(kf0.x * sk_n, kf0.y * sk_n, kf1.x * sk_n, kf1.y * sk_n);
+                vv4 = make_float4(vf0.x * sv_n, vf0.y * sv_n, vf1.x * sv_n, vf1.y * sv_n);
+            }
+            *(float4*)(&s_k[nxt][warp][lane * 4]) = kv4;
+            *(float4*)(&s_v[nxt][warp][lane * 4]) = vv4;
+        }
+        if (k_next < s_end) __syncthreads();
+        cur = nxt;
     }
 
     // Split 0 also attends each tree node's exact uncommitted ancestor chain (<= 16 keys in VRAM)!

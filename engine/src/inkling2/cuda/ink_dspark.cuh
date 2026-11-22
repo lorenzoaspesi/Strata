@@ -229,13 +229,12 @@ __global__ void __launch_bounds__(256) k_dspark_block_attn_splitk(
         }
     };
 
-    __shared__ float s_k[16][kInkHeadDim];
-    __shared__ float s_v[16][kInkHeadDim];
+    __shared__ float s_k[2][8][kInkHeadDim];
+    __shared__ float s_v[2][8][kInkHeadDim];
 
-    for (int k0 = s_beg; k0 < s_end; k0 += 16) {
-        const int kt = min(16, s_end - k0);
-        for (int t = warp; t < kt; t += 8) {
-            const int kp = k0 + t;
+    auto load_tile8 = [&](int k0, int buf) {
+        const int kp = k0 + warp;
+        if (kp < s_end) {
             const size_t base = ((size_t)kp * kInkKVHeads + kh) * kInkHeadDim + lane * 4;
             float4 kv4, vv4;
             if (!is_fp8) {
@@ -249,8 +248,8 @@ __global__ void __launch_bounds__(256) k_dspark_block_attn_splitk(
                 vv4 = make_float4(vf0.x, vf0.y, vf1.x, vf1.y);
             } else {
                 const size_t sidx = (size_t)kp * kInkKVHeads + kh;
-                const float sk = ctx_ksc[sidx];
-                const float sv = ctx_vsc[sidx];
+                const float sk = __shfl_sync(0xFFFFFFFFu, (lane == 0) ? ctx_ksc[sidx] : 0.0f, 0);
+                const float sv = __shfl_sync(0xFFFFFFFFu, (lane == 0) ? ctx_vsc[sidx] : 0.0f, 0);
                 const uint32_t k4 = *(const uint32_t*)(ctx_k8 + base);
                 const uint32_t v4 = *(const uint32_t*)(ctx_v8 + base);
                 const float2 kf0 = e4m3x2_to_f32x2((uint16_t)(k4 & 0xFFFFu));
@@ -260,14 +259,64 @@ __global__ void __launch_bounds__(256) k_dspark_block_attn_splitk(
                 kv4 = make_float4(kf0.x * sk, kf0.y * sk, kf1.x * sk, kf1.y * sk);
                 vv4 = make_float4(vf0.x * sv, vf0.y * sv, vf1.x * sv, vf1.y * sv);
             }
-            *(float4*)(&s_k[t][lane * 4]) = kv4;
-            *(float4*)(&s_v[t][lane * 4]) = vv4;
+            *(float4*)(&s_k[buf][warp][lane * 4]) = kv4;
+            *(float4*)(&s_v[buf][warp][lane * 4]) = vv4;
         }
+    };
+
+    if (s_beg < s_end) {
+        load_tile8(s_beg, 0);
         __syncthreads();
+    }
+    int cur = 0;
+    for (int k0 = s_beg; k0 < s_end; k0 += 8) {
+        const int kt = min(8, s_end - k0);
+        const int nxt = 1 - cur;
+        const int k_next = k0 + 8;
+        // Issue next 8-token PCIe/VRAM fetch into registers BEFORE computing current tile!
+        uint32_t k4_n = 0, v4_n = 0;
+        uint2 k2_n = {0, 0}, v2_n = {0, 0};
+        float sk_n = 0.0f, sv_n = 0.0f;
+        const int kp_n = k_next + warp;
+        const bool has_next = (kp_n < s_end);
+        if (has_next) {
+            const size_t base = ((size_t)kp_n * kInkKVHeads + kh) * kInkHeadDim + lane * 4;
+            if (!is_fp8) {
+                k2_n = *(const uint2*)(ctx_k16 + base);
+                v2_n = *(const uint2*)(ctx_v16 + base);
+            } else {
+                const size_t sidx = (size_t)kp_n * kInkKVHeads + kh;
+                sk_n = __shfl_sync(0xFFFFFFFFu, (lane == 0) ? ctx_ksc[sidx] : 0.0f, 0);
+                sv_n = __shfl_sync(0xFFFFFFFFu, (lane == 0) ? ctx_vsc[sidx] : 0.0f, 0);
+                k4_n = *(const uint32_t*)(ctx_k8 + base);
+                v4_n = *(const uint32_t*)(ctx_v8 + base);
+            }
+        }
         for (int t = 0; t < kt; ++t) {
-            attend3(*(const float4*)(&s_k[t][lane * 4]), *(const float4*)(&s_v[t][lane * 4]));
+            attend3(*(const float4*)(&s_k[cur][t][lane * 4]), *(const float4*)(&s_v[cur][t][lane * 4]));
         }
-        __syncthreads();
+        if (has_next) {
+            float4 kv4, vv4;
+            if (!is_fp8) {
+                const float2 kf0 = __half22float2(*reinterpret_cast<const __half2*>(&k2_n.x));
+                const float2 kf1 = __half22float2(*reinterpret_cast<const __half2*>(&k2_n.y));
+                const float2 vf0 = __half22float2(*reinterpret_cast<const __half2*>(&v2_n.x));
+                const float2 vf1 = __half22float2(*reinterpret_cast<const __half2*>(&v2_n.y));
+                kv4 = make_float4(kf0.x, kf0.y, kf1.x, kf1.y);
+                vv4 = make_float4(vf0.x, vf0.y, vf1.x, vf1.y);
+            } else {
+                const float2 kf0 = e4m3x2_to_f32x2((uint16_t)(k4_n & 0xFFFFu));
+                const float2 kf1 = e4m3x2_to_f32x2((uint16_t)(k4_n >> 16));
+                const float2 vf0 = e4m3x2_to_f32x2((uint16_t)(v4_n & 0xFFFFu));
+                const float2 vf1 = e4m3x2_to_f32x2((uint16_t)(v4_n >> 16));
+                kv4 = make_float4(kf0.x * sk_n, kf0.y * sk_n, kf1.x * sk_n, kf1.y * sk_n);
+                vv4 = make_float4(vf0.x * sv_n, vf0.y * sv_n, vf1.x * sv_n, vf1.y * sv_n);
+            }
+            *(float4*)(&s_k[nxt][warp][lane * 4]) = kv4;
+            *(float4*)(&s_v[nxt][warp][lane * 4]) = vv4;
+        }
+        if (k_next < s_end) __syncthreads();
+        cur = nxt;
     }
 
     // Split 0 attends the 8 local draft block tokens kd/vd!
@@ -773,6 +822,82 @@ __global__ void __launch_bounds__(256) k_dspark_score_cand_eval(
     }
 }
 
+constexpr int kInkMaxBeam = 4;
+
+// Ultra-fast 4-lane dp4a_i8 Batched S_K Candidate Scorer (reads each S_K unembed row ONCE across all nw<=4 beams!)
+// Grid: ((K_cand + 15) / 16), Block: 64 (16 candidate rows/CTA, 4 lanes/row = 1 lane per 64-elem subgroup).
+template <int FMT>
+__global__ void __launch_bounds__(64) k_dspark_score_cand_sk_dp4a_batch(
+    const uint8_t* __restrict__ unemb_raw,
+    const InkQ8_1_G64* __restrict__ corr_sk, // [nw, 36]
+    const int32_t* __restrict__ cand_ids,    // [K_cand]
+    const float* __restrict__ cand_base,     // [K_cand] (nullable)
+    int K_cand,
+    int nw,
+    float* __restrict__ cand_scores) {       // [nw, K_cand]
+    constexpr int SB = ink_sb_bytes(FMT);
+    constexpr float HALF = ink_sk_half(FMT);
+    constexpr bool HAS_HALF = (FMT != FMT_S8_K);
+    const int tid = threadIdx.x;
+    const int sub = tid >> 2;  // 0..15 candidate rows per CTA
+    const int g   = tid & 3;   // 0..3 subgroup
+    const int k   = blockIdx.x * 16 + sub;
+
+    __shared__ alignas(16) InkQ8_1_G64 s_xq[kInkMaxBeam][4];  // 1,280 B
+    float acc[kInkMaxBeam] = {};
+
+    const uint8_t* rptr = (k < K_cand) ? (unemb_raw + (size_t)cand_ids[k] * 9 * SB) : nullptr;
+    const int tot_u4 = nw * 20;
+
+    for (int s = 0; s < 9; ++s) {
+        for (int idx = tid; idx < tot_u4; idx += 64) {
+            const int b   = idx / 20;
+            const int rem = idx - b * 20;
+            const int gg  = rem / 5;
+            const int u4i = rem - gg * 5;
+            const uint4* src = reinterpret_cast<const uint4*>(&corr_sk[(size_t)b * (kInkHidden / 64) + s * 4 + gg]);
+            uint4* dst = reinterpret_cast<uint4*>(&s_xq[b][gg]);
+            dst[u4i] = src[u4i];
+        }
+        __syncthreads();
+
+        if (k < K_cand) {
+            const uint8_t* blk = rptr + (size_t)s * SB;
+            const float eff = f16_to_f32(ld16_u(blk)) * ((float)blk[2 + g] * (1.0f / 255.0f));
+            uint32_t w[16];
+            sk_unpack64_g_to_u32<FMT>(blk + 6, g, w);
+#pragma unroll
+            for (int b = 0; b < kInkMaxBeam; ++b) {
+                if (b < nw) {
+                    const InkQ8_1_G64& xb = s_xq[b][g];
+                    const int32_t isum = dp64_i8_smem(w, xb);
+                    if constexpr (HAS_HALF) {
+                        acc[b] = fmaf(eff, xb.d * (float)isum - HALF * xb.s, acc[b]);
+                    } else {
+                        acc[b] = fmaf(eff, xb.d * (float)isum, acc[b]);
+                    }
+                }
+            }
+        }
+        if (s < 8) __syncthreads();
+    }
+
+    if (k < K_cand) {
+        const float bv = cand_base ? cand_base[k] : 0.0f;
+#pragma unroll
+        for (int b = 0; b < kInkMaxBeam; ++b) {
+            if (b < nw) {
+                float v = acc[b];
+                v += __shfl_xor_sync(0xFFFFFFFFu, v, 2);
+                v += __shfl_xor_sync(0xFFFFFFFFu, v, 1);
+                if (g == 0) {
+                    cand_scores[(size_t)b * K_cand + k] = kInkSoftcap * tanhf((bv + v) * (1.0f / kInkSoftcap));
+                }
+            }
+        }
+    }
+}
+
 __global__ void __launch_bounds__(256) k_dspark_top2_reduce(
     const float* __restrict__ cand_scores,
     const int32_t* __restrict__ cand_ids,
@@ -799,7 +924,6 @@ __global__ void __launch_bounds__(256) k_dspark_top2_reduce(
 // ============================================================================
 // True W=4 Multi-Branch On-GPU Markov Beam Tree Kernels (CUDA-Graph Capturable!)
 // ============================================================================
-constexpr int kInkMaxBeam = 4;
 constexpr int kInkBeamPoolCap = 64;
 
 __global__ void __launch_bounds__(256) k_dspark_beam_init(
@@ -1557,9 +1681,11 @@ struct InkDSpark {
                 dspark_gemm_bf16(it_qkv->second, d_h, d_qkv_fused, B, kInkQDim + 2 * kInkKVDim, kInkHidden, false);
                 k_dspark_split_qkv<<<dim3((kInkQDim + 2 * kInkKVDim + 255) / 256, B), 256, 0, r.st>>>(d_qkv_fused, d_q, d_k, d_v, B);
             } else {
-                dspark_linear_b8(p + ".self_attn.q_proj.weight", d_h, d_q, B, false);
-                dspark_linear_b8(p + ".self_attn.k_proj.weight", d_h, d_k, B, true);
-                dspark_linear_b8(p + ".self_attn.v_proj.weight", d_h, d_v, B, true);
+                const std::string qkv_names[3] = {
+                    p + ".self_attn.q_proj.weight", p + ".self_attn.k_proj.weight", p + ".self_attn.v_proj.weight"
+                };
+                float* qkv_ys[3] = { d_q, d_k, d_v };
+                r.linear_multi(qkv_names, qkv_ys, 3, d_h, B);
             }
             k_dspark_rmsnorm_rope<<<dim3(kInkHeads, B), 128, 0, r.st>>>(
                 d_q, (const float*)m.trunk_ptr(p + ".self_attn.q_norm.weight"), d_pos, m.man.c.dspark_rope_theta, B, kInkHeads);
@@ -1583,8 +1709,9 @@ struct InkDSpark {
                 dspark_gemm_bf16(it_gu->second, d_h, d_gu_fused, B, 2 * kInkDsparkInter, kInkHidden, false);
                 k_dspark_swiglu_fused<<<dim3((kInkDsparkInter + 255) / 256, B), 256, 0, r.st>>>(d_gu_fused, d_act, B);
             } else {
-                dspark_linear_b8(p + ".mlp.gate_proj.weight", d_h, d_g, B, false);
-                dspark_linear_b8(p + ".mlp.up_proj.weight", d_h, d_u, B, true);
+                const std::string gu_names[2] = { p + ".mlp.gate_proj.weight", p + ".mlp.up_proj.weight" };
+                float* gu_ys[2] = { d_g, d_u };
+                r.linear_multi(gu_names, gu_ys, 2, d_h, B);
                 k_dspark_swiglu<<<(B * kInkDsparkInter + 255) / 256, 256, 0, r.st>>>(d_g, d_u, d_act, B * kInkDsparkInter);
             }
             dspark_linear_b8(p + ".mlp.down_proj.weight", d_act, d_proj, B, false);
@@ -1652,6 +1779,13 @@ struct InkDSpark {
                 k_dspark_score_cand_dp4a_batch<<<(K_cand + 7) / 8, 256, 0, r.st>>>(
                     m.unembed_screen.q8, m.unembed_screen.sc, d_corr,
                     d_cand_ids + (size_t)s * K_cand, nullptr, K_cand, 1, d_cand_scores);
+            } else if ((m.sm_cc == 61 || m.sm_cc >= 75) && ti_un.fmt == FMT_S6_K) {
+                k_ink_quant_q8_1<<<(kInkHidden / 64 + 7) / 8, 256, 0, r.st>>>(d_corr, r.moe_ws.xq_sk, 1, kInkHidden);
+                k_dspark_score_cand_sk_dp4a_batch<FMT_S6_K><<<(K_cand + 15) / 16, 64, 0, r.st>>>(
+                    m.d_trunk + ti_un.off, r.moe_ws.xq_sk,
+                    d_cand_ids + (size_t)s * K_cand,
+                    m.unembed_screen.ready ? nullptr : (d_cand_base + (size_t)s * K_cand),
+                    K_cand, 1, d_cand_scores);
             } else {
                 k_dspark_score_cand_eval<<<(K_cand + 7) / 8, 256, 0, r.st>>>(
                     m.d_trunk + ti_un.off, ti_un.fmt, (int)ti_un.rows(),
@@ -1697,6 +1831,14 @@ struct InkDSpark {
                 k_dspark_score_cand_dp4a_batch<<<(K_cand + 7) / 8, 256, 0, r.st>>>(
                     m.unembed_screen.q8, m.unembed_screen.sc, d_corr_b,
                     d_cand_ids + (size_t)s * K_cand, nullptr, K_cand, nw, d_cand_scores_b);
+            } else if ((m.sm_cc == 61 || m.sm_cc >= 75) && ti_un.fmt == FMT_S6_K) {
+                const int nblk = nw * (kInkHidden / 64);
+                k_ink_quant_q8_1<<<(nblk + 7) / 8, 256, 0, r.st>>>(d_corr_b, r.moe_ws.xq_sk, nw, kInkHidden);
+                k_dspark_score_cand_sk_dp4a_batch<FMT_S6_K><<<(K_cand + 15) / 16, 64, 0, r.st>>>(
+                    m.d_trunk + ti_un.off, r.moe_ws.xq_sk,
+                    d_cand_ids + (size_t)s * K_cand,
+                    m.unembed_screen.ready ? nullptr : (d_cand_base + (size_t)s * K_cand),
+                    K_cand, nw, d_cand_scores_b);
             } else {
                 for (int b = 0; b < nw; ++b) {
                     k_dspark_score_cand_eval<<<(K_cand + 7) / 8, 256, 0, r.st>>>(

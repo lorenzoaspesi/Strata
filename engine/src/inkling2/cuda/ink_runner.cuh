@@ -1559,37 +1559,75 @@ struct InkCudaRunner {
         }
 
         // 2. Looped Core: physical layers 6..17 x 3 passes (visits 6..41)
+        //    When Prelude/Coda spill to host RAM but all Core layers are 100% VRAM-resident, capture the
+        //    entire 36-visit Core into a reusable CUDA Graph (~700 launches -> 1 cudaGraphLaunch)!
         const int n_passes = (max_passes_override > 0 && max_passes_override < m.man.c.num_passes)
                                  ? max_passes_override
                                  : m.man.c.num_passes;
-        int n_bank = 0;
-        for (int pass = 0; pass < n_passes; ++pass) {
-            if (pass > 0) {
-                // Bank = previous pass's blocks after the first core block + bank_out (cur from Layer 17)
-                n_bank = n_blocks - (n_pre_blk + 1);
-                for (int b = 0; b < n_bank; ++b) {
-                    INK_CK(cudaMemcpyAsync(d_bank[b], block_ptrs[n_pre_blk + 1 + b], n_hid * 4, cudaMemcpyDeviceToDevice, st));
+        bool core_all_vram = true;
+        for (int ip = m.man.c.core_start; ip < m.man.c.core_end; ++ip) {
+            if (m.layer_has_host[ip]) { core_all_vram = false; break; }
+        }
+        const bool use_core_graph = (use_cuda_graph && !prof_enabled && core_all_vram &&
+                                     m.n_host_experts > 0 && max_passes_override == 0 && slot0 == 0 &&
+                                     (mode == 2 || (mode == 0 && M == 1)));
+        auto emit_core_36 = [&]() {
+            int n_bank = 0;
+            for (int pass = 0; pass < n_passes; ++pass) {
+                if (pass > 0) {
+                    // Bank = previous pass's blocks after the first core block + bank_out (cur from Layer 17)
+                    n_bank = n_blocks - (n_pre_blk + 1);
+                    for (int b = 0; b < n_bank; ++b) {
+                        INK_CK(cudaMemcpyAsync(d_bank[b], block_ptrs[n_pre_blk + 1 + b], n_hid * 4, cudaMemcpyDeviceToDevice, st));
+                    }
+                    INK_CK(cudaMemcpyAsync(d_bank_out, d_cur, n_hid * 4, cudaMemcpyDeviceToDevice, st));
+                    // Reset cur = prelude, blocks = prelude_blocks
+                    INK_CK(cudaMemcpyAsync(d_cur, d_prelude, n_hid * 4, cudaMemcpyDeviceToDevice, st));
+                    n_blocks = n_pre_blk;
+                    for (int b = 0; b < n_pre_blk; ++b) {
+                        INK_CK(cudaMemcpyAsync(d_blocks[b], d_prelude_blocks[b], n_hid * 4, cudaMemcpyDeviceToDevice, st));
+                        block_ptrs[b] = d_blocks[b];
+                    }
                 }
-                INK_CK(cudaMemcpyAsync(d_bank_out, d_cur, n_hid * 4, cudaMemcpyDeviceToDevice, st));
-                // Reset cur = prelude, blocks = prelude_blocks
-                INK_CK(cudaMemcpyAsync(d_cur, d_prelude, n_hid * 4, cudaMemcpyDeviceToDevice, st));
+                DepthStatePtrs bst{};
+                if (pass > 0) {
+                    for (int b = 0; b < n_bank; ++b) bst.p[b] = d_bank[b];
+                    bst.p[n_bank] = d_bank_out;
+                    bst.count = n_bank + 1;
+                }
+                for (int ip = m.man.c.core_start; ip < m.man.c.core_end; ++ip) {
+                    maybe_tap(visit, d_cur);
+                    run_visit(visit, ip, (pass > 0) ? &bst : nullptr, M, mode, slot0, tree_p0, n_blocks, block_ptrs);
+                    ++visit;
+                }
+            }
+        };
+        if (use_core_graph) {
+            GraphKey key{M, 20 + mode, want_taps ? 1 : 0, (int)kv_dtype};
+            cudaGraphExec_t exec = nullptr;
+            for (const auto& e : graph_cache) if (e.key == key) { exec = e.exec; break; }
+            if (!exec) {
+                cudaGraph_t gr = nullptr;
+                INK_CK(cudaStreamBeginCapture(st, cudaStreamCaptureModeThreadLocal));
+                emit_core_36();
+                INK_CK(cudaStreamEndCapture(st, &gr));
+                INK_CK(cudaGraphInstantiate(&exec, gr, nullptr, nullptr, 0));
+                INK_CK(cudaGraphDestroy(gr));
+                graph_cache.push_back({key, exec});
+            } else {
+                // Advance host-side n_blocks / block_ptrs deterministically to match end of pass n_passes-1
                 n_blocks = n_pre_blk;
-                for (int b = 0; b < n_pre_blk; ++b) {
-                    INK_CK(cudaMemcpyAsync(d_blocks[b], d_prelude_blocks[b], n_hid * 4, cudaMemcpyDeviceToDevice, st));
-                    block_ptrs[b] = d_blocks[b];
+                for (int b = 0; b < n_pre_blk; ++b) block_ptrs[b] = d_blocks[b];
+                for (int ip = m.man.c.core_start; ip < m.man.c.core_end; ++ip) {
+                    if (ip % m.man.c.block_size == 0) {
+                        block_ptrs[n_blocks] = d_blocks[n_blocks];
+                        ++n_blocks;
+                    }
                 }
             }
-            DepthStatePtrs bst{};
-            if (pass > 0) {
-                for (int b = 0; b < n_bank; ++b) bst.p[b] = d_bank[b];
-                bst.p[n_bank] = d_bank_out;
-                bst.count = n_bank + 1;
-            }
-            for (int ip = m.man.c.core_start; ip < m.man.c.core_end; ++ip) {
-                maybe_tap(visit, d_cur);
-                run_visit(visit, ip, (pass > 0) ? &bst : nullptr, M, mode, slot0, tree_p0, n_blocks, block_ptrs);
-                ++visit;
-            }
+            INK_CK(cudaGraphLaunch(exec, st));
+        } else {
+            emit_core_36();
         }
 
         // 3. Coda: physical layers 18..23 (visits 42..47)
@@ -1752,6 +1790,41 @@ struct InkCudaRunner {
                         m.d_trunk + ui.off, hm, d_cand_ids, d_cand_cnt, 4096, d_argmax + m0, mc);
                 }
             }
+            prof_mark_end(7);
+            INK_CK(cudaMemcpyAsync(h_out_ids, d_argmax, (size_t)M * 4, cudaMemcpyDeviceToHost, st));
+            INK_CK(cudaStreamSynchronize(st));
+            return;
+        }
+        // Fused 4-lane dp4a_i8 S_K Unembed + Argmax when unembed_screen is unavailable (8 GiB VRAM):
+        // skips writing d_logits + k_ink_softcap + k_ink_argmax_rows (~19 MB/step VRAM traffic saved!).
+        if (M <= 16 && (m.sm_cc == 61 || m.sm_cc >= 75) &&
+            (ui.fmt == FMT_S5_K || ui.fmt == FMT_S6_K || ui.fmt == FMT_S8_K) &&
+            (size_t)M * (kInkHidden / 64) <= (size_t)moe_ws.cap_M * (kInkHidden / 64)) {
+            const int V = m.man.c.vocab_unpadded;
+            const int grid = (V + 31) / 32;
+            const uint8_t* W = m.d_trunk + ui.off;
+            const int nblk = M * (kInkHidden / 64);
+            k_ink_quant_q8_1<<<(nblk + 7) / 8, 256, 0, st>>>(d_h_norm, moe_ws.xq_sk, M, kInkHidden);
+            // Reuse unused d_dot_hat (8 * 200058 floats = 6.4 MB) for [M, grid] partial (val, idx) pairs (~400 KB each)
+            float* part_val = d_dot_hat;
+            int32_t* part_idx = reinterpret_cast<int32_t*>(d_dot_hat + (size_t)M * grid);
+            if (ui.fmt == FMT_S5_K) {
+                if (M == 1)      k_ink_gemv_sk_dp4a_argmax<FMT_S5_K, 1><<<grid, 128, 0, st>>>(W, moe_ws.xq_sk, part_val, part_idx, M, V, kInkHidden);
+                else if (M <= 4) k_ink_gemv_sk_dp4a_argmax<FMT_S5_K, 4><<<grid, 128, 0, st>>>(W, moe_ws.xq_sk, part_val, part_idx, M, V, kInkHidden);
+                else if (M <= 8) k_ink_gemv_sk_dp4a_argmax<FMT_S5_K, 8><<<grid, 128, 0, st>>>(W, moe_ws.xq_sk, part_val, part_idx, M, V, kInkHidden);
+                else             k_ink_gemv_sk_dp4a_argmax<FMT_S5_K, 16><<<grid, 128, 0, st>>>(W, moe_ws.xq_sk, part_val, part_idx, M, V, kInkHidden);
+            } else if (ui.fmt == FMT_S6_K) {
+                if (M == 1)      k_ink_gemv_sk_dp4a_argmax<FMT_S6_K, 1><<<grid, 128, 0, st>>>(W, moe_ws.xq_sk, part_val, part_idx, M, V, kInkHidden);
+                else if (M <= 4) k_ink_gemv_sk_dp4a_argmax<FMT_S6_K, 4><<<grid, 128, 0, st>>>(W, moe_ws.xq_sk, part_val, part_idx, M, V, kInkHidden);
+                else if (M <= 8) k_ink_gemv_sk_dp4a_argmax<FMT_S6_K, 8><<<grid, 128, 0, st>>>(W, moe_ws.xq_sk, part_val, part_idx, M, V, kInkHidden);
+                else             k_ink_gemv_sk_dp4a_argmax<FMT_S6_K, 16><<<grid, 128, 0, st>>>(W, moe_ws.xq_sk, part_val, part_idx, M, V, kInkHidden);
+            } else {
+                if (M == 1)      k_ink_gemv_sk_dp4a_argmax<FMT_S8_K, 1><<<grid, 128, 0, st>>>(W, moe_ws.xq_sk, part_val, part_idx, M, V, kInkHidden);
+                else if (M <= 4) k_ink_gemv_sk_dp4a_argmax<FMT_S8_K, 4><<<grid, 128, 0, st>>>(W, moe_ws.xq_sk, part_val, part_idx, M, V, kInkHidden);
+                else if (M <= 8) k_ink_gemv_sk_dp4a_argmax<FMT_S8_K, 8><<<grid, 128, 0, st>>>(W, moe_ws.xq_sk, part_val, part_idx, M, V, kInkHidden);
+                else             k_ink_gemv_sk_dp4a_argmax<FMT_S8_K, 16><<<grid, 128, 0, st>>>(W, moe_ws.xq_sk, part_val, part_idx, M, V, kInkHidden);
+            }
+            k_ink_argmax_part_reduce<<<M, 256, 0, st>>>(part_val, part_idx, grid, d_argmax);
             prof_mark_end(7);
             INK_CK(cudaMemcpyAsync(h_out_ids, d_argmax, (size_t)M * 4, cudaMemcpyDeviceToHost, st));
             INK_CK(cudaStreamSynchronize(st));

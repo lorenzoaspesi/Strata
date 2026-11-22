@@ -389,6 +389,39 @@ __global__ void __launch_bounds__(256) k_ink_quant_q8_1(
     }
 }
 
+// Active-row-bounded Q8_1_G64 quantizer: reads exact active row count (*off_end = tb.off[128]) on device!
+// Eliminates ~10x wasted DRAM quantization traffic across streamed host-expert chunks during prefill (zero host sync!).
+__global__ void __launch_bounds__(256) k_ink_quant_q8_1_active(
+    const float* __restrict__ x,
+    InkQ8_1_G64* __restrict__ out,
+    const int32_t* __restrict__ off_end,
+    int cols) {
+    const int rows = *off_end;
+    const int ng = cols / 64;
+    const int w = blockIdx.x * 8 + (threadIdx.x >> 5);
+    const int lane = threadIdx.x & 31;
+    const int total = rows * ng;
+    if (w >= total) return;
+    const float* xb = x + (size_t)w * 64;
+    const float v0 = xb[2 * lane];
+    const float v1 = xb[2 * lane + 1];
+    float am = warp_max(fmaxf(fabsf(v0), fabsf(v1)));
+    const float d = am * (1.0f / 127.0f);
+    const float inv = d > 0.0f ? (127.0f / am) : 0.0f;
+    int q0 = max(-127, min(127, __float2int_rn(v0 * inv)));
+    int q1 = max(-127, min(127, __float2int_rn(v1 * inv)));
+    int s = q0 + q1;
+#pragma unroll
+    for (int o = 16; o >= 1; o >>= 1) s += __shfl_xor_sync(0xFFFFFFFFu, s, o);
+    InkQ8_1_G64& dst = out[w];
+    dst.qs[2 * lane]     = (int8_t)q0;
+    dst.qs[2 * lane + 1] = (int8_t)q1;
+    if (lane == 0) {
+        dst.d = d;
+        dst.s = d * (float)s;
+    }
+}
+
 // ============================================================================
 // 4. Bandwidth-Optimal Decode & Verify (M = 1..16) Fused Expert Kernels (sm_70 .. sm_121a!)
 //    Each active expert caches its n_e (<= 16) input vectors in shared memory (or L1) and
@@ -2950,7 +2983,7 @@ inline void launch_ink_moe_dispatch_only(
             dim3 g32(kInkInter / 32, mt);
             k_ink_moe_gu_sk_tile16<<<g32, 128, 0, st>>>(sec4_base, experts, ws.tb, ws.xq_sk, ws.h_f32);
             const int nblk_h = P * (kInkInter / 64);
-            k_ink_quant_q8_1<<<(nblk_h + 7) / 8, 256, 0, st>>>(ws.h_f32, ws.hq_sk, P, kInkInter);
+            k_ink_quant_q8_1_active<<<(nblk_h + 7) / 8, 256, 0, st>>>(ws.h_f32, ws.hq_sk, ws.tb.off + kInkExperts, kInkInter);
             k_ink_moe_dn_sk_tile16<<<g32, 128, 0, st>>>(sec4_base, experts, ws.tb, ws.hq_sk, ws.topk_w, ws.y_pair);
         } else if (M >= 24 && ink_has_int8_tc()) {
             const int mt = ink_moe_max_tiles(M, tile_rows);
@@ -2958,7 +2991,7 @@ inline void launch_ink_moe_dispatch_only(
             if (tile_rows <= 16) k_ink_moe_sk_tc<true, 16><<<grid, 256, 0, st>>>(sec4_base, experts, ws.tb, ws.xq_sk, nullptr, ws.h_f32);
             else                 k_ink_moe_sk_tc<true, 64><<<grid, 256, 0, st>>>(sec4_base, experts, ws.tb, ws.xq_sk, nullptr, ws.h_f32);
             const int nblk_h = P * (kInkInter / 64);
-            k_ink_quant_q8_1<<<(nblk_h + 7) / 8, 256, 0, st>>>(ws.h_f32, ws.hq_sk, P, kInkInter);
+            k_ink_quant_q8_1_active<<<(nblk_h + 7) / 8, 256, 0, st>>>(ws.h_f32, ws.hq_sk, ws.tb.off + kInkExperts, kInkInter);
             if (tile_rows <= 16) k_ink_moe_sk_tc<false, 16><<<grid, 256, 0, st>>>(sec4_base, experts, ws.tb, ws.hq_sk, ws.topk_w, ws.y_pair);
             else                 k_ink_moe_sk_tc<false, 64><<<grid, 256, 0, st>>>(sec4_base, experts, ws.tb, ws.hq_sk, ws.topk_w, ws.y_pair);
         } else {
@@ -2967,7 +3000,7 @@ inline void launch_ink_moe_dispatch_only(
             else if (M <= 32) k_ink_moe_gu_sk<4><<<g32, 128, 0, st>>>(sec4_base, experts, ws.tb, ws.xq_sk, ws.h_f32);
             else              k_ink_moe_gu_sk<16><<<g32, 128, 0, st>>>(sec4_base, experts, ws.tb, ws.xq_sk, ws.h_f32);
             const int nblk_h = P * (kInkInter / 64);
-            k_ink_quant_q8_1<<<(nblk_h + 7) / 8, 256, 0, st>>>(ws.h_f32, ws.hq_sk, P, kInkInter);
+            k_ink_quant_q8_1_active<<<(nblk_h + 7) / 8, 256, 0, st>>>(ws.h_f32, ws.hq_sk, ws.tb.off + kInkExperts, kInkInter);
             if (M == 1)       k_ink_moe_dn_sk<1><<<g32, 128, 0, st>>>(sec4_base, experts, ws.tb, ws.hq_sk, ws.topk_w, ws.y_pair);
             else if (M <= 32) k_ink_moe_dn_sk<4><<<g32, 128, 0, st>>>(sec4_base, experts, ws.tb, ws.hq_sk, ws.topk_w, ws.y_pair);
             else              k_ink_moe_dn_sk<16><<<g32, 128, 0, st>>>(sec4_base, experts, ws.tb, ws.hq_sk, ws.topk_w, ws.y_pair);
