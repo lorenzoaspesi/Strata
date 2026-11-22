@@ -74,6 +74,11 @@ struct InkMoeWorkspace {
     uint8_t* hsc_mx8  = nullptr;    // [P, 36]
     InkQ8_1_G64* xq_sk = nullptr;   // [M, 36]
     InkQ8_1_G64* hq_sk = nullptr;   // [P, 18]
+    // Pascal sm_60..69 cuBLAS FP32 prefill MoE scratch (reuses VRAM saved by skipping sm_120 FP4/MX8 buffers!)
+    float*   pf_w_f32 = nullptr;    // [2304, 2304] (20.25 MiB)
+    float*   pf_x_f32 = nullptr;    // [128, 2304]  (1.125 MiB)
+    float*   pf_y_f32 = nullptr;    // [128, 2304]  (1.125 MiB)
+    int32_t* h_off_pin = nullptr;   // [129] pinned host copy of tb.off
     void*    raw_buf  = nullptr;
     size_t   raw_bytes = 0;
     int      cap_M    = 0;
@@ -85,6 +90,11 @@ struct InkMoeWorkspace {
         const size_t M = (size_t)max_M;
         const size_t P = M * kInkTopK;
         const size_t MT = (size_t)ink_moe_max_tiles(max_M);
+        const bool need_sm120 = sm120::available();
+        int dev = 0, cc_maj = 0;
+        cudaGetDevice(&dev);
+        cudaDeviceGetAttribute(&cc_maj, cudaDevAttrComputeCapabilityMajor, dev);
+        const bool need_pascal_sgemm = (cc_maj > 0 && cc_maj < 7);
         size_t off = 0;
         auto bump = [&](size_t bytes) -> size_t {
             size_t o = off;
@@ -104,14 +114,17 @@ struct InkMoeWorkspace {
         const size_t o_tw      = bump(P * 4);
         const size_t o_hf32    = bump(P * kInkInter * 4);
         const size_t o_ypair   = bump(P * kInkHidden * 4);
-        const size_t o_xafp4   = bump(M * (kInkHidden / 64) * sm120::kActFp4SlotBytes);
-        const size_t o_hafp4   = bump(P * (kInkInter / 64) * sm120::kActFp4SlotBytes);
-        const size_t o_xqmx8   = bump(M * kInkHidden);
-        const size_t o_xscmx8  = bump(M * (kInkHidden / 32));
-        const size_t o_hqmx8   = bump(P * kInkInter);
-        const size_t o_hscmx8  = bump(P * (kInkInter / 32));
+        const size_t o_xafp4   = need_sm120 ? bump(M * (kInkHidden / 64) * sm120::kActFp4SlotBytes) : 0;
+        const size_t o_hafp4   = need_sm120 ? bump(P * (kInkInter / 64) * sm120::kActFp4SlotBytes) : 0;
+        const size_t o_xqmx8   = need_sm120 ? bump(M * kInkHidden) : 0;
+        const size_t o_xscmx8  = need_sm120 ? bump(M * (kInkHidden / 32)) : 0;
+        const size_t o_hqmx8   = need_sm120 ? bump(P * kInkInter) : 0;
+        const size_t o_hscmx8  = need_sm120 ? bump(P * (kInkInter / 32)) : 0;
         const size_t o_xqsk    = bump(M * (kInkHidden / 64) * sizeof(InkQ8_1_G64));
         const size_t o_hqsk    = bump(P * (kInkInter / 64) * sizeof(InkQ8_1_G64));
+        const size_t o_pfw     = need_pascal_sgemm ? bump((size_t)(2 * kInkInter) * kInkHidden * sizeof(float)) : 0;
+        const size_t o_pfx     = need_pascal_sgemm ? bump(128ull * kInkHidden * sizeof(float)) : 0;
+        const size_t o_pfy     = need_pascal_sgemm ? bump(128ull * (2 * kInkInter) * sizeof(float)) : 0;
 
         raw_bytes = off;
         INK_CK(cudaMalloc(&raw_buf, raw_bytes));
@@ -129,17 +142,23 @@ struct InkMoeWorkspace {
         topk_w     = (float*)(base + o_tw);
         h_f32      = (float*)(base + o_hf32);
         y_pair     = (float*)(base + o_ypair);
-        xa_fp4     = base + o_xafp4;
-        ha_fp4     = base + o_hafp4;
-        xq_mx8     = base + o_xqmx8;
-        xsc_mx8    = base + o_xscmx8;
-        hq_mx8     = base + o_hqmx8;
-        hsc_mx8    = base + o_hscmx8;
+        xa_fp4     = need_sm120 ? (base + o_xafp4) : nullptr;
+        ha_fp4     = need_sm120 ? (base + o_hafp4) : nullptr;
+        xq_mx8     = need_sm120 ? (base + o_xqmx8) : nullptr;
+        xsc_mx8    = need_sm120 ? (base + o_xscmx8) : nullptr;
+        hq_mx8     = need_sm120 ? (base + o_hqmx8) : nullptr;
+        hsc_mx8    = need_sm120 ? (base + o_hscmx8) : nullptr;
         xq_sk      = (InkQ8_1_G64*)(base + o_xqsk);
         hq_sk      = (InkQ8_1_G64*)(base + o_hqsk);
+        pf_w_f32   = need_pascal_sgemm ? (float*)(base + o_pfw) : nullptr;
+        pf_x_f32   = need_pascal_sgemm ? (float*)(base + o_pfx) : nullptr;
+        pf_y_f32   = need_pascal_sgemm ? (float*)(base + o_pfy) : nullptr;
+        if (need_pascal_sgemm) h_off_pin = halloc_pinned<int32_t>(kInkExperts + 1);
     }
 
     void free_all() {
+        if (h_off_pin) { cudaFreeHost(h_off_pin); h_off_pin = nullptr; }
+        pf_w_f32 = pf_x_f32 = pf_y_f32 = nullptr;
         if (raw_buf) {
             INK_CK(cudaFree(raw_buf));
             raw_buf = nullptr;
@@ -2421,6 +2440,153 @@ struct InkLayerMoeInfo {
 };
 
 // Shared GPU expert execution helper (bins tier<=1 experts in `experts` and writes weighted outputs to ws.y_pair)
+// ============================================================================
+// 4E. Pascal (sm_60/61) FP32 cuBLAS SGEMM MoE Prefill Path (6.5 TFLOPS on GTX 1070!)
+//     Dequantizes each active expert ONCE into pf_w_f32 and multiplies all routed tokens via cublasSgemm.
+// ============================================================================
+template <bool GU, int FMT>
+__device__ __forceinline__ void dequant_sk_row_f32(
+    const uint8_t* __restrict__ body, uint64_t dn_off, int row, float* __restrict__ dst_row) {
+    constexpr int K = GU ? kInkHidden : kInkInter;
+    constexpr int NG = K / 64;   // 36 (GU) or 18 (DN)
+    constexpr int SB = ink_sb_bytes(FMT);
+    constexpr float HALF = ink_sk_half(FMT);
+    constexpr size_t row_b = 9ull * (size_t)SB;
+    const uint8_t* gu_base = body + kInkInter * 2;
+    for (int idx = threadIdx.x; idx < NG * 8; idx += blockDim.x) {
+        const int xg = idx >> 3;   // 0..NG-1 (64-elem subgroup)
+        const int lg = idx & 7;    // 0..7 (8 weights/thread)
+        const uint8_t* blk;
+        int sg;
+        if constexpr (GU) {
+            blk = gu_base + (size_t)row * row_b + (size_t)(xg >> 2) * SB;
+            sg  = xg & 3;
+        } else {
+            const int pair_r = row >> 1;
+            const int sub_glob = xg + (row & 1) * 18;
+            blk = body + dn_off + (size_t)pair_r * row_b + (size_t)(sub_glob >> 2) * SB;
+            sg  = sub_glob & 3;
+        }
+        const float eff = f16_to_f32(ld16_u(blk)) * ((float)blk[2 + sg] * (1.0f / 255.0f));
+        uint32_t w0, w1;
+        sk_unpack8_lane8<FMT>(blk + 6, sg, lg, w0, w1);
+        float* d = dst_row + xg * 64 + lg * 8;
+        d[0] = ((float)(int8_t)(w0)       - HALF) * eff;
+        d[1] = ((float)(int8_t)(w0 >> 8)  - HALF) * eff;
+        d[2] = ((float)(int8_t)(w0 >> 16) - HALF) * eff;
+        d[3] = ((float)(int8_t)(w0 >> 24) - HALF) * eff;
+        d[4] = ((float)(int8_t)(w1)       - HALF) * eff;
+        d[5] = ((float)(int8_t)(w1 >> 8)  - HALF) * eff;
+        d[6] = ((float)(int8_t)(w1 >> 16) - HALF) * eff;
+        d[7] = ((float)(int8_t)(w1 >> 24) - HALF) * eff;
+    }
+}
+
+template <bool GU>
+__global__ void __launch_bounds__(128) k_ink_dequant_expert_f32(
+    const uint8_t* __restrict__ sec4_base,
+    const InkExpertDev* __restrict__ experts,
+    int eid,
+    float* __restrict__ w_out) {   // [ROWS_N, K] row-major FP32
+    constexpr int K      = GU ? kInkHidden : kInkInter;
+    constexpr int ROWS_N = GU ? (2 * kInkInter) : kInkHidden;
+    const int row = blockIdx.x;
+    if (row >= ROWS_N) return;
+    const InkExpertDev ex = experts[eid];
+    const int fmt = GU ? (int)ex.gu_code : (int)ex.dn_code;
+    const uint8_t* body = sec4_base + ex.body_off;
+    float* dst = w_out + (size_t)row * K;
+
+    if (fmt == FMT_SF4) {
+        const float* hdr = reinterpret_cast<const float*>(body);
+        const float w_outer = GU ? (hdr[0] / hdr[1]) : (hdr[2] / hdr[3]);
+        const uint8_t* bp = GU ? (body + 16) : (body + ex.dn_off);
+        const uint8_t* bs = bp + (size_t)ROWS_N * (K / 2);
+        const uint8_t* rp = bp + (size_t)row * (K / 2);
+        const uint8_t* rs = bs + (size_t)row * (K / 16);
+        for (int blk = threadIdx.x; blk < (K / 16); blk += blockDim.x) {
+            const float sc = e4m3_to_f32(rs[blk]) * w_outer;
+            const uint8_t* b8 = rp + blk * 8;
+            float* d = dst + blk * 16;
+#pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                const float2 v = e2m1x2_byte_to_f32x2(b8[i]);
+                d[2 * i + 0] = v.x * sc;
+                d[2 * i + 1] = v.y * sc;
+            }
+        }
+    } else if (fmt == FMT_MX8) {
+        const uint8_t* bp = GU ? body : (body + ex.dn_off);
+        const uint8_t* bs = bp + (size_t)ROWS_N * K;
+        const uint8_t* rp = bp + (size_t)row * K;
+        const uint8_t* rs = bs + (size_t)row * (K / 32);
+        for (int blk = threadIdx.x; blk < (K / 32); blk += blockDim.x) {
+            const float sc = ue8m0_to_f32(rs[blk]);
+            const uint8_t* b32 = rp + blk * 32;
+            float* d = dst + blk * 32;
+#pragma unroll
+            for (int i = 0; i < 32; ++i) d[i] = e4m3_to_f32(b32[i]) * sc;
+        }
+    } else if (fmt == FMT_S1_5) { dequant_sk_row_f32<GU, FMT_S1_5>(body, ex.dn_off, row, dst); }
+    else if   (fmt == FMT_S2_K) { dequant_sk_row_f32<GU, FMT_S2_K>(body, ex.dn_off, row, dst); }
+    else if   (fmt == FMT_S3_K) { dequant_sk_row_f32<GU, FMT_S3_K>(body, ex.dn_off, row, dst); }
+    else if   (fmt == FMT_S4_K) { dequant_sk_row_f32<GU, FMT_S4_K>(body, ex.dn_off, row, dst); }
+    else if   (fmt == FMT_S5_K) { dequant_sk_row_f32<GU, FMT_S5_K>(body, ex.dn_off, row, dst); }
+    else if   (fmt == FMT_S6_K) { dequant_sk_row_f32<GU, FMT_S6_K>(body, ex.dn_off, row, dst); }
+    else if   (fmt == FMT_S8_K) { dequant_sk_row_f32<GU, FMT_S8_K>(body, ex.dn_off, row, dst); }
+}
+
+__global__ void __launch_bounds__(256) k_ink_moe_gather_x(
+    const float* __restrict__ x_f32,
+    const int32_t* __restrict__ tok_idx,
+    float* __restrict__ x_out,
+    int nr) {
+    const int r = blockIdx.x;
+    if (r >= nr) return;
+    const float4* src = reinterpret_cast<const float4*>(x_f32 + (size_t)tok_idx[r] * kInkHidden);
+    float4* dst = reinterpret_cast<float4*>(x_out + (size_t)r * kInkHidden);
+    for (int i = threadIdx.x; i < (kInkHidden / 4); i += 256) dst[i] = src[i];
+}
+
+__global__ void __launch_bounds__(256) k_ink_moe_situ_store(
+    const uint8_t* __restrict__ sec4_base,
+    const InkExpertDev* __restrict__ experts,
+    int eid,
+    const float* __restrict__ gu_y,   // [nr, 2 * kInkInter]
+    float* __restrict__ h_out,        // [nr, kInkInter]
+    int nr) {
+    const int r = blockIdx.x;
+    if (r >= nr) return;
+    const InkExpertDev ex = experts[eid];
+    const bool is_sk = (ex.gu_code != FMT_SF4 && ex.gu_code != FMT_MX8);
+    const uint8_t* body = sec4_base + ex.body_off;
+    const float* src = gu_y + (size_t)r * (2 * kInkInter);
+    float* dst = h_out + (size_t)r * kInkInter;
+    for (int f = threadIdx.x; f < kInkInter; f += 256) {
+        const float v = situ_f32(src[2 * f], src[2 * f + 1]);
+        const float inv_sq = is_sk ? (1.0f / f16_to_f32(ld16_u(body + f * 2))) : 1.0f;
+        dst[f] = v * inv_sq;
+    }
+}
+
+__global__ void __launch_bounds__(256) k_ink_moe_scatter_y(
+    const float* __restrict__ y_in,   // [nr, kInkHidden]
+    const int32_t* __restrict__ pairs,
+    const float* __restrict__ topk_w,
+    float* __restrict__ y_pair,
+    int nr) {
+    const int r = blockIdx.x;
+    if (r >= nr) return;
+    const int p = pairs[r];
+    const float rw = topk_w[p];
+    const float4* src = reinterpret_cast<const float4*>(y_in + (size_t)r * kInkHidden);
+    float4* dst = reinterpret_cast<float4*>(y_pair + (size_t)p * kInkHidden);
+    for (int i = threadIdx.x; i < (kInkHidden / 4); i += 256) {
+        const float4 v = src[i];
+        dst[i] = make_float4(v.x * rw, v.y * rw, v.z * rw, v.w * rw);
+    }
+}
+
 inline void launch_ink_moe_dispatch_only(
     cudaStream_t st,
     const uint8_t* sec4_base,
@@ -2430,15 +2596,54 @@ inline void launch_ink_moe_dispatch_only(
     int M,
     InkMoeWorkspace& ws,
     bool force_exact_dec,
-    bool quant_x_done = false) {
+    bool quant_x_done = false,
+    cublasHandle_t cublas = nullptr) {
     // For 128-expert Top-8 MoE, M<=16 (all spec verify trees) averages ~1..1.5 tok/active-expert (fast decode kernel);
-    // M>=24 (c=32, c=64, prefill) gets 2x-3x speedup from Blackwell sm_120a / INT8 / FP16 Tensor Cores!
+    // M>=24 (c=32, c=64, prefill) gets 2x-10x speedup from Tensor Cores (sm_70+) or cuBLAS FP32 SGEMM (sm_60/61)!
     const bool use_sm120_tc = (!force_exact_dec && M >= 24 && sm120::available());
     const bool use_fp16_tc  = (!use_sm120_tc && M >= 24 && ink_has_int8_tc());
     const bool use_wmma_tc  = (!use_sm120_tc && !use_fp16_tc && M >= 24 && ink_has_wmma_f16());
+    const bool use_pascal_sgemm = (!use_sm120_tc && !use_fp16_tc && !use_wmma_tc && M >= 24 && cublas != nullptr && ws.pf_w_f32 != nullptr && ws.h_off_pin != nullptr);
     const int tile_rows = use_wmma_tc ? ((M <= 128) ? 16 : 64)
                                       : ((M <= 128 || use_fp16_tc) ? 16 : 64);
     k_ink_moe_bin<<<1, 128, 0, st>>>(experts, ws.topk_idx, M, tile_rows, ws.tb);
+
+    if (use_pascal_sgemm) {
+        INK_CK(cudaMemcpyAsync(ws.h_off_pin, ws.tb.off, (size_t)(kInkExperts + 1) * sizeof(int32_t), cudaMemcpyDeviceToHost, st));
+        INK_CK(cudaStreamSynchronize(st));
+        const float alpha = 1.0f, beta = 0.0f;
+        for (int e = 0; e < kInkExperts; ++e) {
+            const int row0 = ws.h_off_pin[e];
+            const int cnt  = ws.h_off_pin[e + 1] - row0;
+            if (cnt <= 0) continue;
+            // 1. Dequantize Gate+Up [2304, 2304] ONCE, run cublasSgemm in <=128-row slices
+            k_ink_dequant_expert_f32<true><<<2 * kInkInter, 128, 0, st>>>(sec4_base, experts, e, ws.pf_w_f32);
+            for (int r0 = 0; r0 < cnt; r0 += 128) {
+                const int nr = std::min(128, cnt - r0);
+                k_ink_moe_gather_x<<<nr, 256, 0, st>>>(x_f32, ws.tb.tok_idx + row0 + r0, ws.pf_x_f32, nr);
+                INK_CUBLAS_CK(cublasSgemm(
+                    cublas, CUBLAS_OP_T, CUBLAS_OP_N,
+                    2 * kInkInter, nr, kInkHidden,
+                    &alpha, ws.pf_w_f32, kInkHidden, ws.pf_x_f32, kInkHidden,
+                    &beta, ws.pf_y_f32, 2 * kInkInter));
+                k_ink_moe_situ_store<<<nr, 256, 0, st>>>(
+                    sec4_base, experts, e, ws.pf_y_f32, ws.h_f32 + (size_t)(row0 + r0) * kInkInter, nr);
+            }
+            // 2. Dequantize Down [2304, 1152] ONCE, run cublasSgemm in <=128-row slices
+            k_ink_dequant_expert_f32<false><<<kInkHidden, 128, 0, st>>>(sec4_base, experts, e, ws.pf_w_f32);
+            for (int r0 = 0; r0 < cnt; r0 += 128) {
+                const int nr = std::min(128, cnt - r0);
+                INK_CUBLAS_CK(cublasSgemm(
+                    cublas, CUBLAS_OP_T, CUBLAS_OP_N,
+                    kInkHidden, nr, kInkInter,
+                    &alpha, ws.pf_w_f32, kInkInter, ws.h_f32 + (size_t)(row0 + r0) * kInkInter, kInkInter,
+                    &beta, ws.pf_y_f32, kInkHidden));
+                k_ink_moe_scatter_y<<<nr, 256, 0, st>>>(
+                    ws.pf_y_f32, ws.tb.pairs + row0 + r0, ws.topk_w, ws.y_pair, nr);
+            }
+        }
+        return;
+    }
 
     const int P = M * kInkTopK;
     const int max_act = std::min(P, kInkExperts);
@@ -2565,7 +2770,7 @@ inline void launch_ink_moe(
     k_ink_router_select_topk8<<<M, 32, 0, st>>>(ws.r_logits, gate_b, ws.topk_idx, ws.topk_w, route_scale, M);
 
     // 2. Dispatch GPU-resident experts
-    launch_ink_moe_dispatch_only(st, sec4_base, experts, info, x_f32, M, ws, force_exact_dec, false);
+    launch_ink_moe_dispatch_only(st, sec4_base, experts, info, x_f32, M, ws, force_exact_dec, false, cublas);
 
     // 3. Deterministic 8-slot weighted sum -> y_out [M, 2304] (skipped when caller fuses reduce8 + post-MLP ShortConv4!)
     if (run_reduce8) {

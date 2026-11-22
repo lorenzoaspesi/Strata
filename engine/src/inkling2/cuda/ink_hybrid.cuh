@@ -1301,16 +1301,16 @@ inline void launch_ink_moe_hybrid(
         if (!chunks.empty()) issue_dma(0, 0);
 
         // Run resident tier==0 VRAM experts on main stream `st` (quantizes x once!)
-        launch_ink_moe_dispatch_only(st, sec4_base, experts, info, x_f32, M, ws, force_exact_dec, false);
+        launch_ink_moe_dispatch_only(st, sec4_base, experts, info, x_f32, M, ws, force_exact_dec, false, cublas);
 
-        // Execute each streamed host chunk on GPU Tensor Cores while pf_dma_st overlaps the NEXT chunk!
+        // Execute each streamed host chunk on GPU Tensor Cores / cuBLAS while pf_dma_st overlaps the NEXT chunk!
         for (size_t ci = 0; ci < chunks.size(); ++ci) {
             const int buf = (int)(ci & 1);
             if (ci + 1 < chunks.size()) {
                 issue_dma(ci + 1, 1 - buf);
             }
             INK_CK(cudaStreamWaitEvent(st, hyb.pf_ev_dma[buf], 0));
-            launch_ink_moe_dispatch_only(st, hyb.d_pf_stage[buf], hyb.d_pf_exp_tmp[buf], info, x_f32, M, ws, force_exact_dec, true);
+            launch_ink_moe_dispatch_only(st, hyb.d_pf_stage[buf], hyb.d_pf_exp_tmp[buf], info, x_f32, M, ws, force_exact_dec, true, cublas);
             INK_CK(cudaEventRecord(hyb.pf_ev_done[buf], st));
             hyb.pf_buf_busy[buf] = true;
         }
