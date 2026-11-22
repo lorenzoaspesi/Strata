@@ -381,6 +381,22 @@ class ConversationCacheCard(unittest.TestCase):
                 httpd.shutdown()
                 httpd.server_close()
 
+    def test_first_token_clears_reading_prompt_phase_when_events_empty(self):
+        from serve.frontend import Event
+
+        tok = ByteTokenizer()
+        svc = Service(MockEngine(tok, "Hello.", max_context=4096), tok,
+                      ChatTemplate(Path(__file__).parent / "chat_template.jinja"))
+        with svc.status_lock:
+            svc.status.update(busy=True, phase="reading the prompt", prompt_tokens=100,
+                              generated=0, started=time.time(), first_token=None, max_tokens=128)
+        svc._note(1, [])
+        live = svc.metrics()["live"]
+        self.assertEqual(live["state"], "generating")
+        self.assertEqual(live["phase"], "generating")
+        svc._note(2, [Event("content", "Hi")])
+        self.assertEqual(svc.metrics()["live"]["phase"], "answering")
+
 
 if __name__ == "__main__":
     unittest.main()

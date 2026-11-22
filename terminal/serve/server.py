@@ -5464,6 +5464,8 @@ class Service:
             s["generated"] = n
             if s.get("first_token") is None:
                 s["first_token"] = time.time()
+                if s.get("phase") == "reading the prompt":
+                    s["phase"] = "generating"
             (self.rate if rate is None else rate).append((time.time(), n))   # the live rate's window (RATE_WINDOW_S)
             for ev in evs:
                 if ev.kind == "reasoning":
