@@ -423,6 +423,10 @@ struct InkCudaRunner {
     int32_t* d_acc_path = nullptr;
     __nv_bfloat16 *d_x_bf16 = nullptr;
     __nv_bfloat16 *d_w_scratch = nullptr;  // [max_N, max_K] BF16 scratch for Q8_ROW / S_K cuBLAS prefill
+    // Pascal sm_61 Fixed-VRAM (24 MiB) Tiled FP32 Flash-cuBLAS Prefill Attention workspace (works up to 262K ctx!)
+    float *d_pf32_q = nullptr, *d_pf32_k = nullptr, *d_pf32_v = nullptr;
+    float *d_pf32_s = nullptr, *d_pf32_o = nullptr, *d_pf32_m = nullptr, *d_pf32_l = nullptr;
+    int pf32_m_cap = 0;
 
     // Logits & screened argmax buffers
     float   *d_logits = nullptr;      // [logits_cap, 200058] (allocated lazily if full logits needed)
@@ -1073,6 +1077,8 @@ struct InkCudaRunner {
         INK_CK(cudaStreamSynchronize(st));
         auto fr = [](auto*& p) { if (p) { cudaFree(p); p = nullptr; } };
         fr(d_pf_q); fr(d_pf_k); fr(d_pf_v); fr(d_pf_p); fr(d_pf_s); fr(d_pf_o);
+        fr(d_pf32_q); fr(d_pf32_k); fr(d_pf32_v); fr(d_pf32_s); fr(d_pf32_o); fr(d_pf32_m); fr(d_pf32_l);
+        pf32_m_cap = 0;
         pf_kv_cap = std::max(K_len, 2048);
         d_pf_q = dalloc<__nv_bfloat16>((size_t)kInkHeads * max_batch * kInkHeadDim);
         d_pf_k = dalloc<__nv_bfloat16>((size_t)kInkHeads * pf_kv_cap * kInkHeadDim);
@@ -1080,6 +1086,32 @@ struct InkCudaRunner {
         d_pf_s = dalloc<float>((size_t)kInkHeads * Q_CH * pf_kv_cap);
         d_pf_p = dalloc<__nv_bfloat16>((size_t)kInkHeads * Q_CH * pf_kv_cap);
         d_pf_o = dalloc<float>((size_t)kInkHeads * Q_CH * kInkHeadDim);
+    }
+
+    bool ensure_pf_attn_f32(int M_need) {
+        constexpr int K_TILE = 1024;
+        constexpr int Q_CH   = 128;
+        if (M_need <= pf32_m_cap && d_pf32_q) return true;
+        size_t vf = 0, vt = 0;
+        INK_CK(cudaMemGetInfo(&vf, &vt));
+        const int cap_m = std::max(M_need, max_batch);
+        const size_t need = ((size_t)2 * kInkHeads * cap_m * kInkHeadDim
+                           + (size_t)2 * kInkKVHeads * K_TILE * kInkHeadDim
+                           + (size_t)kInkKVHeads * Q_CH * K_TILE
+                           + (size_t)2 * kInkHeads * cap_m) * sizeof(float);
+        if (vf < need + (16ull << 20)) return false;
+        INK_CK(cudaStreamSynchronize(st));
+        auto fr = [](auto*& p) { if (p) { cudaFree(p); p = nullptr; } };
+        fr(d_pf32_q); fr(d_pf32_k); fr(d_pf32_v); fr(d_pf32_s); fr(d_pf32_o); fr(d_pf32_m); fr(d_pf32_l);
+        pf32_m_cap = cap_m;
+        d_pf32_q = dalloc<float>((size_t)kInkHeads * pf32_m_cap * kInkHeadDim);
+        d_pf32_k = dalloc<float>((size_t)kInkKVHeads * K_TILE * kInkHeadDim);
+        d_pf32_v = dalloc<float>((size_t)kInkKVHeads * K_TILE * kInkHeadDim);
+        d_pf32_s = dalloc<float>((size_t)kInkKVHeads * Q_CH * K_TILE);
+        d_pf32_o = dalloc<float>((size_t)kInkHeads * pf32_m_cap * kInkHeadDim);
+        d_pf32_m = dalloc<float>((size_t)kInkHeads * pf32_m_cap);
+        d_pf32_l = dalloc<float>((size_t)kInkHeads * pf32_m_cap);
+        return true;
     }
 
     // ---- Execute 1 virtual visit (visit in 0..47, phys layer ip in 0..23) ----
@@ -1311,6 +1343,49 @@ struct InkCudaRunner {
                         kInkHeads, CUBLAS_COMPUTE_32F, pf_algo));
                     k_ink_pf_unpack_o_gate<<<dim3(kInkHeads, C), 128, 0, st>>>(d_pf_o, d_gate_attn, d_attn_out, q0, C);
                 }
+            } else if (mode == 0 && M >= 64 && m.sm_cc == 61 && ensure_pf_attn_f32(M)) {
+                // Pascal sm_61 Tiled FP32 Flash-cuBLAS Prefill Attention (6.5 TFLOPS, 24 MiB fixed VRAM up to 262K ctx!)
+                constexpr int K_TILE = 1024;
+                constexpr int Q_CH   = 128;
+                const int k_start = is_swa ? std::max(0, p0_val - kInkSwaWin + 1) : 0;
+                const int k_end   = p0_val + M;
+                const float sc_qk = 0.08838834764831845f;
+                const float one = 1.0f, zero = 0.0f;
+                k_ink_pf32_pack_q<<<dim3(kInkHeads, M), 128, 0, st>>>(
+                    d_q, d_sinks, d_pf32_q, d_pf32_o, d_pf32_m, d_pf32_l, M);
+                for (int k0 = k_start; k0 < k_end; k0 += K_TILE) {
+                    const int Kt = std::min(K_TILE, k_end - k0);
+                    k_ink_pf32_pack_kv<<<dim3(kInkKVHeads, Kt), 128, 0, st>>>(
+                        kv_desc[visit], slot0, k0, Kt, d_pf32_k, d_pf32_v);
+                    for (int q0 = 0; q0 < M; q0 += Q_CH) {
+                        const int C = std::min(Q_CH, M - q0);
+                        // Skip upper-triangular causal tiles and out-of-window SWA tiles
+                        if (p0_val + q0 + C - 1 < k0) continue;
+                        if (is_swa && (p0_val + q0) - (k0 + Kt - 1) >= kInkSwaWin) continue;
+                        for (int g = 0; g < 3; ++g) {
+                            const size_t q_off = ((size_t)(g * kInkKVHeads) * M + q0) * kInkHeadDim;
+                            INK_CUBLAS_CK(cublasSgemmStridedBatched(
+                                cublas, CUBLAS_OP_T, CUBLAS_OP_N,
+                                Kt, C, kInkHeadDim, &sc_qk,
+                                d_pf32_k, kInkHeadDim, (long long)Kt * kInkHeadDim,
+                                d_pf32_q + q_off, kInkHeadDim, (long long)M * kInkHeadDim,
+                                &zero, d_pf32_s, Kt, (long long)C * Kt,
+                                kInkKVHeads));
+                            k_ink_pf32_online_softmax_rescale<<<dim3(C, kInkKVHeads), 256, 0, st>>>(
+                                d_pf32_s, d_rel_table, d_pf32_m, d_pf32_l, d_pf32_o,
+                                g, q0, C, k0, Kt, p0_val, M, is_swa);
+                            INK_CUBLAS_CK(cublasSgemmStridedBatched(
+                                cublas, CUBLAS_OP_N, CUBLAS_OP_N,
+                                kInkHeadDim, C, Kt, &one,
+                                d_pf32_v, kInkHeadDim, (long long)Kt * kInkHeadDim,
+                                d_pf32_s, Kt, (long long)C * Kt,
+                                &one, d_pf32_o + q_off, kInkHeadDim, (long long)M * kInkHeadDim,
+                                kInkKVHeads));
+                        }
+                    }
+                }
+                k_ink_pf32_finish_o_gate<<<dim3(kInkHeads, M), 128, 0, st>>>(
+                    d_pf32_o, d_pf32_l, d_gate_attn, d_attn_out, M);
             } else {
                 dim3 g3(kInkKVHeads, M);
                 k_ink_flash_gqa_gqa3<<<g3, 128, 0, st>>>(
@@ -1678,6 +1753,8 @@ struct InkCudaRunner {
         fr(d_ctrl_cat); fr(d_ctrl_gate); fr(d_ctrl_gain); fr(d_ctrl_forget);
         fr(d_attn_pm); fr(d_attn_pl); fr(d_attn_po);
         fr(d_pf_q); fr(d_pf_k); fr(d_pf_v); fr(d_pf_p); fr(d_pf_s); fr(d_pf_o);
+        fr(d_pf32_q); fr(d_pf32_k); fr(d_pf32_v); fr(d_pf32_s); fr(d_pf32_o); fr(d_pf32_m); fr(d_pf32_l);
+        pf32_m_cap = 0;
         fr(d_stage_k); fr(d_stage_v); fr(d_stage_sconv);
         fr(d_kv_desc_arr); fr(d_sconv_pool_arr); fr(d_acc_path);
         fr(d_x_bf16); fr(d_w_scratch); fr(d_logits);

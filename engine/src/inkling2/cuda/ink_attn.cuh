@@ -952,4 +952,135 @@ __global__ void __launch_bounds__(128) k_ink_pf_unpack_o_gate(
     out[ob] = v;
 }
 
+// ============================================================================
+// 5. Pascal (sm_61) Tiled FP32 Flash-cuBLAS Prefill Attention (24 MiB fixed VRAM up to 262K ctx!)
+//    Reads each KV token (VRAM or mapped host RAM) ONCE per chunk instead of M times!
+// ============================================================================
+__global__ void __launch_bounds__(128) k_ink_pf32_pack_q(
+    const float* __restrict__ q_in,       // [M, 24, 128]
+    const float* __restrict__ sinks,      // [M, 24]
+    float* __restrict__ q_out,            // [3, 8, M, 128]
+    float* __restrict__ o_out,            // [3, 8, M, 128] (zeroed)
+    float* __restrict__ m_out,            // [3, 8, M]      (initialized to sink)
+    float* __restrict__ l_out,            // [3, 8, M]      (initialized to 1.0f)
+    int M) {
+    const int h = blockIdx.x;   // 0..23
+    const int m = blockIdx.y;   // 0..M-1
+    const int d = threadIdx.x;  // 0..127
+    if (h >= kInkHeads || m >= M) return;
+    const int kh = h / 3;
+    const int g  = h - 3 * kh;
+    const size_t gh_m = ((size_t)(g * kInkKVHeads + kh) * M + m);
+    q_out[gh_m * kInkHeadDim + d] = q_in[((size_t)m * kInkHeads + h) * kInkHeadDim + d];
+    o_out[gh_m * kInkHeadDim + d] = 0.0f;
+    if (d == 0) {
+        m_out[gh_m] = sinks[(size_t)m * kInkHeads + h];
+        l_out[gh_m] = 1.0f;
+    }
+}
+
+__global__ void __launch_bounds__(128) k_ink_pf32_pack_kv(
+    InkKvVisitDesc kv,
+    int slot0, int k_start, int K_len,
+    float* __restrict__ k_out,            // [8, K_len, 128]
+    float* __restrict__ v_out) {          // [8, K_len, 128]
+    const int kh = blockIdx.x;  // 0..7
+    const int ki = blockIdx.y;  // 0..K_len-1
+    const int d  = threadIdx.x; // 0..127
+    if (kh >= kInkKVHeads || ki >= K_len) return;
+    const int kp = k_start + ki;
+    const int p_idx = kv.is_swa ? (kp % kv.cap_pos) : kp;
+    float kf, vf;
+    if (!kv.is_fp8) {
+        kf = __half2float(ink_kv_f16_ptr(kv, true,  slot0, p_idx, kh)[d]);
+        vf = __half2float(ink_kv_f16_ptr(kv, false, slot0, p_idx, kh)[d]);
+    } else {
+        kf = e4m3_to_f32(ink_kv_f8_ptr(kv, true,  slot0, p_idx, kh)[d]) * (*ink_kv_sc_ptr(kv, true,  slot0, p_idx, kh));
+        vf = e4m3_to_f32(ink_kv_f8_ptr(kv, false, slot0, p_idx, kh)[d]) * (*ink_kv_sc_ptr(kv, false, slot0, p_idx, kh));
+    }
+    const size_t dst = ((size_t)kh * K_len + ki) * kInkHeadDim + d;
+    k_out[dst] = kf;
+    v_out[dst] = vf;
+}
+
+__global__ void __launch_bounds__(256) k_ink_pf32_online_softmax_rescale(
+    float* __restrict__ s_io,             // [8, C, Kt] in: raw QK^T/sqrt(d), out: unnormalized exp(s - m_new)
+    const float* __restrict__ rel_table,  // [M, 24, 1025]
+    float* __restrict__ m_io,             // [3, 8, M]
+    float* __restrict__ l_io,             // [3, 8, M]
+    float* __restrict__ o_io,             // [3, 8, M, 128] (rescaled by exp(m_old - m_new))
+    int g, int q0, int C, int k0, int Kt, int p0_val, int M, bool is_swa) {
+    const int ci  = blockIdx.x;  // 0..C-1
+    const int kh  = blockIdx.y;  // 0..7
+    const int tid = threadIdx.x; // 0..255
+    if (ci >= C || kh >= kInkKVHeads) return;
+    const int h  = 3 * kh + g;
+    const int m  = q0 + ci;
+    const int qp = p0_val + m;
+    const size_t gh_m = (size_t)(g * kInkKVHeads + kh) * M + m;
+    float* s_row = s_io + ((size_t)kh * C + ci) * Kt;
+    const float* rt = rel_table + ((size_t)m * kInkHeads + h) * (kInkRelExtent + 1);
+
+    __shared__ float sh[8];
+    const float m_old = m_io[gh_m];
+    float mx = m_old;
+    for (int ki = tid; ki < Kt; ki += 256) {
+        const int kp = k0 + ki;
+        const int dist = qp - kp;
+        if (kp <= qp && (!is_swa || dist < kInkSwaWin)) {
+            mx = fmaxf(mx, s_row[ki] + rt[min(dist, kInkRelExtent)]);
+        }
+    }
+    mx = warp_max(mx);
+    if ((tid & 31) == 0) sh[tid >> 5] = mx;
+    __syncthreads();
+    if (tid < 32) {
+        float v = (tid < 8) ? sh[tid] : -1e30f;
+        v = warp_max(v);
+        if (tid == 0) sh[0] = v;
+    }
+    __syncthreads();
+    const float m_new = sh[0];
+    const float alpha = __expf(m_old - m_new);
+
+    float l_tile = 0.0f;
+    for (int ki = tid; ki < Kt; ki += 256) {
+        const int kp = k0 + ki;
+        const int dist = qp - kp;
+        float p = 0.0f;
+        if (kp <= qp && (!is_swa || dist < kInkSwaWin)) {
+            p = __expf(s_row[ki] + rt[min(dist, kInkRelExtent)] - m_new);
+            l_tile += p;
+        }
+        s_row[ki] = p;
+    }
+    l_tile = block_sum(l_tile, sh);
+    if (tid < kInkHeadDim && alpha != 1.0f) {
+        o_io[gh_m * kInkHeadDim + tid] *= alpha;
+    }
+    if (tid == 0) {
+        m_io[gh_m] = m_new;
+        l_io[gh_m] = l_io[gh_m] * alpha + l_tile;
+    }
+}
+
+__global__ void __launch_bounds__(128) k_ink_pf32_finish_o_gate(
+    const float* __restrict__ o_in,       // [3, 8, M, 128]
+    const float* __restrict__ l_in,       // [3, 8, M]
+    const float* __restrict__ gate_attn,  // [M, 24, 128]
+    float* __restrict__ out,              // [M, 24, 128]
+    int M) {
+    const int h = blockIdx.x;   // 0..23
+    const int m = blockIdx.y;   // 0..M-1
+    const int d = threadIdx.x;  // 0..127
+    if (h >= kInkHeads || m >= M) return;
+    const int kh = h / 3;
+    const int g  = h - 3 * kh;
+    const size_t gh_m = (size_t)(g * kInkKVHeads + kh) * M + m;
+    const size_t ob = ((size_t)m * kInkHeads + h) * kInkHeadDim + d;
+    float v = o_in[gh_m * kInkHeadDim + d] / l_in[gh_m];
+    if (gate_attn) v *= 1.0f / (1.0f + __expf(-gate_attn[ob]));
+    out[ob] = v;
+}
+
 }  // namespace strata::ink
