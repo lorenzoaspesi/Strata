@@ -1286,13 +1286,26 @@ struct InkCudaRunner {
             dim3 gr(kInkHeads, M);
             k_ink_rel_table<<<gr, 256, 0, st>>>(d_r, (const float*)m.trunk_ptr(p + ".attn.rel_logits_proj.proj"), d_rel_table, M);
             if (M <= 16 || mode == 2) {
-                dim3 gsp(kInkKVHeads, kInkAttnSplits, M);
-                k_ink_flash_gqa_splitk<<<gsp, 128, 0, st>>>(
-                    d_q, d_rel_table, d_sinks,
-                    kv_desc[visit], (mode == 1) ? d_slots : nullptr, slot0, d_pos,
-                    (mode == 2) ? d_k : nullptr, (mode == 2) ? d_v : nullptr,
-                    (mode == 2) ? d_tree_anc : nullptr, (mode == 2) ? d_tree_dep : nullptr,
-                    p0_val, d_attn_pm, d_attn_pl, d_attn_po, M);
+                if (mode == 2 && !is_swa && M > 1 && M <= 16) {
+                    dim3 gsp(kInkKVHeads, kInkAttnSplits);
+                    if (M <= 8) {
+                        k_ink_flash_gqa_splitk_tree<3><<<gsp, 256, 0, st>>>(
+                            d_q, d_rel_table, d_sinks, kv_desc[visit], slot0, d_pos,
+                            d_k, d_v, d_tree_anc, d_tree_dep, d_attn_pm, d_attn_pl, d_attn_po, M);
+                    } else {
+                        k_ink_flash_gqa_splitk_tree<6><<<gsp, 256, 0, st>>>(
+                            d_q, d_rel_table, d_sinks, kv_desc[visit], slot0, d_pos,
+                            d_k, d_v, d_tree_anc, d_tree_dep, d_attn_pm, d_attn_pl, d_attn_po, M);
+                    }
+                } else {
+                    dim3 gsp(kInkKVHeads, kInkAttnSplits, M);
+                    k_ink_flash_gqa_splitk<<<gsp, 128, 0, st>>>(
+                        d_q, d_rel_table, d_sinks,
+                        kv_desc[visit], (mode == 1) ? d_slots : nullptr, slot0, d_pos,
+                        (mode == 2) ? d_k : nullptr, (mode == 2) ? d_v : nullptr,
+                        (mode == 2) ? d_tree_anc : nullptr, (mode == 2) ? d_tree_dep : nullptr,
+                        p0_val, d_attn_pm, d_attn_pl, d_attn_po, M);
+                }
                 k_ink_flash_gqa_merge<<<gr, 128, 0, st>>>(d_attn_pm, d_attn_pl, d_attn_po, d_gate_attn, d_attn_out, M);
             } else if (mode == 0 && M >= 128 && (m.sm_cc >= 70 || m.sm_cc == 60) && (d_pf_q != nullptr || [&](){ size_t vf=0,vt=0; cudaMemGetInfo(&vf,&vt); return vf > (480ull<<20); }())) {
                 // High-speed Causal/SWA-Sliced Tensor Core Prefill Attention (BF16 on sm_80+, FP16 on sm_60..75!)

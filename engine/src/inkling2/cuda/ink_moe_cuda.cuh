@@ -274,7 +274,8 @@ __global__ void __launch_bounds__(128) k_ink_moe_bin(
     const int32_t* __restrict__ topk_idx,
     int M,
     int tile_rows,
-    InkMoeTables tb) {
+    InkMoeTables tb,
+    int max_tier = 1) {
     __shared__ int s_cnt[128], s_off[128], s_act[128], s_fill[128], s_tcnt[128];
     const int t = threadIdx.x;
     const int P = M * kInkTopK;
@@ -285,7 +286,7 @@ __global__ void __launch_bounds__(128) k_ink_moe_bin(
 
     for (int i = t; i < P; i += 128) {
         const int e = topk_idx[i];
-        if (ex[e].tier <= 1) atomicAdd(&s_cnt[e], 1);  // tier 0=VRAM, 1=pinned host GPU-readable, 2=CPU hybrid
+        if (ex[e].tier <= max_tier) atomicAdd(&s_cnt[e], 1);  // tier 0=VRAM, 1=pinned host GPU-readable, 2=CPU/DMA hybrid
     }
     __syncthreads();
 
@@ -330,7 +331,7 @@ __global__ void __launch_bounds__(128) k_ink_moe_bin(
     // Scatter sorted pair indices & source token indices
     for (int i = t; i < P; i += 128) {
         const int e = topk_idx[i];
-        if (ex[e].tier > 1) continue;
+        if (ex[e].tier > max_tier) continue;
         const int pos = s_off[e] + atomicAdd(&s_fill[e], 1);
         tb.pairs[pos] = i;
         tb.tok_idx[pos] = i / kInkTopK;
@@ -2471,14 +2472,16 @@ __device__ __forceinline__ void dequant_sk_row_f32(
         uint32_t w0, w1;
         sk_unpack8_lane8<FMT>(blk + 6, sg, lg, w0, w1);
         float* d = dst_row + xg * 64 + lg * 8;
-        d[0] = ((float)(int8_t)(w0)       - HALF) * eff;
-        d[1] = ((float)(int8_t)(w0 >> 8)  - HALF) * eff;
-        d[2] = ((float)(int8_t)(w0 >> 16) - HALF) * eff;
-        d[3] = ((float)(int8_t)(w0 >> 24) - HALF) * eff;
-        d[4] = ((float)(int8_t)(w1)       - HALF) * eff;
-        d[5] = ((float)(int8_t)(w1 >> 8)  - HALF) * eff;
-        d[6] = ((float)(int8_t)(w1 >> 16) - HALF) * eff;
-        d[7] = ((float)(int8_t)(w1 >> 24) - HALF) * eff;
+        reinterpret_cast<float4*>(d)[0] = make_float4(
+            ((float)(int8_t)(w0)       - HALF) * eff,
+            ((float)(int8_t)(w0 >> 8)  - HALF) * eff,
+            ((float)(int8_t)(w0 >> 16) - HALF) * eff,
+            ((float)(int8_t)(w0 >> 24) - HALF) * eff);
+        reinterpret_cast<float4*>(d)[1] = make_float4(
+            ((float)(int8_t)(w1)       - HALF) * eff,
+            ((float)(int8_t)(w1 >> 8)  - HALF) * eff,
+            ((float)(int8_t)(w1 >> 16) - HALF) * eff,
+            ((float)(int8_t)(w1 >> 24) - HALF) * eff);
     }
 }
 
@@ -2587,6 +2590,46 @@ __global__ void __launch_bounds__(256) k_ink_moe_scatter_y(
     }
 }
 
+// Execute Pascal FP32 cuBLAS SGEMM for a single pre-binned expert `e` (zero host sync!)
+inline void run_ink_moe_pascal_sgemm_one(
+    cudaStream_t st,
+    cublasHandle_t cublas,
+    const uint8_t* sec4_base,
+    const InkExpertDev* experts,
+    const float* x_f32,
+    InkMoeWorkspace& ws,
+    int e,
+    int row0,
+    int cnt) {
+    if (cnt <= 0) return;
+    const float alpha = 1.0f, beta = 0.0f;
+    // 1. Dequantize Gate+Up [2304, 2304] ONCE (256 threads/row), run cublasSgemm in <=128-row slices
+    k_ink_dequant_expert_f32<true><<<2 * kInkInter, 256, 0, st>>>(sec4_base, experts, e, ws.pf_w_f32);
+    for (int r0 = 0; r0 < cnt; r0 += 128) {
+        const int nr = std::min(128, cnt - r0);
+        k_ink_moe_gather_x<<<nr, 256, 0, st>>>(x_f32, ws.tb.tok_idx + row0 + r0, ws.pf_x_f32, nr);
+        INK_CUBLAS_CK(cublasSgemm(
+            cublas, CUBLAS_OP_T, CUBLAS_OP_N,
+            2 * kInkInter, nr, kInkHidden,
+            &alpha, ws.pf_w_f32, kInkHidden, ws.pf_x_f32, kInkHidden,
+            &beta, ws.pf_y_f32, 2 * kInkInter));
+        k_ink_moe_situ_store<<<nr, 256, 0, st>>>(
+            sec4_base, experts, e, ws.pf_y_f32, ws.h_f32 + (size_t)(row0 + r0) * kInkInter, nr);
+    }
+    // 2. Dequantize Down [2304, 1152] ONCE (256 threads/row), run cublasSgemm in <=128-row slices
+    k_ink_dequant_expert_f32<false><<<kInkHidden, 256, 0, st>>>(sec4_base, experts, e, ws.pf_w_f32);
+    for (int r0 = 0; r0 < cnt; r0 += 128) {
+        const int nr = std::min(128, cnt - r0);
+        INK_CUBLAS_CK(cublasSgemm(
+            cublas, CUBLAS_OP_T, CUBLAS_OP_N,
+            kInkHidden, nr, kInkInter,
+            &alpha, ws.pf_w_f32, kInkInter, ws.h_f32 + (size_t)(row0 + r0) * kInkInter, kInkInter,
+            &beta, ws.pf_y_f32, kInkHidden));
+        k_ink_moe_scatter_y<<<nr, 256, 0, st>>>(
+            ws.pf_y_f32, ws.tb.pairs + row0 + r0, ws.topk_w, ws.y_pair, nr);
+    }
+}
+
 inline void launch_ink_moe_dispatch_only(
     cudaStream_t st,
     const uint8_t* sec4_base,
@@ -2611,36 +2654,10 @@ inline void launch_ink_moe_dispatch_only(
     if (use_pascal_sgemm) {
         INK_CK(cudaMemcpyAsync(ws.h_off_pin, ws.tb.off, (size_t)(kInkExperts + 1) * sizeof(int32_t), cudaMemcpyDeviceToHost, st));
         INK_CK(cudaStreamSynchronize(st));
-        const float alpha = 1.0f, beta = 0.0f;
         for (int e = 0; e < kInkExperts; ++e) {
             const int row0 = ws.h_off_pin[e];
             const int cnt  = ws.h_off_pin[e + 1] - row0;
-            if (cnt <= 0) continue;
-            // 1. Dequantize Gate+Up [2304, 2304] ONCE (256 threads/row), run cublasSgemm in <=128-row slices
-            k_ink_dequant_expert_f32<true><<<2 * kInkInter, 256, 0, st>>>(sec4_base, experts, e, ws.pf_w_f32);
-            for (int r0 = 0; r0 < cnt; r0 += 128) {
-                const int nr = std::min(128, cnt - r0);
-                k_ink_moe_gather_x<<<nr, 256, 0, st>>>(x_f32, ws.tb.tok_idx + row0 + r0, ws.pf_x_f32, nr);
-                INK_CUBLAS_CK(cublasSgemm(
-                    cublas, CUBLAS_OP_T, CUBLAS_OP_N,
-                    2 * kInkInter, nr, kInkHidden,
-                    &alpha, ws.pf_w_f32, kInkHidden, ws.pf_x_f32, kInkHidden,
-                    &beta, ws.pf_y_f32, 2 * kInkInter));
-                k_ink_moe_situ_store<<<nr, 256, 0, st>>>(
-                    sec4_base, experts, e, ws.pf_y_f32, ws.h_f32 + (size_t)(row0 + r0) * kInkInter, nr);
-            }
-            // 2. Dequantize Down [2304, 1152] ONCE (256 threads/row), run cublasSgemm in <=128-row slices
-            k_ink_dequant_expert_f32<false><<<kInkHidden, 256, 0, st>>>(sec4_base, experts, e, ws.pf_w_f32);
-            for (int r0 = 0; r0 < cnt; r0 += 128) {
-                const int nr = std::min(128, cnt - r0);
-                INK_CUBLAS_CK(cublasSgemm(
-                    cublas, CUBLAS_OP_T, CUBLAS_OP_N,
-                    kInkHidden, nr, kInkInter,
-                    &alpha, ws.pf_w_f32, kInkInter, ws.h_f32 + (size_t)(row0 + r0) * kInkInter, kInkInter,
-                    &beta, ws.pf_y_f32, kInkHidden));
-                k_ink_moe_scatter_y<<<nr, 256, 0, st>>>(
-                    ws.pf_y_f32, ws.tb.pairs + row0 + r0, ws.topk_w, ws.y_pair, nr);
-            }
+            run_ink_moe_pascal_sgemm_one(st, cublas, sec4_base, experts, x_f32, ws, e, row0, cnt);
         }
         return;
     }

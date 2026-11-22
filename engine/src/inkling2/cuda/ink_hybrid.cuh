@@ -1256,7 +1256,27 @@ inline void launch_ink_moe_hybrid(
         host_list.reserve(kInkExperts);
         int cpu_batch_nj = 0;
         uint32_t cpu_batch_seq = 0;
-        if (M <= 16) {
+        // Fast single-binning zero-sync Pascal SGEMM prefill path:
+        // Bins ALL 128 experts ONCE, copies h_off_pin ONCE, skips cnt==0 host experts before DMA,
+        // and runs resident + all ping-pong DMA chunks with ZERO mid-layer stream syncs!
+        const bool pascal_fast_pf = (M >= 24 && cublas != nullptr && ws.pf_w_f32 != nullptr && ws.h_off_pin != nullptr
+                                     && !sm120::available() && !ink_has_int8_tc() && !ink_has_wmma_f16());
+        std::vector<int> vram_list;
+        if (pascal_fast_pf) {
+            k_ink_moe_bin<<<1, 128, 0, st>>>(experts, ws.topk_idx, M, 16, ws.tb, /*max_tier=*/2);
+            INK_CK(cudaMemcpyAsync(ws.h_off_pin, ws.tb.off, (size_t)(kInkExperts + 1) * sizeof(int32_t), cudaMemcpyDeviceToHost, st));
+            INK_CK(cudaStreamSynchronize(st));
+            vram_list.reserve(kInkExperts);
+            for (int e = 0; e < kInkExperts; ++e) {
+                const int cnt = ws.h_off_pin[e + 1] - ws.h_off_pin[e];
+                if (cnt <= 0) continue;
+                const int key = ip * kInkExperts + e;
+                const bool is_host = (hyb.host_meta[key].body != nullptr &&
+                                      (hyb.key_to_slot.empty() || hyb.key_to_slot[key] < 0));
+                if (is_host) host_list.push_back(e);
+                else         vram_list.push_back(e);
+            }
+        } else if (M <= 16) {
             const bool split_cpu = (hyb.pcie_share < 0.99f && hyb.h_x_batch_pin && hyb.h_batch_buf);
             INK_CK(cudaMemcpyAsync(hyb.h_topk_pin, ws.topk_idx, (size_t)M * kInkTopK * 4, cudaMemcpyDeviceToHost, st));
             if (split_cpu) {
@@ -1362,7 +1382,14 @@ inline void launch_ink_moe_hybrid(
         if (!chunks.empty()) issue_dma(0, 0);
 
         // Run resident tier==0 VRAM experts on main stream `st` (quantizes x once!)
-        launch_ink_moe_dispatch_only(st, sec4_base, experts, info, x_f32, M, ws, force_exact_dec, false, cublas);
+        if (pascal_fast_pf) {
+            for (int e : vram_list) {
+                const int row0 = ws.h_off_pin[e];
+                run_ink_moe_pascal_sgemm_one(st, cublas, sec4_base, experts, x_f32, ws, e, row0, ws.h_off_pin[e + 1] - row0);
+            }
+        } else {
+            launch_ink_moe_dispatch_only(st, sec4_base, experts, info, x_f32, M, ws, force_exact_dec, false, cublas);
+        }
 
         // Execute each streamed host chunk on GPU Tensor Cores / cuBLAS while pf_dma_st overlaps the NEXT chunk!
         for (size_t ci = 0; ci < chunks.size(); ++ci) {
@@ -1371,7 +1398,14 @@ inline void launch_ink_moe_hybrid(
                 issue_dma(ci + 1, 1 - buf);
             }
             INK_CK(cudaStreamWaitEvent(st, hyb.pf_ev_dma[buf], 0));
-            launch_ink_moe_dispatch_only(st, hyb.d_pf_stage[buf], hyb.d_pf_exp_tmp[buf], info, x_f32, M, ws, force_exact_dec, true, cublas);
+            if (pascal_fast_pf) {
+                for (int e : chunks[ci].eids) {
+                    const int row0 = ws.h_off_pin[e];
+                    run_ink_moe_pascal_sgemm_one(st, cublas, hyb.d_pf_stage[buf], hyb.d_pf_exp_tmp[buf], x_f32, ws, e, row0, ws.h_off_pin[e + 1] - row0);
+                }
+            } else {
+                launch_ink_moe_dispatch_only(st, hyb.d_pf_stage[buf], hyb.d_pf_exp_tmp[buf], info, x_f32, M, ws, force_exact_dec, true, cublas);
+            }
             INK_CK(cudaEventRecord(hyb.pf_ev_done[buf], st));
             hyb.pf_buf_busy[buf] = true;
         }

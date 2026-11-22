@@ -593,6 +593,176 @@ __global__ void __launch_bounds__(128) k_ink_flash_gqa_splitk(
     }
 }
 
+// ============================================================================
+// Fused Multi-Query Split-K Tree-Verify Global Attention (Reads KV ONCE across all M<=16 tree nodes!)
+// Grid: (8 KV heads, kInkAttnSplits=8), Block: 256 threads (8 warps).
+// Eliminates M-fold redundant PCIe reads when Global KV spills to pinned host RAM!
+// ============================================================================
+template <int MAX_PAIRS>
+__global__ void __launch_bounds__(256) k_ink_flash_gqa_splitk_tree(
+    const float* __restrict__ q,          // [M, 24, 128]
+    const float* __restrict__ rel_table,  // [M, 24, 1025]
+    const float* __restrict__ sinks,      // [M, 24]
+    InkKvVisitDesc kv,
+    int slot0,
+    const int32_t* __restrict__ q_pos,    // [M]
+    const float* __restrict__ tree_k,     // [M, 8, 128]
+    const float* __restrict__ tree_v,     // [M, 8, 128]
+    const uint8_t* __restrict__ tree_anc, // [M, 16]
+    const uint8_t* __restrict__ tree_dep, // [M]
+    float* __restrict__ part_m,           // [M, 24, kInkAttnSplits]
+    float* __restrict__ part_l,           // [M, 24, kInkAttnSplits]
+    float* __restrict__ part_o,           // [M, 24, kInkAttnSplits, 128]
+    int M) {
+    const int kh = blockIdx.x;  // 0..7
+    const int sp = blockIdx.y;  // 0..kInkAttnSplits-1
+    if (kh >= kInkKVHeads || sp >= kInkAttnSplits) return;
+
+    const int tid  = threadIdx.x;
+    const int warp = tid >> 5;  // 0..7
+    const int lane = tid & 31;  // 0..31 -> dims 4*lane .. 4*lane+3
+    const float scale = 0.08838834764831845f;
+    const int h0 = 3 * kh;
+    const int total_pairs = 3 * M;
+
+    // Each of the 8 warps owns up to MAX_PAIRS (m, r) query pairs!
+    int p_m[MAX_PAIRS];
+    int p_h[MAX_PAIRS];
+    int p_qp[MAX_PAIRS];
+    float mw[MAX_PAIRS];
+    float lw[MAX_PAIRS];
+    float a[MAX_PAIRS][4];
+    float4 qv[MAX_PAIRS];
+    int n_own = 0;
+
+#pragma unroll
+    for (int pi = 0; pi < MAX_PAIRS; ++pi) {
+        const int idx = warp + pi * 8;
+        if (idx < total_pairs) {
+            const int m = idx / 3;
+            const int h = h0 + (idx - m * 3);
+            p_m[pi]  = m;
+            p_h[pi]  = h;
+            p_qp[pi] = q_pos[m];
+            qv[pi]   = *(const float4*)(q + ((size_t)m * kInkHeads + h) * kInkHeadDim + lane * 4);
+            mw[pi]   = (sp == 0) ? sinks[(size_t)m * kInkHeads + h] : -1e30f;
+            lw[pi]   = (sp == 0) ? 1.0f : 0.0f;
+            a[pi][0] = a[pi][1] = a[pi][2] = a[pi][3] = 0.0f;
+            ++n_own;
+        } else {
+            p_m[pi] = 0; p_h[pi] = 0; p_qp[pi] = 0;
+            qv[pi] = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+            mw[pi] = -1e30f; lw[pi] = 0.0f;
+            a[pi][0] = a[pi][1] = a[pi][2] = a[pi][3] = 0.0f;
+        }
+    }
+
+    const int tp0 = q_pos[0];
+    const int per_sp = (tp0 + kInkAttnSplits - 1) / kInkAttnSplits;
+    const int s_beg  = sp * per_sp;
+    const int s_end  = min(tp0, s_beg + per_sp);
+
+    // 16 KiB shared tile: 16 KV positions x 128 dims (K and V), loaded ONCE per split across all 8 warps!
+    __shared__ float s_k[16][kInkHeadDim];
+    __shared__ float s_v[16][kInkHeadDim];
+
+    for (int k0 = s_beg; k0 < s_end; k0 += 16) {
+        const int kt = min(16, s_end - k0);
+        for (int t = warp; t < kt; t += 8) {
+            const int kp = k0 + t;
+            float4 kv4, vv4;
+            if (!kv.is_fp8) {
+                const uint2 k2 = *(const uint2*)(ink_kv_f16_ptr(kv, true,  slot0, kp, kh) + lane * 4);
+                const uint2 v2 = *(const uint2*)(ink_kv_f16_ptr(kv, false, slot0, kp, kh) + lane * 4);
+                const float2 kf0 = __half22float2(*reinterpret_cast<const __half2*>(&k2.x));
+                const float2 kf1 = __half22float2(*reinterpret_cast<const __half2*>(&k2.y));
+                const float2 vf0 = __half22float2(*reinterpret_cast<const __half2*>(&v2.x));
+                const float2 vf1 = __half22float2(*reinterpret_cast<const __half2*>(&v2.y));
+                kv4 = make_float4(kf0.x, kf0.y, kf1.x, kf1.y);
+                vv4 = make_float4(vf0.x, vf0.y, vf1.x, vf1.y);
+            } else {
+                const float sk = *ink_kv_sc_ptr(kv, true,  slot0, kp, kh);
+                const float sv = *ink_kv_sc_ptr(kv, false, slot0, kp, kh);
+                const uint32_t k4 = *(const uint32_t*)(ink_kv_f8_ptr(kv, true,  slot0, kp, kh) + lane * 4);
+                const uint32_t v4 = *(const uint32_t*)(ink_kv_f8_ptr(kv, false, slot0, kp, kh) + lane * 4);
+                const float2 kf0 = e4m3x2_to_f32x2((uint16_t)(k4 & 0xFFFFu));
+                const float2 kf1 = e4m3x2_to_f32x2((uint16_t)(k4 >> 16));
+                const float2 vf0 = e4m3x2_to_f32x2((uint16_t)(v4 & 0xFFFFu));
+                const float2 vf1 = e4m3x2_to_f32x2((uint16_t)(v4 >> 16));
+                kv4 = make_float4(kf0.x * sk, kf0.y * sk, kf1.x * sk, kf1.y * sk);
+                vv4 = make_float4(vf0.x * sv, vf0.y * sv, vf1.x * sv, vf1.y * sv);
+            }
+            *(float4*)(&s_k[t][lane * 4]) = kv4;
+            *(float4*)(&s_v[t][lane * 4]) = vv4;
+        }
+        __syncthreads();
+
+        for (int t = 0; t < kt; ++t) {
+            const float4 kv4 = *(const float4*)(&s_k[t][lane * 4]);
+            const float4 vv4 = *(const float4*)(&s_v[t][lane * 4]);
+            const int kp = k0 + t;
+#pragma unroll
+            for (int pi = 0; pi < MAX_PAIRS; ++pi) {
+                if (pi < n_own) {
+                    const float dot = warp_sum(qv[pi].x * kv4.x + qv[pi].y * kv4.y + qv[pi].z * kv4.z + qv[pi].w * kv4.w) * scale;
+                    const int dist = min(max(p_qp[pi] - kp, 0), kInkRelExtent);
+                    const float sc = dot + rel_table[((size_t)p_m[pi] * kInkHeads + p_h[pi]) * (kInkRelExtent + 1) + dist];
+                    const float mn = fmaxf(mw[pi], sc);
+                    const float al = __expf(mw[pi] - mn);
+                    const float p  = __expf(sc - mn);
+                    lw[pi] = lw[pi] * al + p;
+                    a[pi][0] = a[pi][0] * al + p * vv4.x;
+                    a[pi][1] = a[pi][1] * al + p * vv4.y;
+                    a[pi][2] = a[pi][2] * al + p * vv4.z;
+                    a[pi][3] = a[pi][3] * al + p * vv4.w;
+                    mw[pi] = mn;
+                }
+            }
+        }
+        __syncthreads();
+    }
+
+    // Split 0 also attends each tree node's exact uncommitted ancestor chain (<= 16 keys in VRAM)!
+    if (sp == 0) {
+#pragma unroll
+        for (int pi = 0; pi < MAX_PAIRS; ++pi) {
+            if (pi < n_own) {
+                const int m = p_m[pi];
+                const int dep = (int)tree_dep[m];
+                for (int d_i = 0; d_i <= dep; ++d_i) {
+                    const int anc_node = (int)tree_anc[m * kInkMaxTreeDepth + d_i];
+                    const int kp = tp0 + d_i;
+                    const size_t tbase = ((size_t)anc_node * kInkKVHeads + kh) * kInkHeadDim + lane * 4;
+                    const float4 kv4 = *(const float4*)(tree_k + tbase);
+                    const float4 vv4 = *(const float4*)(tree_v + tbase);
+                    const float dot = warp_sum(qv[pi].x * kv4.x + qv[pi].y * kv4.y + qv[pi].z * kv4.z + qv[pi].w * kv4.w) * scale;
+                    const int dist = min(max(p_qp[pi] - kp, 0), kInkRelExtent);
+                    const float sc = dot + rel_table[((size_t)m * kInkHeads + p_h[pi]) * (kInkRelExtent + 1) + dist];
+                    const float mn = fmaxf(mw[pi], sc);
+                    const float al = __expf(mw[pi] - mn);
+                    const float p  = __expf(sc - mn);
+                    lw[pi] = lw[pi] * al + p;
+                    a[pi][0] = a[pi][0] * al + p * vv4.x;
+                    a[pi][1] = a[pi][1] * al + p * vv4.y;
+                    a[pi][2] = a[pi][2] * al + p * vv4.z;
+                    a[pi][3] = a[pi][3] * al + p * vv4.w;
+                    mw[pi] = mn;
+                }
+            }
+        }
+    }
+
+    // Write each owned pair's split result directly (no intra-CTA merge needed!)
+#pragma unroll
+    for (int pi = 0; pi < MAX_PAIRS; ++pi) {
+        if (pi < n_own) {
+            const size_t idx_sp = ((size_t)p_m[pi] * kInkHeads + p_h[pi]) * kInkAttnSplits + sp;
+            if (lane == 0) { part_m[idx_sp] = mw[pi]; part_l[idx_sp] = lw[pi]; }
+            *(float4*)(part_o + idx_sp * kInkHeadDim + lane * 4) = make_float4(a[pi][0], a[pi][1], a[pi][2], a[pi][3]);
+        }
+    }
+}
+
 // Merge kInkAttnSplits=16 splits + fused * sigmoid(gate_attn)! Grid: (24 heads, M), Block: 128 (1 dim/thread!)
 __global__ void __launch_bounds__(128) k_ink_flash_gqa_merge(
     const float* __restrict__ part_m,     // [M, 24, 16]

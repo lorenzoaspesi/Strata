@@ -163,6 +163,129 @@ __global__ void __launch_bounds__(128) k_dspark_block_attn(
     }
 }
 
+// Fused Split-K GQA x B=8 DSpark Block Attention (reads ctx_k/v ONCE for all 3 Q heads x all 8 block tokens -> 24x less PCIe!)
+// Supports both FP16 (VRAM) and FP8 E4M3 (host-mapped) context KV; outputs into runner's part_m/part_l/part_o for k_ink_flash_gqa_merge!
+// Grid: (8 KV heads, kInkAttnSplits=8), Block: 256 threads (8 warps, warp b = 0..7 owns block token b x all 3 Q heads!)
+__global__ void __launch_bounds__(256) k_dspark_block_attn_splitk(
+    const float* __restrict__ q,            // [8, 24, 128]
+    const float* __restrict__ kd,           // [8, 8, 128]
+    const float* __restrict__ vd,           // [8, 8, 128]
+    const __half* __restrict__ ctx_k16,     // [cap, 8, 128] (when !is_fp8)
+    const __half* __restrict__ ctx_v16,
+    const uint8_t* __restrict__ ctx_k8,     // [cap, 8, 128] (when is_fp8)
+    const uint8_t* __restrict__ ctx_v8,
+    const float* __restrict__ ctx_ksc,      // [cap, 8] (when is_fp8)
+    const float* __restrict__ ctx_vsc,
+    bool is_fp8,
+    const int32_t* __restrict__ apos_ptr,   // [1]
+    bool is_swa,
+    int swa_win,                            // 1025
+    float* __restrict__ part_m,             // [8, 24, kInkAttnSplits]
+    float* __restrict__ part_l,             // [8, 24, kInkAttnSplits]
+    float* __restrict__ part_o) {           // [8, 24, kInkAttnSplits, 128]
+    const int kh = blockIdx.x;  // 0..7
+    const int sp = blockIdx.y;  // 0..kInkAttnSplits-1
+    if (kh >= kInkKVHeads || sp >= kInkAttnSplits) return;
+
+    const int tid  = threadIdx.x;
+    const int warp = tid >> 5;  // 0..7 == block token b!
+    const int lane = tid & 31;  // 0..31 -> dims 4*lane .. 4*lane+3
+    const int b    = warp;
+    const int h0   = 3 * kh;
+    const float scale = 0.08838834764831845f;
+
+    const float4 qv0 = *(const float4*)(q + ((size_t)b * kInkHeads + h0 + 0) * kInkHeadDim + lane * 4);
+    const float4 qv1 = *(const float4*)(q + ((size_t)b * kInkHeads + h0 + 1) * kInkHeadDim + lane * 4);
+    const float4 qv2 = *(const float4*)(q + ((size_t)b * kInkHeads + h0 + 2) * kInkHeadDim + lane * 4);
+
+    const int apos = *apos_ptr;
+    const int c0 = is_swa ? max(0, apos - swa_win + 1) : 0;
+    const int clen = max(0, apos - c0);
+    const int per_sp = (clen + kInkAttnSplits - 1) / kInkAttnSplits;
+    const int s_beg = c0 + sp * per_sp;
+    const int s_end = min(apos, s_beg + per_sp);
+
+    float mw[3] = { -1e30f, -1e30f, -1e30f };
+    float lw[3] = { 0.0f, 0.0f, 0.0f };
+    float a[3][4] = {};
+
+    auto attend3 = [&](float4 kv4, float4 vv4) {
+        const float sc[3] = {
+            warp_sum(qv0.x * kv4.x + qv0.y * kv4.y + qv0.z * kv4.z + qv0.w * kv4.w) * scale,
+            warp_sum(qv1.x * kv4.x + qv1.y * kv4.y + qv1.z * kv4.z + qv1.w * kv4.w) * scale,
+            warp_sum(qv2.x * kv4.x + qv2.y * kv4.y + qv2.z * kv4.z + qv2.w * kv4.w) * scale
+        };
+#pragma unroll
+        for (int r = 0; r < 3; ++r) {
+            const float mn = fmaxf(mw[r], sc[r]);
+            const float al = __expf(mw[r] - mn);
+            const float p  = __expf(sc[r] - mn);
+            lw[r] = lw[r] * al + p;
+            a[r][0] = a[r][0] * al + p * vv4.x;
+            a[r][1] = a[r][1] * al + p * vv4.y;
+            a[r][2] = a[r][2] * al + p * vv4.z;
+            a[r][3] = a[r][3] * al + p * vv4.w;
+            mw[r] = mn;
+        }
+    };
+
+    __shared__ float s_k[16][kInkHeadDim];
+    __shared__ float s_v[16][kInkHeadDim];
+
+    for (int k0 = s_beg; k0 < s_end; k0 += 16) {
+        const int kt = min(16, s_end - k0);
+        for (int t = warp; t < kt; t += 8) {
+            const int kp = k0 + t;
+            const size_t base = ((size_t)kp * kInkKVHeads + kh) * kInkHeadDim + lane * 4;
+            float4 kv4, vv4;
+            if (!is_fp8) {
+                const uint2 k2 = *(const uint2*)(ctx_k16 + base);
+                const uint2 v2 = *(const uint2*)(ctx_v16 + base);
+                const float2 kf0 = __half22float2(*reinterpret_cast<const __half2*>(&k2.x));
+                const float2 kf1 = __half22float2(*reinterpret_cast<const __half2*>(&k2.y));
+                const float2 vf0 = __half22float2(*reinterpret_cast<const __half2*>(&v2.x));
+                const float2 vf1 = __half22float2(*reinterpret_cast<const __half2*>(&v2.y));
+                kv4 = make_float4(kf0.x, kf0.y, kf1.x, kf1.y);
+                vv4 = make_float4(vf0.x, vf0.y, vf1.x, vf1.y);
+            } else {
+                const size_t sidx = (size_t)kp * kInkKVHeads + kh;
+                const float sk = ctx_ksc[sidx];
+                const float sv = ctx_vsc[sidx];
+                const uint32_t k4 = *(const uint32_t*)(ctx_k8 + base);
+                const uint32_t v4 = *(const uint32_t*)(ctx_v8 + base);
+                const float2 kf0 = e4m3x2_to_f32x2((uint16_t)(k4 & 0xFFFFu));
+                const float2 kf1 = e4m3x2_to_f32x2((uint16_t)(k4 >> 16));
+                const float2 vf0 = e4m3x2_to_f32x2((uint16_t)(v4 & 0xFFFFu));
+                const float2 vf1 = e4m3x2_to_f32x2((uint16_t)(v4 >> 16));
+                kv4 = make_float4(kf0.x * sk, kf0.y * sk, kf1.x * sk, kf1.y * sk);
+                vv4 = make_float4(vf0.x * sv, vf0.y * sv, vf1.x * sv, vf1.y * sv);
+            }
+            *(float4*)(&s_k[t][lane * 4]) = kv4;
+            *(float4*)(&s_v[t][lane * 4]) = vv4;
+        }
+        __syncthreads();
+        for (int t = 0; t < kt; ++t) {
+            attend3(*(const float4*)(&s_k[t][lane * 4]), *(const float4*)(&s_v[t][lane * 4]));
+        }
+        __syncthreads();
+    }
+
+    // Split 0 attends the 8 local draft block tokens kd/vd!
+    if (sp == 0) {
+        for (int j = 0; j < kInkDsparkBlock; ++j) {
+            const size_t base = ((size_t)j * kInkKVHeads + kh) * kInkHeadDim + lane * 4;
+            attend3(*(const float4*)(kd + base), *(const float4*)(vd + base));
+        }
+    }
+
+#pragma unroll
+    for (int r = 0; r < 3; ++r) {
+        const size_t idx_sp = ((size_t)b * kInkHeads + h0 + r) * kInkAttnSplits + sp;
+        if (lane == 0) { part_m[idx_sp] = mw[r]; part_l[idx_sp] = lw[r]; }
+        *(float4*)(part_o + idx_sp * kInkHeadDim + lane * 4) = make_float4(a[r][0], a[r][1], a[r][2], a[r][3]);
+    }
+}
+
 __global__ void __launch_bounds__(256) k_dspark_fill_mask(
     const float* __restrict__ mask_e,
     float* __restrict__ dst_cur,
@@ -1011,9 +1134,13 @@ struct InkDSpark {
     int K_cand = 256;  // reduced-vocab L2-cached candidate pool for Markov RNN
 
     // Context KV cache for 3 DSpark layers + f_rnn [max_ctx, 2304]
-    __half* d_ctx_k[3] = {};
-    __half* d_ctx_v[3] = {};
-    float*  d_f_rnn = nullptr;  // [max_ctx, 2304]
+    __half*  d_ctx_k[3] = {};
+    __half*  d_ctx_v[3] = {};
+    uint8_t* d_ctx_k8[3] = {};
+    uint8_t* d_ctx_v8[3] = {};
+    float*   d_ctx_ksc[3] = {};
+    float*   d_ctx_vsc[3] = {};
+    float*   d_f_rnn = nullptr;  // [max_ctx, 2304]
 
     // Working buffers for Block-8 forward
     float *d_cur = nullptr, *d_h = nullptr, *d_q = nullptr, *d_k = nullptr, *d_v = nullptr;
@@ -1074,9 +1201,14 @@ struct InkDSpark {
     __half*   d_unembed_fp16 = nullptr;  // Optional FP16 unembed on V100 sm_70 (32GB) -> 0.67 ms TC screening!
     bool cache_is_fp16 = false;
     bool ctx_is_host_mapped = false;
-    __half* h_ctx_k[3] = {};
-    __half* h_ctx_v[3] = {};
-    float*  h_f_rnn = nullptr;
+    bool ctx_is_fp8 = false;
+    __half*  h_ctx_k[3] = {};
+    __half*  h_ctx_v[3] = {};
+    uint8_t* h_ctx_k8[3] = {};
+    uint8_t* h_ctx_v8[3] = {};
+    float*   h_ctx_ksc[3] = {};
+    float*   h_ctx_vsc[3] = {};
+    float*   h_f_rnn = nullptr;
 
     static size_t ctx_vram_bytes(int ctx) noexcept {
         return (size_t)ctx * (3ull * 2ull * kInkKVHeads * kInkHeadDim * sizeof(__half)
@@ -1093,21 +1225,31 @@ struct InkDSpark {
         INK_CK(ink_cuda_mem_info(&vf_ctx, &vt_ctx));
         const size_t need_ctx = ctx_vram_bytes(max_ctx);
         // If VRAM is tight (e.g. 8/12 GB GPUs or long 256K context), place DSpark's context buffers in
-        // mapped pinned host RAM so DSpark engages cleanly without OOM!
+        // mapped pinned host RAM using FP8 E4M3 KV (halves both host RAM and PCIe bandwidth!).
         if (vf_ctx < need_ctx + (320ull << 20)) {
             ctx_is_host_mapped = true;
+            ctx_is_fp8 = true;
+            const size_t kv_bytes = (size_t)max_ctx * kInkKVHeads * kInkHeadDim;
+            const size_t sc_bytes = (size_t)max_ctx * kInkKVHeads * sizeof(float);
+            const size_t rnn_bytes = (size_t)max_ctx * kInkHidden * sizeof(float);
             for (int il = 0; il < 3; ++il) {
-                INK_CK(cudaHostAlloc(&h_ctx_k[il], (size_t)max_ctx * kInkKVHeads * kInkHeadDim * sizeof(__half), cudaHostAllocMapped));
-                INK_CK(cudaHostAlloc(&h_ctx_v[il], (size_t)max_ctx * kInkKVHeads * kInkHeadDim * sizeof(__half), cudaHostAllocMapped));
-                INK_CK(cudaHostGetDevicePointer(&d_ctx_k[il], h_ctx_k[il], 0));
-                INK_CK(cudaHostGetDevicePointer(&d_ctx_v[il], h_ctx_v[il], 0));
+                INK_CK(cudaHostAlloc(&h_ctx_k8[il],  kv_bytes, cudaHostAllocMapped));
+                INK_CK(cudaHostAlloc(&h_ctx_v8[il],  kv_bytes, cudaHostAllocMapped));
+                INK_CK(cudaHostAlloc(&h_ctx_ksc[il], sc_bytes, cudaHostAllocMapped));
+                INK_CK(cudaHostAlloc(&h_ctx_vsc[il], sc_bytes, cudaHostAllocMapped));
+                INK_CK(cudaHostGetDevicePointer(&d_ctx_k8[il],  h_ctx_k8[il],  0));
+                INK_CK(cudaHostGetDevicePointer(&d_ctx_v8[il],  h_ctx_v8[il],  0));
+                INK_CK(cudaHostGetDevicePointer(&d_ctx_ksc[il], h_ctx_ksc[il], 0));
+                INK_CK(cudaHostGetDevicePointer(&d_ctx_vsc[il], h_ctx_vsc[il], 0));
             }
-            INK_CK(cudaHostAlloc(&h_f_rnn, (size_t)max_ctx * kInkHidden * sizeof(float), cudaHostAllocMapped));
+            INK_CK(cudaHostAlloc(&h_f_rnn, rnn_bytes, cudaHostAllocMapped));
             INK_CK(cudaHostGetDevicePointer(&d_f_rnn, h_f_rnn, 0));
-            std::fprintf(stderr, "[InkDSpark] Using mapped pinned host RAM for DSpark context (ctx=%d, %.0f MiB; %.0f MiB VRAM free)\n",
-                         max_ctx, (double)need_ctx / (1024.0 * 1024.0), (double)vf_ctx / (1024.0 * 1024.0));
+            const size_t host_tot = 3ull * (2 * kv_bytes + 2 * sc_bytes) + rnn_bytes;
+            std::fprintf(stderr, "[InkDSpark] Using mapped pinned host RAM (FP8 KV) for DSpark context (ctx=%d, %.0f MiB; %.0f MiB VRAM free)\n",
+                         max_ctx, (double)host_tot / (1024.0 * 1024.0), (double)vf_ctx / (1024.0 * 1024.0));
         } else {
             ctx_is_host_mapped = false;
+            ctx_is_fp8 = false;
             for (int il = 0; il < 3; ++il) {
                 d_ctx_k[il] = dalloc<__half>((size_t)max_ctx * kInkKVHeads * kInkHeadDim);
                 d_ctx_v[il] = dalloc<__half>((size_t)max_ctx * kInkKVHeads * kInkHeadDim);
@@ -1368,13 +1510,21 @@ struct InkDSpark {
                 d_kc_tmp, (const float*)m.trunk_ptr(p + ".self_attn.k_norm_ctx.weight"),
                 d_pos, m.man.c.dspark_rope_theta, M, kInkKVHeads);
             InkKvVisitDesc desc{};
-            desc.k_f16 = d_ctx_k[il];
-            desc.v_f16 = d_ctx_v[il];
+            if (ctx_is_fp8) {
+                desc.k_f8 = d_ctx_k8[il];
+                desc.v_f8 = d_ctx_v8[il];
+                desc.k_sc = d_ctx_ksc[il];
+                desc.v_sc = d_ctx_vsc[il];
+                desc.is_fp8 = true;
+            } else {
+                desc.k_f16 = d_ctx_k[il];
+                desc.v_f16 = d_ctx_v[il];
+                desc.is_fp8 = false;
+            }
             desc.cap_pos = max_ctx;
             desc.vram_pos = max_ctx;
             desc.host_pos = 0;
             desc.is_swa = false;
-            desc.is_fp8 = false;
             k_ink_kv_write<<<g, 128, 0, r.st>>>(d_kc_tmp, d_vc_tmp, nullptr, 0, d_pos, desc, M);
         }
         k_dspark_mix_taps<<<M, 256, 0, r.st>>>(
@@ -1415,9 +1565,15 @@ struct InkDSpark {
                 d_q, (const float*)m.trunk_ptr(p + ".self_attn.q_norm.weight"), d_pos, m.man.c.dspark_rope_theta, B, kInkHeads);
             k_dspark_rmsnorm_rope<<<dim3(kInkKVHeads, B), 128, 0, r.st>>>(
                 d_k, (const float*)m.trunk_ptr(p + ".self_attn.k_norm.weight"), d_pos, m.man.c.dspark_rope_theta, B, kInkKVHeads);
-            k_dspark_block_attn<<<dim3(kInkHeads, B), 128, 0, r.st>>>(
-                d_q, d_k, d_v, d_ctx_k[il], d_ctx_v[il], d_apos,
-                m.man.c.dspark_is_swa[il] != 0, m.man.c.dspark_swa_win, B, d_attn_out);
+            k_dspark_block_attn_splitk<<<dim3(kInkKVHeads, kInkAttnSplits), 256, 0, r.st>>>(
+                d_q, d_k, d_v,
+                d_ctx_k[il], d_ctx_v[il],
+                d_ctx_k8[il], d_ctx_v8[il], d_ctx_ksc[il], d_ctx_vsc[il],
+                ctx_is_fp8, d_apos,
+                m.man.c.dspark_is_swa[il] != 0, m.man.c.dspark_swa_win,
+                r.d_attn_pm, r.d_attn_pl, r.d_attn_po);
+            k_ink_flash_gqa_merge<<<dim3(kInkHeads, B), 128, 0, r.st>>>(
+                r.d_attn_pm, r.d_attn_pl, r.d_attn_po, nullptr, d_attn_out, B);
             dspark_linear_b8(p + ".self_attn.o_proj.weight", d_attn_out, d_proj, B, false);
             k_ink_add<<<(B * kInkHidden + 255) / 256, 256, 0, r.st>>>(d_cur, d_cur, d_proj, B * kInkHidden);
 
@@ -1695,11 +1851,16 @@ struct InkDSpark {
         if (d_unembed_fp16) { cudaFree(d_unembed_fp16); d_unembed_fp16 = nullptr; }
         if (ctx_is_host_mapped) {
             for (int il = 0; il < 3; ++il) {
-                if (h_ctx_k[il]) { cudaFreeHost(h_ctx_k[il]); h_ctx_k[il] = nullptr; d_ctx_k[il] = nullptr; }
-                if (h_ctx_v[il]) { cudaFreeHost(h_ctx_v[il]); h_ctx_v[il] = nullptr; d_ctx_v[il] = nullptr; }
+                if (h_ctx_k[il])   { cudaFreeHost(h_ctx_k[il]);   h_ctx_k[il]   = nullptr; d_ctx_k[il]   = nullptr; }
+                if (h_ctx_v[il])   { cudaFreeHost(h_ctx_v[il]);   h_ctx_v[il]   = nullptr; d_ctx_v[il]   = nullptr; }
+                if (h_ctx_k8[il])  { cudaFreeHost(h_ctx_k8[il]);  h_ctx_k8[il]  = nullptr; d_ctx_k8[il]  = nullptr; }
+                if (h_ctx_v8[il])  { cudaFreeHost(h_ctx_v8[il]);  h_ctx_v8[il]  = nullptr; d_ctx_v8[il]  = nullptr; }
+                if (h_ctx_ksc[il]) { cudaFreeHost(h_ctx_ksc[il]); h_ctx_ksc[il] = nullptr; d_ctx_ksc[il] = nullptr; }
+                if (h_ctx_vsc[il]) { cudaFreeHost(h_ctx_vsc[il]); h_ctx_vsc[il] = nullptr; d_ctx_vsc[il] = nullptr; }
             }
             if (h_f_rnn) { cudaFreeHost(h_f_rnn); h_f_rnn = nullptr; d_f_rnn = nullptr; }
             ctx_is_host_mapped = false;
+            ctx_is_fp8 = false;
         } else {
             for (int il = 0; il < 3; ++il) {
                 if (d_ctx_k[il]) { cudaFree(d_ctx_k[il]); d_ctx_k[il] = nullptr; }
