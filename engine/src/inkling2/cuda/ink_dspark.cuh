@@ -1371,6 +1371,8 @@ struct InkDSpark {
             desc.k_f16 = d_ctx_k[il];
             desc.v_f16 = d_ctx_v[il];
             desc.cap_pos = max_ctx;
+            desc.vram_pos = max_ctx;
+            desc.host_pos = 0;
             desc.is_swa = false;
             desc.is_fp8 = false;
             k_ink_kv_write<<<g, 128, 0, r.st>>>(d_kc_tmp, d_vc_tmp, nullptr, 0, d_pos, desc, M);

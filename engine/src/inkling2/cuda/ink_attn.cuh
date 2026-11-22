@@ -51,29 +51,32 @@ struct InkKvVisitDesc {
 };
 
 __device__ __forceinline__ __half* ink_kv_f16_ptr(const InkKvVisitDesc& kv, bool is_k, int sl, int p_idx, int kh) {
-    if (!kv.is_swa && p_idx >= kv.vram_pos) {
+    if (!kv.is_swa && kv.host_pos > 0 && p_idx >= kv.vram_pos) {
         const size_t base = (((size_t)sl * kv.host_pos + (p_idx - kv.vram_pos)) * kInkKVHeads + kh) * kInkHeadDim;
         return (is_k ? kv.k_f16_host : kv.v_f16_host) + base;
     }
-    const size_t base = (((size_t)sl * kv.vram_pos + p_idx) * kInkKVHeads + kh) * kInkHeadDim;
+    const int stride = (kv.vram_pos > 0) ? kv.vram_pos : kv.cap_pos;
+    const size_t base = (((size_t)sl * stride + p_idx) * kInkKVHeads + kh) * kInkHeadDim;
     return (is_k ? kv.k_f16 : kv.v_f16) + base;
 }
 
 __device__ __forceinline__ uint8_t* ink_kv_f8_ptr(const InkKvVisitDesc& kv, bool is_k, int sl, int p_idx, int kh) {
-    if (!kv.is_swa && p_idx >= kv.vram_pos) {
+    if (!kv.is_swa && kv.host_pos > 0 && p_idx >= kv.vram_pos) {
         const size_t base = (((size_t)sl * kv.host_pos + (p_idx - kv.vram_pos)) * kInkKVHeads + kh) * kInkHeadDim;
         return (is_k ? kv.k_f8_host : kv.v_f8_host) + base;
     }
-    const size_t base = (((size_t)sl * kv.vram_pos + p_idx) * kInkKVHeads + kh) * kInkHeadDim;
+    const int stride = (kv.vram_pos > 0) ? kv.vram_pos : kv.cap_pos;
+    const size_t base = (((size_t)sl * stride + p_idx) * kInkKVHeads + kh) * kInkHeadDim;
     return (is_k ? kv.k_f8 : kv.v_f8) + base;
 }
 
 __device__ __forceinline__ float* ink_kv_sc_ptr(const InkKvVisitDesc& kv, bool is_k, int sl, int p_idx, int kh) {
-    if (!kv.is_swa && p_idx >= kv.vram_pos) {
+    if (!kv.is_swa && kv.host_pos > 0 && p_idx >= kv.vram_pos) {
         const size_t sidx = ((size_t)sl * kv.host_pos + (p_idx - kv.vram_pos)) * kInkKVHeads + kh;
         return (is_k ? kv.k_sc_host : kv.v_sc_host) + sidx;
     }
-    const size_t sidx = ((size_t)sl * kv.vram_pos + p_idx) * kInkKVHeads + kh;
+    const int stride = (kv.vram_pos > 0) ? kv.vram_pos : kv.cap_pos;
+    const size_t sidx = ((size_t)sl * stride + p_idx) * kInkKVHeads + kh;
     return (is_k ? kv.k_sc : kv.v_sc) + sidx;
 }
 
