@@ -659,6 +659,25 @@ __global__ void __launch_bounds__(256) k_ink_doorbell_wait_collect(
     }
 }
 
+// Non-spinning collector used after host-submitted CPU jobs finish in M=1 PCIe+CPU split decode!
+__global__ void __launch_bounds__(256) k_ink_collect_cpu_y(
+    const InkMappedDoorbell* bell,
+    int nj,
+    const float* __restrict__ topk_w,
+    float* __restrict__ y_pair) {
+    const int j = blockIdx.x;
+    if (j >= nj) return;
+    const int tid = threadIdx.x;
+    const int k = bell->slot_k[j];
+    const float rw = topk_w[k];
+    const float4* src = reinterpret_cast<const float4*>(bell->y[k]);
+    float4* dst = reinterpret_cast<float4*>(y_pair + (size_t)k * kInkHidden);
+    for (int i = tid; i < (kInkHidden / 4); i += 256) {
+        const float4 v = __ldcv(src + i);
+        dst[i] = make_float4(v.x * rw, v.y * rw, v.z * rw, v.w * rw);
+    }
+}
+
 __global__ void __launch_bounds__(256) k_ink_decay_use_cnt(float* __restrict__ cnt, int n, float decay) {
     const int i = blockIdx.x * 256 + threadIdx.x;
     if (i < n) cnt[i] *= decay;
@@ -714,13 +733,48 @@ struct InkHybridEngine {
     std::thread master_thr;
     int n_threads = 0;
 
+    // PCIe GPU streaming + CPU parallel split for M=1 decode (STRATA_INK_PCIE_SHARE, default 0.55)
+    float pcie_share = 0.55f;
+    int32_t* h_topk_pin = nullptr;
+    uint32_t host_ring_seq = 0;
+
+    bool pcie_decode_enabled() const noexcept {
+        return active && pcie_share > 0.0f && d_pf_stage[0] != nullptr && pf_stage_bytes > 0;
+    }
+
+    // Submit CPU-side host experts directly from host thread (used in M=1 PCIe+CPU split decode)
+    uint32_t submit_cpu_jobs_async(int layer, int nj) noexcept {
+        h_bell->layer = layer;
+        h_bell->n_jobs = nj;
+        std::atomic_thread_fence(std::memory_order_release);
+        const uint32_t seq = ++host_ring_seq;
+        // Avoid colliding with GPU-side ring sequence (which starts at 1..); use high bit for host-submitted jobs
+        const uint32_t tagged = seq | 0x80000000u;
+        h_bell->ring = tagged;
+        std::atomic_thread_fence(std::memory_order_seq_cst);
+        return tagged;
+    }
+
+    void wait_cpu_jobs(uint32_t tagged_seq) noexcept {
+        while (h_bell->ack != tagged_seq) {
+            std::this_thread::yield();
+        }
+        std::atomic_thread_fence(std::memory_order_acquire);
+    }
+
     void start_workers(int num_threads = 0) {
         if (active) return;
+        if (const char* env = std::getenv("STRATA_INK_PCIE_SHARE")) {
+            char* endp = nullptr;
+            const float v = std::strtof(env, &endp);
+            if (endp != env) pcie_share = std::clamp(v, 0.0f, 1.0f);
+        }
         const int hw = std::max(1, (int)std::thread::hardware_concurrency());
         n_threads = (num_threads > 0) ? num_threads : std::min(16, std::max(2, hw / 2));
         INK_CK(cudaHostAlloc(&h_bell, sizeof(InkMappedDoorbell), cudaHostAllocMapped));
         std::memset(h_bell, 0, sizeof(InkMappedDoorbell));
         INK_CK(cudaHostGetDevicePointer(&d_bell, h_bell, 0));
+        h_topk_pin = halloc_pinned<int32_t>(kInkTopK);
         d_seq     = dalloc<uint32_t>(1);
         d_cur_seq = dalloc<uint32_t>(1);
         INK_CK(cudaMemset(d_seq, 0, 4));
@@ -910,6 +964,7 @@ struct InkHybridEngine {
             if (h_pf_exp_pin[b]) { cudaFreeHost(h_pf_exp_pin[b]); h_pf_exp_pin[b] = nullptr; }
         }
         if (h_bell) { cudaFreeHost(h_bell); h_bell = nullptr; d_bell = nullptr; }
+        if (h_topk_pin) { cudaFreeHost(h_topk_pin); h_topk_pin = nullptr; }
         if (h_sec4_pinned) { cudaFreeHost(h_sec4_pinned); h_sec4_pinned = nullptr; h_sec4_bytes = 0; }
         if (promo_st) { cudaStreamDestroy(promo_st); promo_st = nullptr; }
         if (pf_dma_st) { cudaStreamDestroy(pf_dma_st); pf_dma_st = nullptr; }
@@ -956,7 +1011,7 @@ inline void launch_ink_moe_hybrid(
     }
     k_ink_router_select_topk8<<<M, 32, 0, st>>>(ws.r_logits, gate_b, ws.topk_idx, ws.topk_w, route_scale, M);
 
-    if (M == 1) {
+    if (M == 1 && !hyb.pcie_decode_enabled()) {
         // Zero-sync CUDA-Graph-capturable Doorbell: CPU DDR5 computes tier==2 experts IN PARALLEL with GPU tier==0!
         k_ink_doorbell_ring<<<1, 256, 0, st>>>(
             ip, experts, ws.topk_idx, x_f32,
@@ -964,6 +1019,96 @@ inline void launch_ink_moe_hybrid(
             hyb.d_bell, hyb.d_seq, hyb.d_cur_seq);
         launch_ink_moe_dispatch_only(st, sec4_base, experts, info, x_f32, 1, ws, force_exact_dec, false);
         k_ink_doorbell_wait_collect<<<kInkTopK, 256, 0, st>>>(hyb.d_bell, hyb.d_cur_seq, ws.topk_w, ws.y_pair);
+    } else if (M == 1) {
+        // M=1 PCIe GPU Streaming + CPU Parallel Split:
+        // Copy topk_idx (32 B) + x_f32 (9 KiB) to pinned host, split cold host experts across
+        // PCIe DMA -> GPU (pf_dma_st + d_pf_stage[0]) AND CPU AVX2 workers in parallel!
+        INK_CK(cudaMemcpyAsync(hyb.h_topk_pin, ws.topk_idx, (size_t)kInkTopK * 4, cudaMemcpyDeviceToHost, st));
+        INK_CK(cudaMemcpyAsync(const_cast<float*>(hyb.h_bell->x), x_f32, (size_t)kInkHidden * sizeof(float), cudaMemcpyDeviceToHost, st));
+        INK_CK(cudaStreamSynchronize(st));
+
+        int cold_k[kInkTopK], cold_e[kInkTopK];
+        int n_cold = 0;
+        for (int k = 0; k < kInkTopK; ++k) {
+            const int e = hyb.h_topk_pin[k];
+            const int key = ip * kInkExperts + e;
+            if (hyb.host_meta[key].body != nullptr &&
+                (hyb.key_to_slot.empty() || hyb.key_to_slot[key] < 0)) {
+                cold_k[n_cold] = k;
+                cold_e[n_cold] = e;
+                ++n_cold;
+            }
+        }
+
+        int n_gpu = 0;
+        if (n_cold > 0) {
+            if (hyb.pcie_share >= 0.99f) {
+                n_gpu = n_cold;
+            } else {
+                n_gpu = (int)std::lround((float)n_cold * hyb.pcie_share);
+                if (n_cold >= 2) n_gpu = std::clamp(n_gpu, 1, n_cold - 1);
+                else n_gpu = std::clamp(n_gpu, 0, n_cold);
+            }
+        }
+        // 1. Kick off PCIe DMA for GPU share into ping-pong buffer 0
+        if (n_gpu > 0) {
+            if (hyb.pf_buf_busy[0]) {
+                INK_CK(cudaEventSynchronize(hyb.pf_ev_done[0]));
+                hyb.pf_buf_busy[0] = false;
+            }
+            InkExpertDev* h_exp = hyb.h_pf_exp_pin[0];
+            for (int e = 0; e < kInkExperts; ++e) { h_exp[e] = {}; h_exp[e].tier = 2; }
+            size_t off = 0;
+            for (int i = 0; i < n_gpu; ++i) {
+                const int e = cold_e[i];
+                const auto& hm = hyb.host_meta[ip * kInkExperts + e];
+                const size_t b = (hm.body_bytes + 255ull) & ~255ull;
+                if (off + b > hyb.pf_stage_bytes) {
+                    // Fallback: overflow goes to CPU
+                    n_gpu = i;
+                    break;
+                }
+                h_exp[e].body_off = off;
+                h_exp[e].dn_off   = hm.dn_off;
+                h_exp[e].gu_code  = hm.gu_code;
+                h_exp[e].dn_code  = hm.dn_code;
+                h_exp[e].tier     = 0;
+                INK_CK(cudaMemcpyAsync(hyb.d_pf_stage[0] + off, hm.body, hm.body_bytes, cudaMemcpyHostToDevice, hyb.pf_dma_st));
+                off += b;
+            }
+            if (n_gpu > 0) {
+                INK_CK(cudaMemcpyAsync(hyb.d_pf_exp_tmp[0], h_exp, (size_t)kInkExperts * sizeof(InkExpertDev), cudaMemcpyHostToDevice, hyb.pf_dma_st));
+                INK_CK(cudaEventRecord(hyb.pf_ev_dma[0], hyb.pf_dma_st));
+            }
+        }
+
+        // 2. In parallel, kick off CPU AVX2 workers for the remaining cold experts
+        const int eff_cpu = n_cold - n_gpu;
+        uint32_t cpu_seq = 0;
+        if (eff_cpu > 0) {
+            for (int j = 0; j < eff_cpu; ++j) {
+                hyb.h_bell->slot_k[j]    = cold_k[n_gpu + j];
+                hyb.h_bell->expert_id[j] = cold_e[n_gpu + j];
+            }
+            cpu_seq = hyb.submit_cpu_jobs_async(ip, eff_cpu);
+        }
+
+        // 3. On main stream `st`, run resident tier==0 VRAM experts (overlaps both PCIe DMA & CPU!)
+        launch_ink_moe_dispatch_only(st, sec4_base, experts, info, x_f32, 1, ws, force_exact_dec, false);
+
+        // 4. Wait for PCIe DMA and compute the streamed experts on GPU
+        if (n_gpu > 0) {
+            INK_CK(cudaStreamWaitEvent(st, hyb.pf_ev_dma[0], 0));
+            launch_ink_moe_dispatch_only(st, hyb.d_pf_stage[0], hyb.d_pf_exp_tmp[0], info, x_f32, 1, ws, force_exact_dec, true);
+            INK_CK(cudaEventRecord(hyb.pf_ev_done[0], st));
+            hyb.pf_buf_busy[0] = true;
+        }
+
+        // 5. Wait for CPU workers and collect their scaled outputs into ws.y_pair
+        if (eff_cpu > 0) {
+            hyb.wait_cpu_jobs(cpu_seq);
+            k_ink_collect_cpu_y<<<eff_cpu, 256, 0, st>>>(hyb.d_bell, eff_cpu, ws.topk_w, ws.y_pair);
+        }
     } else {
         // Double-Buffered Ping-Pong Async DMA Streaming overlapped with Blackwell sm_120a / INT8 Tensor Cores!
         // Step A: Collect which host experts in layer `ip` are needed (all host experts for M>16; exact hit set for M<=16!)

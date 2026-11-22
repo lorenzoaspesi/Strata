@@ -29,17 +29,53 @@ enum class InkKvDtype : int {
 };
 
 // Per-visit KV cache descriptor passed by value to attention kernels (CUDA-Graph friendly!)
+// Supports tiered VRAM ([0..vram_pos)) + mapped pinned host-RAM ([vram_pos..cap_pos)) for Global visits!
 struct InkKvVisitDesc {
-    __half*  k_f16;      // [max_slots, cap_pos, 8, 128] (used if dtype == FP16)
-    __half*  v_f16;
-    uint8_t* k_f8;       // [max_slots, cap_pos, 8, 128] E4M3 (used if dtype == FP8)
-    uint8_t* v_f8;
-    float*   k_sc;       // [max_slots, cap_pos, 8] per-head FP32 scale for FP8
-    float*   v_sc;
-    int      cap_pos;    // SWA: swa_ring (>= 1024 + max_chunk or 1024+16); Global: max_ctx
-    bool     is_swa;
-    bool     is_fp8;
+    __half*  k_f16 = nullptr;       // VRAM: [max_slots, vram_pos, 8, 128] (used if dtype == FP16)
+    __half*  v_f16 = nullptr;
+    uint8_t* k_f8  = nullptr;       // VRAM: [max_slots, vram_pos, 8, 128] E4M3 (used if dtype == FP8)
+    uint8_t* v_f8  = nullptr;
+    float*   k_sc  = nullptr;       // VRAM: [max_slots, vram_pos, 8] per-head FP32 scale for FP8
+    float*   v_sc  = nullptr;
+    __half*  k_f16_host = nullptr;  // Host mapped: [max_slots, host_pos, 8, 128]
+    __half*  v_f16_host = nullptr;
+    uint8_t* k_f8_host  = nullptr;
+    uint8_t* v_f8_host  = nullptr;
+    float*   k_sc_host  = nullptr;
+    float*   v_sc_host  = nullptr;
+    int      cap_pos  = 0;          // Total capacity (SWA: swa_ring; Global: max_ctx)
+    int      vram_pos = 0;          // Positions < vram_pos in VRAM; [vram_pos..cap_pos) in mapped host RAM
+    int      host_pos = 0;          // cap_pos - vram_pos (0 when 100% VRAM)
+    bool     is_swa   = false;
+    bool     is_fp8   = false;
 };
+
+__device__ __forceinline__ __half* ink_kv_f16_ptr(const InkKvVisitDesc& kv, bool is_k, int sl, int p_idx, int kh) {
+    if (!kv.is_swa && p_idx >= kv.vram_pos) {
+        const size_t base = (((size_t)sl * kv.host_pos + (p_idx - kv.vram_pos)) * kInkKVHeads + kh) * kInkHeadDim;
+        return (is_k ? kv.k_f16_host : kv.v_f16_host) + base;
+    }
+    const size_t base = (((size_t)sl * kv.vram_pos + p_idx) * kInkKVHeads + kh) * kInkHeadDim;
+    return (is_k ? kv.k_f16 : kv.v_f16) + base;
+}
+
+__device__ __forceinline__ uint8_t* ink_kv_f8_ptr(const InkKvVisitDesc& kv, bool is_k, int sl, int p_idx, int kh) {
+    if (!kv.is_swa && p_idx >= kv.vram_pos) {
+        const size_t base = (((size_t)sl * kv.host_pos + (p_idx - kv.vram_pos)) * kInkKVHeads + kh) * kInkHeadDim;
+        return (is_k ? kv.k_f8_host : kv.v_f8_host) + base;
+    }
+    const size_t base = (((size_t)sl * kv.vram_pos + p_idx) * kInkKVHeads + kh) * kInkHeadDim;
+    return (is_k ? kv.k_f8 : kv.v_f8) + base;
+}
+
+__device__ __forceinline__ float* ink_kv_sc_ptr(const InkKvVisitDesc& kv, bool is_k, int sl, int p_idx, int kh) {
+    if (!kv.is_swa && p_idx >= kv.vram_pos) {
+        const size_t sidx = ((size_t)sl * kv.host_pos + (p_idx - kv.vram_pos)) * kInkKVHeads + kh;
+        return (is_k ? kv.k_sc_host : kv.v_sc_host) + sidx;
+    }
+    const size_t sidx = ((size_t)sl * kv.vram_pos + p_idx) * kInkKVHeads + kh;
+    return (is_k ? kv.k_sc : kv.v_sc) + sidx;
+}
 
 // Write K, V [M, 8, 128] FP32 into KV cache at positions pos_arr[m] for slot_arr[m]
 // (For SWA, writes to ring index pos % cap_pos; for Global, writes to pos).
@@ -59,13 +95,12 @@ __global__ void __launch_bounds__(128) k_ink_kv_write(
     const int sl = slots ? slots[m] : slot0;
     const int p = pos[m];
     const int p_idx = kv.is_swa ? (p % kv.cap_pos) : p;
-    const size_t base = (((size_t)sl * kv.cap_pos + p_idx) * kInkKVHeads + h) * kInkHeadDim;
     const float kv_val = k_in[((size_t)m * kInkKVHeads + h) * kInkHeadDim + d];
     const float vv_val = v_in[((size_t)m * kInkKVHeads + h) * kInkHeadDim + d];
 
     if (!kv.is_fp8) {
-        kv.k_f16[base + d] = __float2half(kv_val);
-        kv.v_f16[base + d] = __float2half(vv_val);
+        ink_kv_f16_ptr(kv, true,  sl, p_idx, h)[d] = __float2half(kv_val);
+        ink_kv_f16_ptr(kv, false, sl, p_idx, h)[d] = __float2half(vv_val);
     } else {
         // Warp/block max for per-head FP8 scale
         float mk = warp_max(fabsf(kv_val));
@@ -79,12 +114,11 @@ __global__ void __launch_bounds__(128) k_ink_kv_write(
         const float sc_v = amv > 0.0f ? (amv * (1.0f / 448.0f)) : 1.0f;
         const __nv_fp8_e4m3 qk(fminf(fmaxf(kv_val / sc_k, -448.0f), 448.0f));
         const __nv_fp8_e4m3 qv(fminf(fmaxf(vv_val / sc_v, -448.0f), 448.0f));
-        kv.k_f8[base + d] = qk.__x;
-        kv.v_f8[base + d] = qv.__x;
+        ink_kv_f8_ptr(kv, true,  sl, p_idx, h)[d] = qk.__x;
+        ink_kv_f8_ptr(kv, false, sl, p_idx, h)[d] = qv.__x;
         if (d == 0) {
-            const size_t sidx = ((size_t)sl * kv.cap_pos + p_idx) * kInkKVHeads + h;
-            kv.k_sc[sidx] = sc_k;
-            kv.v_sc[sidx] = sc_v;
+            *ink_kv_sc_ptr(kv, true,  sl, p_idx, h) = sc_k;
+            *ink_kv_sc_ptr(kv, false, sl, p_idx, h) = sc_v;
         }
     }
 }
@@ -195,9 +229,8 @@ __global__ void __launch_bounds__(128) k_ink_post_qkv_fused(
             // Direct write into KV cache (FP16 or FP8 E4M3)!
             const int p = pos_arr[m];
             const int p_idx = kv.is_swa ? (p % kv.cap_pos) : p;
-            const size_t base = (((size_t)sl * kv.cap_pos + p_idx) * kInkKVHeads + kh) * kInkHeadDim;
             if (!kv.is_fp8) {
-                (is_k ? kv.k_f16 : kv.v_f16)[base + tid] = __float2half(val);
+                ink_kv_f16_ptr(kv, is_k, sl, p_idx, kh)[tid] = __float2half(val);
             } else {
                 float mv = warp_max(fabsf(val));
                 if ((tid & 31) == 0) sh[tid >> 5] = mv;
@@ -205,10 +238,9 @@ __global__ void __launch_bounds__(128) k_ink_post_qkv_fused(
                 float am = fmaxf(fmaxf(sh[0], sh[1]), fmaxf(sh[2], sh[3]));
                 const float sc = am > 0.0f ? (am * (1.0f / 448.0f)) : 1.0f;
                 const __nv_fp8_e4m3 qv(fminf(fmaxf(val / sc, -448.0f), 448.0f));
-                (is_k ? kv.k_f8 : kv.v_f8)[base + tid] = qv.__x;
+                ink_kv_f8_ptr(kv, is_k, sl, p_idx, kh)[tid] = qv.__x;
                 if (tid == 0) {
-                    const size_t sidx = ((size_t)sl * kv.cap_pos + p_idx) * kInkKVHeads + kh;
-                    (is_k ? kv.k_sc : kv.v_sc)[sidx] = sc;
+                    *ink_kv_sc_ptr(kv, is_k, sl, p_idx, kh) = sc;
                 }
             }
         }
@@ -330,11 +362,10 @@ __global__ void __launch_bounds__(128) k_ink_flash_gqa(
     // 1. Committed KV cache loop (stride 4 across the 4 warps)
     for (int kp = k_start + warp; kp < k_end; kp += 4) {
         const int p_idx = kv.is_swa ? (kp % kv.cap_pos) : kp;
-        const size_t base = (((size_t)sl * kv.cap_pos + p_idx) * kInkKVHeads + kh) * kInkHeadDim + lane * 4;
         float4 kv4, vv4;
         if (!kv.is_fp8) {
-            const uint2 k2 = *(const uint2*)(kv.k_f16 + base);
-            const uint2 v2 = *(const uint2*)(kv.v_f16 + base);
+            const uint2 k2 = *(const uint2*)(ink_kv_f16_ptr(kv, true,  sl, p_idx, kh) + lane * 4);
+            const uint2 v2 = *(const uint2*)(ink_kv_f16_ptr(kv, false, sl, p_idx, kh) + lane * 4);
             const float2 kf0 = __half22float2(*reinterpret_cast<const __half2*>(&k2.x));
             const float2 kf1 = __half22float2(*reinterpret_cast<const __half2*>(&k2.y));
             const float2 vf0 = __half22float2(*reinterpret_cast<const __half2*>(&v2.x));
@@ -342,11 +373,10 @@ __global__ void __launch_bounds__(128) k_ink_flash_gqa(
             kv4 = make_float4(kf0.x, kf0.y, kf1.x, kf1.y);
             vv4 = make_float4(vf0.x, vf0.y, vf1.x, vf1.y);
         } else {
-            const size_t sidx = ((size_t)sl * kv.cap_pos + p_idx) * kInkKVHeads + kh;
-            const float sk = kv.k_sc[sidx];
-            const float sv = kv.v_sc[sidx];
-            const uint32_t k4 = *(const uint32_t*)(kv.k_f8 + base);
-            const uint32_t v4 = *(const uint32_t*)(kv.v_f8 + base);
+            const float sk = *ink_kv_sc_ptr(kv, true,  sl, p_idx, kh);
+            const float sv = *ink_kv_sc_ptr(kv, false, sl, p_idx, kh);
+            const uint32_t k4 = *(const uint32_t*)(ink_kv_f8_ptr(kv, true,  sl, p_idx, kh) + lane * 4);
+            const uint32_t v4 = *(const uint32_t*)(ink_kv_f8_ptr(kv, false, sl, p_idx, kh) + lane * 4);
             const float2 kf0 = e4m3x2_to_f32x2((uint16_t)(k4 & 0xFFFFu));
             const float2 kf1 = e4m3x2_to_f32x2((uint16_t)(k4 >> 16));
             const float2 vf0 = e4m3x2_to_f32x2((uint16_t)(v4 & 0xFFFFu));
@@ -506,10 +536,9 @@ __global__ void __launch_bounds__(128) k_ink_flash_gqa_splitk(
             vv4 = *(const float4*)(tree_v + tbase);
         } else {
             const int p_idx = kv.is_swa ? (kp % kv.cap_pos) : kp;
-            const size_t base = (((size_t)sl * kv.cap_pos + p_idx) * kInkKVHeads + kh) * kInkHeadDim + lane * 4;
             if (!kv.is_fp8) {
-                const uint2 k2 = *(const uint2*)(kv.k_f16 + base);
-                const uint2 v2 = *(const uint2*)(kv.v_f16 + base);
+                const uint2 k2 = *(const uint2*)(ink_kv_f16_ptr(kv, true,  sl, p_idx, kh) + lane * 4);
+                const uint2 v2 = *(const uint2*)(ink_kv_f16_ptr(kv, false, sl, p_idx, kh) + lane * 4);
                 const float2 kf0 = __half22float2(*reinterpret_cast<const __half2*>(&k2.x));
                 const float2 kf1 = __half22float2(*reinterpret_cast<const __half2*>(&k2.y));
                 const float2 vf0 = __half22float2(*reinterpret_cast<const __half2*>(&v2.x));
@@ -517,10 +546,10 @@ __global__ void __launch_bounds__(128) k_ink_flash_gqa_splitk(
                 kv4 = make_float4(kf0.x, kf0.y, kf1.x, kf1.y);
                 vv4 = make_float4(vf0.x, vf0.y, vf1.x, vf1.y);
             } else {
-                const size_t sidx = ((size_t)sl * kv.cap_pos + p_idx) * kInkKVHeads + kh;
-                const float sk = kv.k_sc[sidx], sv = kv.v_sc[sidx];
-                const uint32_t k4 = *(const uint32_t*)(kv.k_f8 + base);
-                const uint32_t v4 = *(const uint32_t*)(kv.v_f8 + base);
+                const float sk = *ink_kv_sc_ptr(kv, true,  sl, p_idx, kh);
+                const float sv = *ink_kv_sc_ptr(kv, false, sl, p_idx, kh);
+                const uint32_t k4 = *(const uint32_t*)(ink_kv_f8_ptr(kv, true,  sl, p_idx, kh) + lane * 4);
+                const uint32_t v4 = *(const uint32_t*)(ink_kv_f8_ptr(kv, false, sl, p_idx, kh) + lane * 4);
                 const float2 kf0 = e4m3x2_to_f32x2((uint16_t)(k4 & 0xFFFFu));
                 const float2 kf1 = e4m3x2_to_f32x2((uint16_t)(k4 >> 16));
                 const float2 vf0 = e4m3x2_to_f32x2((uint16_t)(v4 & 0xFFFFu));
@@ -644,11 +673,10 @@ __global__ void __launch_bounds__(128) k_ink_flash_gqa_gqa3(
 
     for (int kp = k_start + warp; kp < k_end; kp += 4) {
         const int p_idx = kv.is_swa ? (kp % kv.cap_pos) : kp;
-        const size_t base = (((size_t)sl * kv.cap_pos + p_idx) * kInkKVHeads + kh) * kInkHeadDim + lane * 4;
         float4 kv4, vv4;
         if (!kv.is_fp8) {
-            const uint2 k2 = *(const uint2*)(kv.k_f16 + base);
-            const uint2 v2 = *(const uint2*)(kv.v_f16 + base);
+            const uint2 k2 = *(const uint2*)(ink_kv_f16_ptr(kv, true,  sl, p_idx, kh) + lane * 4);
+            const uint2 v2 = *(const uint2*)(ink_kv_f16_ptr(kv, false, sl, p_idx, kh) + lane * 4);
             const float2 kf0 = __half22float2(*reinterpret_cast<const __half2*>(&k2.x));
             const float2 kf1 = __half22float2(*reinterpret_cast<const __half2*>(&k2.y));
             const float2 vf0 = __half22float2(*reinterpret_cast<const __half2*>(&v2.x));
@@ -656,10 +684,10 @@ __global__ void __launch_bounds__(128) k_ink_flash_gqa_gqa3(
             kv4 = make_float4(kf0.x, kf0.y, kf1.x, kf1.y);
             vv4 = make_float4(vf0.x, vf0.y, vf1.x, vf1.y);
         } else {
-            const size_t sidx = ((size_t)sl * kv.cap_pos + p_idx) * kInkKVHeads + kh;
-            const float sk = kv.k_sc[sidx], sv = kv.v_sc[sidx];
-            const uint32_t k4 = *(const uint32_t*)(kv.k_f8 + base);
-            const uint32_t v4 = *(const uint32_t*)(kv.v_f8 + base);
+            const float sk = *ink_kv_sc_ptr(kv, true,  sl, p_idx, kh);
+            const float sv = *ink_kv_sc_ptr(kv, false, sl, p_idx, kh);
+            const uint32_t k4 = *(const uint32_t*)(ink_kv_f8_ptr(kv, true,  sl, p_idx, kh) + lane * 4);
+            const uint32_t v4 = *(const uint32_t*)(ink_kv_f8_ptr(kv, false, sl, p_idx, kh) + lane * 4);
             const float2 kf0 = e4m3x2_to_f32x2((uint16_t)(k4 & 0xFFFFu));
             const float2 kf1 = e4m3x2_to_f32x2((uint16_t)(k4 >> 16));
             const float2 vf0 = e4m3x2_to_f32x2((uint16_t)(v4 & 0xFFFFu));
@@ -757,26 +785,23 @@ __global__ void __launch_bounds__(128) k_ink_pf_pack_kv(
     if (kh >= kInkKVHeads || ki >= K_len) return;
     const int kp = k_start + ki;
     const int p_idx = kv.is_swa ? (kp % kv.cap_pos) : kp;
-    const size_t base = (((size_t)slot0 * kv.cap_pos + p_idx) * kInkKVHeads + kh) * kInkHeadDim + d;
     uint16_t kb, vb;
     if constexpr (USE_FP16) {
         if (!kv.is_fp8) {
-            kb = *reinterpret_cast<const uint16_t*>(&kv.k_f16[base]);
-            vb = *reinterpret_cast<const uint16_t*>(&kv.v_f16[base]);
+            kb = *reinterpret_cast<const uint16_t*>(ink_kv_f16_ptr(kv, true,  slot0, p_idx, kh) + d);
+            vb = *reinterpret_cast<const uint16_t*>(ink_kv_f16_ptr(kv, false, slot0, p_idx, kh) + d);
         } else {
-            const size_t sidx = ((size_t)slot0 * kv.cap_pos + p_idx) * kInkKVHeads + kh;
-            kb = pf_cvt_from_f32<true>(e4m3_to_f32(kv.k_f8[base]) * kv.k_sc[sidx]);
-            vb = pf_cvt_from_f32<true>(e4m3_to_f32(kv.v_f8[base]) * kv.v_sc[sidx]);
+            kb = pf_cvt_from_f32<true>(e4m3_to_f32(ink_kv_f8_ptr(kv, true,  slot0, p_idx, kh)[d]) * (*ink_kv_sc_ptr(kv, true,  slot0, p_idx, kh)));
+            vb = pf_cvt_from_f32<true>(e4m3_to_f32(ink_kv_f8_ptr(kv, false, slot0, p_idx, kh)[d]) * (*ink_kv_sc_ptr(kv, false, slot0, p_idx, kh)));
         }
     } else {
         float kf, vf;
         if (!kv.is_fp8) {
-            kf = __half2float(kv.k_f16[base]);
-            vf = __half2float(kv.v_f16[base]);
+            kf = __half2float(ink_kv_f16_ptr(kv, true,  slot0, p_idx, kh)[d]);
+            vf = __half2float(ink_kv_f16_ptr(kv, false, slot0, p_idx, kh)[d]);
         } else {
-            const size_t sidx = ((size_t)slot0 * kv.cap_pos + p_idx) * kInkKVHeads + kh;
-            kf = e4m3_to_f32(kv.k_f8[base]) * kv.k_sc[sidx];
-            vf = e4m3_to_f32(kv.v_f8[base]) * kv.v_sc[sidx];
+            kf = e4m3_to_f32(ink_kv_f8_ptr(kv, true,  slot0, p_idx, kh)[d]) * (*ink_kv_sc_ptr(kv, true,  slot0, p_idx, kh));
+            vf = e4m3_to_f32(ink_kv_f8_ptr(kv, false, slot0, p_idx, kh)[d]) * (*ink_kv_sc_ptr(kv, false, slot0, p_idx, kh));
         }
         kb = pf_cvt_from_f32<false>(kf);
         vb = pf_cvt_from_f32<false>(vf);

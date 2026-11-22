@@ -27,6 +27,7 @@
 #include "ink_backend.h"
 #include "ink_batch.h"
 #include "ink_manifest.h"
+#include "ink_session.h"
 #include "ink_vision.h"
 
 namespace ink2 {
@@ -345,6 +346,9 @@ struct ServeConfig {
     bool force_cpu = false;
     bool anti_loop = true;
     std::string version = "0.1.65";
+    int64_t conversation_cache_mib = 0;   // --conversation-cache-mib N (RAM LRU tier)
+    int64_t conversation_spill_mib = 0;   // --conversation-spill-mib M (ephemeral SSD spill tier)
+    std::string conversation_spill_dir;   // --conversation-spill-dir DIR
 };
 
 inline int run_serve_loop(const ServeConfig& cfg, InkModelFile& mf, InkBackend& backend) {
@@ -377,10 +381,27 @@ inline int run_serve_loop(const ServeConfig& cfg, InkModelFile& mf, InkBackend& 
     size_t sl = base.find_last_of("/\\");
     if (sl != std::string::npos) base = base.substr(sl + 1);
 
-    proto("INFO engine=strata-inkling-%s arch=inkling2_loop backend=%s model=%s layers=%d visits=%d vocab=%d chunk=%d batch_slots=%d slot_read=1 kv_dtype=%s drafter=%s images=%d image_pad=%d parallel=%d",
+    const auto bstats = backend.stats();
+    const int kv_is_fp8 = (bstats.kv_dtype == KvDtype::FP8_E4M3) ? 1 : 0;
+    const uint64_t model_fp = ink_model_fingerprint(cfg.model_path, c);
+    const uint64_t config_fp = ink_config_fingerprint(cfg.version, bstats.kv_dtype, c);
+
+    InkConversationCache conv_cache;
+    {
+        std::string spill_root = cfg.conversation_spill_dir;
+        if (spill_root.empty() && cfg.conversation_spill_mib > 0) {
+            std::filesystem::path mp(cfg.model_path);
+            if (mp.has_parent_path()) spill_root = (mp.parent_path() / "conversation-spill").string();
+        }
+        conv_cache.configure(cfg.conversation_cache_mib, cfg.conversation_spill_mib, spill_root,
+                             model_fp, config_fp, kv_is_fp8, cfg.bopts.max_ctx);
+    }
+
+    proto("INFO engine=strata-inkling-%s arch=inkling2_loop backend=%s model=%s layers=%d visits=%d vocab=%d chunk=%d batch_slots=%d slot_read=1 kv_dtype=%s drafter=%s images=%d image_pad=%d parallel=%d session_fp=v1:%016llx:%016llx",
           cfg.version.c_str(), backend.backend_name(), base.c_str(), c.n_phys, c.n_visits, V, chunk_sz,
-          P, cfg.bopts.kv_dtype == KvDtype::FP8_E4M3 ? "fp8" : "fp16",
-          use_dspark ? "dspark" : "none", images_ok ? 1 : 0, c.image_token_id, kMaxParallelSlots);
+          P, kv_is_fp8 ? "fp8" : "fp16",
+          use_dspark ? "dspark" : "none", images_ok ? 1 : 0, c.image_token_id, kMaxParallelSlots,
+          static_cast<unsigned long long>(model_fp), static_cast<unsigned long long>(config_fp));
     proto("READY %d stop hold holdb", cfg.bopts.max_ctx);
 
     std::vector<ActiveReq> reqs(P);
@@ -482,8 +503,38 @@ inline int run_serve_loop(const ServeConfig& cfg, InkModelFile& mf, InkBackend& 
             }
         }
         if (reuse == 0) {
-            backend.reset_slot(rq.slot);
-            rq.cached_prefix.clear();
+            // Park outgoing slot-0 conversation into RAM/SSD conversation cache before resetting
+            if (rq.slot == 0 && conv_cache.enabled() && rq.cached_prefix.size() >= 64) {
+                InkSlotSnapshot parked;
+                std::string perr;
+                if (backend.export_slot(0, static_cast<int>(rq.cached_prefix.size()), parked, perr)) {
+                    parked.model_fp = model_fp;
+                    parked.config_fp = config_fp;
+                    parked.tokens = rq.cached_prefix;
+                    conv_cache.park(std::move(parked));
+                }
+            }
+            // Check RAM + SSD spill conversation cache for a matching prefix before resetting
+            bool hit_cache = false;
+            if (rq.slot == 0 && pg.images.empty() && conv_cache.enabled()) {
+                InkSlotSnapshot restored;
+                std::string tier;
+                if (conv_cache.lookup(rq.prompt_ids, restored, tier)) {
+                    std::string ierr;
+                    if (backend.import_slot(0, restored, ierr)) {
+                        rq.cached_prefix = std::move(restored.tokens);
+                        reuse = static_cast<int>(rq.cached_prefix.size());
+                        hit_cache = true;
+                        std::fprintf(stderr, "strata-inkling serve: conversation cache hit (%s): %d tokens restored\n",
+                                     tier.c_str(), reuse);
+                        proto("RESUME %d", reuse);
+                    }
+                }
+            }
+            if (!hit_cache) {
+                backend.reset_slot(rq.slot);
+                rq.cached_prefix.clear();
+            }
         } else {
             proto("RESUME %d", reuse);
         }
@@ -542,6 +593,58 @@ inline int run_serve_loop(const ServeConfig& cfg, InkModelFile& mf, InkBackend& 
                     proto("BCOK %d %zu", s, cids.size());
                 }
             }
+            return true;
+        }
+        if (line.rfind("SAVE ", 0) == 0) {
+            const std::string path = line.substr(5);
+            if (reqs[0].active) {
+                proto("SERR invalid 0 slot 0 is busy");
+                return true;
+            }
+            if (reqs[0].cached_prefix.empty()) {
+                proto("SERR invalid 0 no active conversation to save");
+                return true;
+            }
+            const double t0 = now_s();
+            InkSlotSnapshot snap;
+            std::string serr, kind = "io";
+            if (!backend.export_slot(0, static_cast<int>(reqs[0].cached_prefix.size()), snap, serr)) {
+                proto("SERR invalid 0 %s", serr.c_str());
+                return true;
+            }
+            snap.model_fp = model_fp;
+            snap.config_fp = config_fp;
+            snap.tokens = reqs[0].cached_prefix;
+            uint64_t bytes = 0;
+            if (!ink_session_write(path, snap, bytes, serr, kind)) {
+                proto("SERR %s 0 %s", kind.c_str(), serr.c_str());
+                return true;
+            }
+            const double ms = (now_s() - t0) * 1000.0;
+            proto("SAVED %d %llu %.1f", snap.n_tokens, static_cast<unsigned long long>(bytes), ms);
+            return true;
+        }
+        if (line.rfind("RESTORE ", 0) == 0) {
+            const std::string path = line.substr(8);
+            if (reqs[0].active) {
+                proto("SERR invalid 0 slot 0 is busy");
+                return true;
+            }
+            const double t0 = now_s();
+            InkSlotSnapshot snap;
+            uint64_t bytes = 0;
+            std::string serr, kind = "io";
+            if (!ink_session_read(path, model_fp, config_fp, kv_is_fp8, cfg.bopts.max_ctx, snap, bytes, serr, kind)) {
+                proto("SERR %s 0 %s", kind.c_str(), serr.c_str());
+                return true;
+            }
+            if (!backend.import_slot(0, snap, serr)) {
+                proto("SERR io 0 %s", serr.c_str());
+                return true;
+            }
+            reqs[0].cached_prefix = std::move(snap.tokens);
+            const double ms = (now_s() - t0) * 1000.0;
+            proto("RESTORED %d %llu %.1f", snap.n_tokens, static_cast<unsigned long long>(bytes), ms);
             return true;
         }
         if (line.rfind("GEN ", 0) == 0 || line.rfind("BGEN ", 0) == 0 || line.rfind("GENERATE ", 0) == 0) {

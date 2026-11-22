@@ -144,7 +144,8 @@ public:
 
         runner_ = std::make_unique<strata::ink::InkCudaRunner>(model_);
         runner_->use_cuda_graph = true;
-        runner_->init(max_slots_, std::max(256, opts.max_ctx), std::max(64, opts.chunk), cuda_kvd);
+        const size_t dspark_post_reserve = (opts.enable_dspark && model_.man.has_dspark) ? (256ull << 20) : 0ull;
+        runner_->init(max_slots_, std::max(256, opts.max_ctx), std::max(64, opts.chunk), cuda_kvd, dspark_post_reserve, opts.kv_resident);
         eff_max_ctx_ = runner_->max_ctx;
 
         if (opts.enable_dspark && model_.man.has_dspark) {
@@ -561,6 +562,210 @@ public:
                 return false;
             }
         }
+        return true;
+    }
+
+    bool export_slot(int slot, int n_tokens, InkSlotSnapshot& out, std::string& err) override {
+        if (!initialized_ || !runner_) { err = "CUDA backend not initialized"; return false; }
+        if (slot < 0 || slot >= max_slots_) { err = "invalid slot"; return false; }
+        if (n_tokens <= 0 || n_tokens > runner_->max_ctx) { err = "n_tokens out of range"; return false; }
+        INK_CK(cudaStreamSynchronize(runner_->st));
+
+        const bool is_fp8 = (runner_->kv_dtype == strata::ink::InkKvDtype::FP8);
+        const int swa_cap = runner_->swa_ring;
+        const int swa_len = std::min(n_tokens, std::min(swa_cap, strata::ink::kInkSwaWin));
+        const int swa_start = n_tokens - swa_len;
+
+        const size_t sconv_bytes = (size_t)strata::ink::kInkVisits * 3 * strata::ink::kInkSconvCh * sizeof(float);
+        const size_t kv_elem_bytes = is_fp8 ? sizeof(uint8_t) : sizeof(__half);
+        const size_t kv_pos_bytes = (size_t)strata::ink::kInkKVHeads * strata::ink::kInkHeadDim * kv_elem_bytes;
+        const size_t sc_pos_bytes = is_fp8 ? ((size_t)strata::ink::kInkKVHeads * sizeof(float)) : 0;
+
+        size_t total_payload = sconv_bytes;
+        for (int v = 0; v < strata::ink::kInkVisits; ++v) {
+            const int len = runner_->kv_desc[v].is_swa ? swa_len : n_tokens;
+            total_payload += 2 * (size_t)len * (kv_pos_bytes + sc_pos_bytes);
+        }
+
+        out.n_tokens = n_tokens;
+        out.kv_is_fp8 = is_fp8 ? 1 : 0;
+        out.swa_len = swa_len;
+        out.swa_start = swa_start;
+        out.payload.resize(total_payload);
+        uint8_t* dst = out.payload.data();
+
+        // 1. Copy 48 ShortConv4 slot histories via existing slot-copy kernel -> d_sconv_snap_ -> host
+        strata::ink::k_ink_sconv_slot_copy<<<dim3(strata::ink::kInkVisits, 4), 256, 0, runner_->st>>>(
+            runner_->d_sconv_pool_arr, d_sconv_snap_, slot, runner_->max_slots, true);
+        INK_CK(cudaMemcpyAsync(dst, d_sconv_snap_, sconv_bytes, cudaMemcpyDeviceToHost, runner_->st));
+        INK_CK(cudaStreamSynchronize(runner_->st));
+        dst += sconv_bytes;
+
+        // 2. Copy all 48 visits (8 Global tiered VRAM+Host, 40 SWA circular ring)
+        for (int v = 0; v < strata::ink::kInkVisits; ++v) {
+            const auto& kv = runner_->kv_desc[v];
+            if (!kv.is_swa) {
+                const int vn = std::min(n_tokens, kv.vram_pos);
+                const int hn = std::max(0, n_tokens - kv.vram_pos);
+                const size_t v_slot_off = (size_t)slot * kv.vram_pos;
+                const size_t h_slot_off = (size_t)slot * kv.host_pos;
+                // K then V
+                for (int is_v = 0; is_v < 2; ++is_v) {
+                    if (vn > 0) {
+                        const uint8_t* vptr = is_fp8
+                            ? (const uint8_t*)(is_v ? kv.v_f8 : kv.k_f8)
+                            : (const uint8_t*)(is_v ? kv.v_f16 : kv.k_f16);
+                        INK_CK(cudaMemcpy(dst, vptr + v_slot_off * kv_pos_bytes, (size_t)vn * kv_pos_bytes, cudaMemcpyDeviceToHost));
+                        dst += (size_t)vn * kv_pos_bytes;
+                    }
+                    if (hn > 0) {
+                        const uint8_t* hptr = (const uint8_t*)(is_v ? runner_->h_kv_v_host[v] : runner_->h_kv_k_host[v]);
+                        std::memcpy(dst, hptr + h_slot_off * kv_pos_bytes, (size_t)hn * kv_pos_bytes);
+                        dst += (size_t)hn * kv_pos_bytes;
+                    }
+                    if (is_fp8) {
+                        if (vn > 0) {
+                            const uint8_t* vsptr = (const uint8_t*)(is_v ? kv.v_sc : kv.k_sc);
+                            INK_CK(cudaMemcpy(dst, vsptr + v_slot_off * sc_pos_bytes, (size_t)vn * sc_pos_bytes, cudaMemcpyDeviceToHost));
+                            dst += (size_t)vn * sc_pos_bytes;
+                        }
+                        if (hn > 0) {
+                            const uint8_t* hsptr = (const uint8_t*)(is_v ? runner_->h_kv_vsc_host[v] : runner_->h_kv_ksc_host[v]);
+                            std::memcpy(dst, hsptr + h_slot_off * sc_pos_bytes, (size_t)hn * sc_pos_bytes);
+                            dst += (size_t)hn * sc_pos_bytes;
+                        }
+                    }
+                }
+            } else if (swa_len > 0) {
+                const int ring_pos = swa_start % kv.cap_pos;
+                const int first = std::min(swa_len, kv.cap_pos - ring_pos);
+                const int second = swa_len - first;
+                const size_t slot_off = (size_t)slot * kv.vram_pos;
+                for (int is_v = 0; is_v < 2; ++is_v) {
+                    const uint8_t* vptr = is_fp8
+                        ? (const uint8_t*)(is_v ? kv.v_f8 : kv.k_f8)
+                        : (const uint8_t*)(is_v ? kv.v_f16 : kv.k_f16);
+                    INK_CK(cudaMemcpy(dst, vptr + (slot_off + ring_pos) * kv_pos_bytes, (size_t)first * kv_pos_bytes, cudaMemcpyDeviceToHost));
+                    dst += (size_t)first * kv_pos_bytes;
+                    if (second > 0) {
+                        INK_CK(cudaMemcpy(dst, vptr + slot_off * kv_pos_bytes, (size_t)second * kv_pos_bytes, cudaMemcpyDeviceToHost));
+                        dst += (size_t)second * kv_pos_bytes;
+                    }
+                    if (is_fp8) {
+                        const uint8_t* vsptr = (const uint8_t*)(is_v ? kv.v_sc : kv.k_sc);
+                        INK_CK(cudaMemcpy(dst, vsptr + (slot_off + ring_pos) * sc_pos_bytes, (size_t)first * sc_pos_bytes, cudaMemcpyDeviceToHost));
+                        dst += (size_t)first * sc_pos_bytes;
+                        if (second > 0) {
+                            INK_CK(cudaMemcpy(dst, vsptr + slot_off * sc_pos_bytes, (size_t)second * sc_pos_bytes, cudaMemcpyDeviceToHost));
+                            dst += (size_t)second * sc_pos_bytes;
+                        }
+                    }
+                }
+            }
+        }
+        return true;
+    }
+
+    bool import_slot(int slot, const InkSlotSnapshot& in, std::string& err) override {
+        if (!initialized_ || !runner_) { err = "CUDA backend not initialized"; return false; }
+        if (slot < 0 || slot >= max_slots_) { err = "invalid slot"; return false; }
+        const bool is_fp8 = (runner_->kv_dtype == strata::ink::InkKvDtype::FP8);
+        if ((in.kv_is_fp8 != 0) != is_fp8) { err = "KV dtype mismatch"; return false; }
+        if (in.n_tokens <= 0 || in.n_tokens > runner_->max_ctx) { err = "n_tokens out of range"; return false; }
+        if (in.swa_len < 0 || in.swa_len > runner_->swa_ring || in.swa_start < 0 || in.swa_start + in.swa_len != in.n_tokens) {
+            err = "invalid SWA range in snapshot";
+            return false;
+        }
+        INK_CK(cudaStreamSynchronize(runner_->st));
+
+        const size_t sconv_bytes = (size_t)strata::ink::kInkVisits * 3 * strata::ink::kInkSconvCh * sizeof(float);
+        const size_t kv_elem_bytes = is_fp8 ? sizeof(uint8_t) : sizeof(__half);
+        const size_t kv_pos_bytes = (size_t)strata::ink::kInkKVHeads * strata::ink::kInkHeadDim * kv_elem_bytes;
+        const size_t sc_pos_bytes = is_fp8 ? ((size_t)strata::ink::kInkKVHeads * sizeof(float)) : 0;
+
+        size_t expect_payload = sconv_bytes;
+        for (int v = 0; v < strata::ink::kInkVisits; ++v) {
+            const int len = runner_->kv_desc[v].is_swa ? in.swa_len : in.n_tokens;
+            expect_payload += 2 * (size_t)len * (kv_pos_bytes + sc_pos_bytes);
+        }
+        if (in.payload.size() != expect_payload) {
+            err = "snapshot payload size mismatch";
+            return false;
+        }
+
+        const uint8_t* src = in.payload.data();
+
+        // 1. Restore 48 ShortConv4 slot histories
+        INK_CK(cudaMemcpyAsync(d_sconv_snap_, src, sconv_bytes, cudaMemcpyHostToDevice, runner_->st));
+        strata::ink::k_ink_sconv_slot_copy<<<dim3(strata::ink::kInkVisits, 4), 256, 0, runner_->st>>>(
+            runner_->d_sconv_pool_arr, d_sconv_snap_, slot, runner_->max_slots, false);
+        INK_CK(cudaStreamSynchronize(runner_->st));
+        src += sconv_bytes;
+
+        // 2. Restore all 48 visits
+        for (int v = 0; v < strata::ink::kInkVisits; ++v) {
+            const auto& kv = runner_->kv_desc[v];
+            if (!kv.is_swa) {
+                const int vn = std::min(in.n_tokens, kv.vram_pos);
+                const int hn = std::max(0, in.n_tokens - kv.vram_pos);
+                const size_t v_slot_off = (size_t)slot * kv.vram_pos;
+                const size_t h_slot_off = (size_t)slot * kv.host_pos;
+                for (int is_v = 0; is_v < 2; ++is_v) {
+                    if (vn > 0) {
+                        uint8_t* vptr = is_fp8
+                            ? (uint8_t*)(is_v ? kv.v_f8 : kv.k_f8)
+                            : (uint8_t*)(is_v ? kv.v_f16 : kv.k_f16);
+                        INK_CK(cudaMemcpy(vptr + v_slot_off * kv_pos_bytes, src, (size_t)vn * kv_pos_bytes, cudaMemcpyHostToDevice));
+                        src += (size_t)vn * kv_pos_bytes;
+                    }
+                    if (hn > 0) {
+                        uint8_t* hptr = (uint8_t*)(is_v ? runner_->h_kv_v_host[v] : runner_->h_kv_k_host[v]);
+                        std::memcpy(hptr + h_slot_off * kv_pos_bytes, src, (size_t)hn * kv_pos_bytes);
+                        src += (size_t)hn * kv_pos_bytes;
+                    }
+                    if (is_fp8) {
+                        if (vn > 0) {
+                            uint8_t* vsptr = (uint8_t*)(is_v ? kv.v_sc : kv.k_sc);
+                            INK_CK(cudaMemcpy(vsptr + v_slot_off * sc_pos_bytes, src, (size_t)vn * sc_pos_bytes, cudaMemcpyHostToDevice));
+                            src += (size_t)vn * sc_pos_bytes;
+                        }
+                        if (hn > 0) {
+                            uint8_t* hsptr = (uint8_t*)(is_v ? runner_->h_kv_vsc_host[v] : runner_->h_kv_ksc_host[v]);
+                            std::memcpy(hsptr + h_slot_off * sc_pos_bytes, src, (size_t)hn * sc_pos_bytes);
+                            src += (size_t)hn * sc_pos_bytes;
+                        }
+                    }
+                }
+            } else if (in.swa_len > 0) {
+                const int ring_pos = in.swa_start % kv.cap_pos;
+                const int first = std::min(in.swa_len, kv.cap_pos - ring_pos);
+                const int second = in.swa_len - first;
+                const size_t slot_off = (size_t)slot * kv.vram_pos;
+                for (int is_v = 0; is_v < 2; ++is_v) {
+                    uint8_t* vptr = is_fp8
+                        ? (uint8_t*)(is_v ? kv.v_f8 : kv.k_f8)
+                        : (uint8_t*)(is_v ? kv.v_f16 : kv.k_f16);
+                    INK_CK(cudaMemcpy(vptr + (slot_off + ring_pos) * kv_pos_bytes, src, (size_t)first * kv_pos_bytes, cudaMemcpyHostToDevice));
+                    src += (size_t)first * kv_pos_bytes;
+                    if (second > 0) {
+                        INK_CK(cudaMemcpy(vptr + slot_off * kv_pos_bytes, src, (size_t)second * kv_pos_bytes, cudaMemcpyHostToDevice));
+                        src += (size_t)second * kv_pos_bytes;
+                    }
+                    if (is_fp8) {
+                        uint8_t* vsptr = (uint8_t*)(is_v ? kv.v_sc : kv.k_sc);
+                        INK_CK(cudaMemcpy(vsptr + (slot_off + ring_pos) * sc_pos_bytes, src, (size_t)first * sc_pos_bytes, cudaMemcpyHostToDevice));
+                        src += (size_t)first * sc_pos_bytes;
+                        if (second > 0) {
+                            INK_CK(cudaMemcpy(vsptr + slot_off * sc_pos_bytes, src, (size_t)second * sc_pos_bytes, cudaMemcpyHostToDevice));
+                            src += (size_t)second * sc_pos_bytes;
+                        }
+                    }
+                }
+            }
+        }
+        // Reset DSpark tap state (taps are not serialized; DSpark resumes cleanly once new taps arrive)
+        tree_snap_ready_ = false;
+        if (slot == 0) dspark_slot_ = -1;
         return true;
     }
 

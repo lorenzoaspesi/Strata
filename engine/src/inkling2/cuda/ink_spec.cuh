@@ -86,11 +86,10 @@ __global__ void __launch_bounds__(128) k_ink_commit_kv_all48(
         const size_t sbase = (((size_t)v * tree_cap + node) * kInkKVHeads + h) * kInkHeadDim + d;
         const float kv_val = stage_k[sbase];
         const float vv_val = stage_v[sbase];
-        const size_t dbase = (((size_t)slot0 * kv.cap_pos + p_idx) * kInkKVHeads + h) * kInkHeadDim;
 
         if (!kv.is_fp8) {
-            kv.k_f16[dbase + d] = __float2half(kv_val);
-            kv.v_f16[dbase + d] = __float2half(vv_val);
+            ink_kv_f16_ptr(kv, true,  slot0, p_idx, h)[d] = __float2half(kv_val);
+            ink_kv_f16_ptr(kv, false, slot0, p_idx, h)[d] = __float2half(vv_val);
         } else {
             float mk = warp_max(fabsf(kv_val));
             float mv = warp_max(fabsf(vv_val));
@@ -103,12 +102,11 @@ __global__ void __launch_bounds__(128) k_ink_commit_kv_all48(
             const float sc_v = amv > 0.0f ? (amv * (1.0f / 448.0f)) : 1.0f;
             const __nv_fp8_e4m3 qk(fminf(fmaxf(kv_val / sc_k, -448.0f), 448.0f));
             const __nv_fp8_e4m3 qv(fminf(fmaxf(vv_val / sc_v, -448.0f), 448.0f));
-            kv.k_f8[dbase + d] = qk.__x;
-            kv.v_f8[dbase + d] = qv.__x;
+            ink_kv_f8_ptr(kv, true,  slot0, p_idx, h)[d] = qk.__x;
+            ink_kv_f8_ptr(kv, false, slot0, p_idx, h)[d] = qv.__x;
             if (d == 0) {
-                const size_t sidx = ((size_t)slot0 * kv.cap_pos + p_idx) * kInkKVHeads + h;
-                kv.k_sc[sidx] = sc_k;
-                kv.v_sc[sidx] = sc_v;
+                *ink_kv_sc_ptr(kv, true,  slot0, p_idx, h) = sc_k;
+                *ink_kv_sc_ptr(kv, false, slot0, p_idx, h) = sc_v;
             }
             __syncthreads();
         }

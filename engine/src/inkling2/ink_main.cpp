@@ -390,6 +390,18 @@ int main(int argc, char** argv) {
             else if (kv == "k8v8" || kv == "i8" || kv == "q8") { cfg.bopts.kv_dtype = KvDtype::K8V8; cfg.bopts.kv_dtype_auto = false; }
             else if (kv == "k8v4") { cfg.bopts.kv_dtype = KvDtype::K8V4; cfg.bopts.kv_dtype_auto = false; }
             else { cfg.bopts.kv_dtype_auto = true; }
+        } else if (a == "--kv-resident") {
+            cfg.bopts.kv_resident = std::max(0, std::atoi(next().c_str()));
+        } else if (a == "--conversation-cache-mib") {
+            cfg.conversation_cache_mib = std::max<int64_t>(0, std::atoll(next().c_str()));
+        } else if (a == "--conversation-spill-mib") {
+            cfg.conversation_spill_mib = std::max<int64_t>(0, std::atoll(next().c_str()));
+        } else if (a == "--conversation-spill-dir") {
+            cfg.conversation_spill_dir = next();
+        } else if (a == "--conversation-cache-min-free-mib") {
+            (void)next();
+        } else if (a == "--session-save-reclaim") {
+            // accepted for parity with main strata engine
         } else if (a == "--draft") {
             cfg.draft_mode = next();
             cfg.bopts.enable_dspark = (cfg.draft_mode != "off");

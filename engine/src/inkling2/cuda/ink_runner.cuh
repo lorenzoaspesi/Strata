@@ -384,6 +384,13 @@ struct InkCudaRunner {
 
     // KV Cache (48 visits: 40 SWA, 8 Global)
     InkKvVisitDesc kv_desc[kInkVisits]{};
+    // Host pinned backing pointers for Global KV overflow tier (when kv_desc[v].host_pos > 0)
+    void* h_kv_k_host[kInkVisits]   = {};
+    void* h_kv_v_host[kInkVisits]   = {};
+    void* h_kv_ksc_host[kInkVisits] = {};
+    void* h_kv_vsc_host[kInkVisits] = {};
+    int   kv_vram_pos = 0;
+    int   kv_host_pos = 0;
     // ShortConv state pool: [48 visits] x 4 states (k [1024], v [1024], attn [2304], mlp [2304]) -> 1 contiguous buffer!
     // Layout: visit -> [max_slots, 3, 6656] F32 (or 256 MB for 64 slots)
     float* d_sconv_pool[kInkVisits] = {};
@@ -484,7 +491,7 @@ struct InkCudaRunner {
 
     InkCudaRunner(InkCudaModel& model) : m(model) {}
 
-    void init(int slots, int ctx, int chunk, InkKvDtype kvd = InkKvDtype::FP16) {
+    void init(int slots, int ctx, int chunk, InkKvDtype kvd = InkKvDtype::FP16, size_t extra_post_reserve = 0, int kv_resident_req = -1) {
         max_slots = std::max(1, slots);
         max_ctx = std::max(64, ctx);
         max_batch = std::max(chunk, std::max(16, max_slots));
@@ -515,21 +522,27 @@ struct InkCudaRunner {
             const size_t sc_per_pos = (kv_dtype == InkKvDtype::FP8) ? (size_t)(2 * kInkKVHeads * 4) : 0;
             const size_t swa_kv_bytes = (size_t)40 * max_slots * swa_ring * ((size_t)kInkKVDim * bpe + sc_per_pos);
             const size_t sconv_bytes  = (size_t)kInkVisits * max_slots * 3 * kInkSconvCh * 4;
-            const size_t ws_reserve   = (max_slots >= 8) ? (1400ull << 20) : (480ull << 20);  // activation workspaces + DSpark + cuBLAS headroom
+            const size_t ws_reserve   = ((max_slots >= 8) ? (1400ull << 20) : (480ull << 20)) + extra_post_reserve;  // activation workspaces + DSpark + cuBLAS headroom
+            int fit_ctx = 0;
             if (vfree > swa_kv_bytes + sconv_bytes + ws_reserve) {
                 const size_t avail_glob = vfree - swa_kv_bytes - sconv_bytes - ws_reserve;
                 const size_t per_pos_glob = (size_t)8 * max_slots * ((size_t)kInkKVDim * bpe + sc_per_pos);
-                const int fit_ctx = (int)std::min<size_t>((size_t)max_ctx, (avail_glob / std::max<size_t>(1, per_pos_glob)) & ~(size_t)63);
-                if (fit_ctx < max_ctx) {
-                    const int clamped = std::max(256, fit_ctx);
-                    std::fprintf(stderr, "[InkCUDA] Auto-sizing max_ctx %d -> %d for parallel=%d (%.2f GiB free VRAM)\n",
-                                 max_ctx, clamped, max_slots, (double)vfree / (1024.0 * 1024.0 * 1024.0));
-                    max_ctx = clamped;
-                }
-            } else if (max_ctx > 256) {
-                std::fprintf(stderr, "[InkCUDA] Tight VRAM (%.2f GiB free) for parallel=%d: clamping max_ctx %d -> 256\n",
-                             (double)vfree / (1024.0 * 1024.0 * 1024.0), max_slots, max_ctx);
-                max_ctx = 256;
+                fit_ctx = (int)std::min<size_t>((size_t)max_ctx, (avail_glob / std::max<size_t>(1, per_pos_glob)) & ~(size_t)63);
+            }
+            if (kv_resident_req >= 0) {
+                kv_vram_pos = std::min(max_ctx, std::min(kv_resident_req, fit_ctx));
+            } else {
+                kv_vram_pos = std::min(max_ctx, fit_ctx);
+            }
+            kv_vram_pos = std::max(0, kv_vram_pos & ~63);
+            kv_host_pos = max_ctx - kv_vram_pos;
+            if (kv_host_pos > 0) {
+                const size_t per_pos_glob = (size_t)8 * max_slots * ((size_t)kInkKVDim * bpe + sc_per_pos);
+                const double host_gib = (double)((size_t)kv_host_pos * per_pos_glob) / (1024.0 * 1024.0 * 1024.0);
+                std::fprintf(stderr, "[InkCUDA] Global KV tiered: %d tokens VRAM + %d tokens mapped host RAM = %d max_ctx (%s, %.2f GiB host, %.2f GiB free VRAM)\n",
+                             kv_vram_pos, kv_host_pos, max_ctx,
+                             (kv_dtype == InkKvDtype::FP8) ? "fp8" : "fp16",
+                             host_gib, (double)vfree / (1024.0 * 1024.0 * 1024.0));
             }
         }
 
@@ -538,18 +551,44 @@ struct InkCudaRunner {
             const int ip = ink_visit_phys(v);
             const bool swa = m.man.c.is_swa[ip] != 0;
             const int cap = swa ? swa_ring : max_ctx;
-            kv_desc[v].cap_pos = cap;
-            kv_desc[v].is_swa = swa;
-            kv_desc[v].is_fp8 = (kv_dtype == InkKvDtype::FP8);
-            const size_t elems = (size_t)max_slots * cap * kInkKVHeads * kInkHeadDim;
+            const int vpos = swa ? swa_ring : kv_vram_pos;
+            const int hpos = swa ? 0 : kv_host_pos;
+            kv_desc[v] = {};
+            kv_desc[v].cap_pos  = cap;
+            kv_desc[v].vram_pos = vpos;
+            kv_desc[v].host_pos = hpos;
+            kv_desc[v].is_swa   = swa;
+            kv_desc[v].is_fp8   = (kv_dtype == InkKvDtype::FP8);
+            const size_t v_elems = (size_t)max_slots * vpos * kInkKVHeads * kInkHeadDim;
+            const size_t h_elems = (size_t)max_slots * hpos * kInkKVHeads * kInkHeadDim;
             if (!kv_desc[v].is_fp8) {
-                kv_desc[v].k_f16 = dalloc<__half>(elems);
-                kv_desc[v].v_f16 = dalloc<__half>(elems);
+                if (v_elems > 0) {
+                    kv_desc[v].k_f16 = dalloc<__half>(v_elems);
+                    kv_desc[v].v_f16 = dalloc<__half>(v_elems);
+                }
+                if (h_elems > 0) {
+                    INK_CK(cudaHostAlloc(&h_kv_k_host[v], h_elems * sizeof(__half), cudaHostAllocMapped));
+                    INK_CK(cudaHostAlloc(&h_kv_v_host[v], h_elems * sizeof(__half), cudaHostAllocMapped));
+                    INK_CK(cudaHostGetDevicePointer(&kv_desc[v].k_f16_host, h_kv_k_host[v], 0));
+                    INK_CK(cudaHostGetDevicePointer(&kv_desc[v].v_f16_host, h_kv_v_host[v], 0));
+                }
             } else {
-                kv_desc[v].k_f8 = dalloc<uint8_t>(elems);
-                kv_desc[v].v_f8 = dalloc<uint8_t>(elems);
-                kv_desc[v].k_sc = dalloc<float>((size_t)max_slots * cap * kInkKVHeads);
-                kv_desc[v].v_sc = dalloc<float>((size_t)max_slots * cap * kInkKVHeads);
+                if (v_elems > 0) {
+                    kv_desc[v].k_f8 = dalloc<uint8_t>(v_elems);
+                    kv_desc[v].v_f8 = dalloc<uint8_t>(v_elems);
+                    kv_desc[v].k_sc = dalloc<float>((size_t)max_slots * vpos * kInkKVHeads);
+                    kv_desc[v].v_sc = dalloc<float>((size_t)max_slots * vpos * kInkKVHeads);
+                }
+                if (h_elems > 0) {
+                    INK_CK(cudaHostAlloc(&h_kv_k_host[v], h_elems * sizeof(uint8_t), cudaHostAllocMapped));
+                    INK_CK(cudaHostAlloc(&h_kv_v_host[v], h_elems * sizeof(uint8_t), cudaHostAllocMapped));
+                    INK_CK(cudaHostAlloc(&h_kv_ksc_host[v], (size_t)max_slots * hpos * kInkKVHeads * sizeof(float), cudaHostAllocMapped));
+                    INK_CK(cudaHostAlloc(&h_kv_vsc_host[v], (size_t)max_slots * hpos * kInkKVHeads * sizeof(float), cudaHostAllocMapped));
+                    INK_CK(cudaHostGetDevicePointer(&kv_desc[v].k_f8_host, h_kv_k_host[v], 0));
+                    INK_CK(cudaHostGetDevicePointer(&kv_desc[v].v_f8_host, h_kv_v_host[v], 0));
+                    INK_CK(cudaHostGetDevicePointer(&kv_desc[v].k_sc_host, h_kv_ksc_host[v], 0));
+                    INK_CK(cudaHostGetDevicePointer(&kv_desc[v].v_sc_host, h_kv_vsc_host[v], 0));
+                }
             }
             d_sconv_pool[v] = dalloc<float>((size_t)max_slots * 3 * kInkSconvCh);
             INK_CK(cudaMemset(d_sconv_pool[v], 0, (size_t)max_slots * 3 * kInkSconvCh * sizeof(float)));
@@ -1452,8 +1491,8 @@ struct InkCudaRunner {
         INK_CK(cudaMemcpyAsync(d_tok_ids, slot_buf, (size_t)M * 4, cudaMemcpyHostToDevice, st));
         INK_CK(cudaMemcpyAsync(d_pos, h_pos, (size_t)M * 4, cudaMemcpyHostToDevice, st));
 
-        // Use CUDA Graph for single-token / small-M decode!
-        if (use_cuda_graph && !has_img_step && max_passes_override == 0 && M == 1 && slot0 == 0) {
+        // Use CUDA Graph for single-token / small-M decode (skip when M=1 PCIe+CPU split is active)!
+        if (use_cuda_graph && !has_img_step && max_passes_override == 0 && M == 1 && slot0 == 0 && !m.hybrid.pcie_decode_enabled()) {
             GraphKey key{M, 0, want_taps ? 1 : 0, (int)kv_dtype};
             cudaGraphExec_t exec = nullptr;
             for (const auto& e : graph_cache) if (e.key == key) { exec = e.exec; break; }
@@ -1524,7 +1563,7 @@ struct InkCudaRunner {
         INK_CK(cudaMemcpyAsync(d_slots, slot_buf + B, (size_t)B * 4, cudaMemcpyHostToDevice, st));
         INK_CK(cudaMemcpyAsync(d_pos, slot_buf + 2 * B, (size_t)B * 4, cudaMemcpyHostToDevice, st));
 
-        if (use_cuda_graph && B <= 64 && (m.n_host_experts == 0 || B == 1)) {
+        if (use_cuda_graph && B <= 64 && (m.n_host_experts == 0 || (B == 1 && !m.hybrid.pcie_decode_enabled()))) {
             GraphKey key{B, 10, want_taps ? 1 : 0, (int)kv_dtype};
             cudaGraphExec_t exec = nullptr;
             for (const auto& e : graph_cache) if (e.key == key) { exec = e.exec; break; }
@@ -1617,6 +1656,11 @@ struct InkCudaRunner {
             if (kv_desc[v].v_f8)  cudaFree(kv_desc[v].v_f8);
             if (kv_desc[v].k_sc)  cudaFree(kv_desc[v].k_sc);
             if (kv_desc[v].v_sc)  cudaFree(kv_desc[v].v_sc);
+            if (h_kv_k_host[v])   { cudaFreeHost(h_kv_k_host[v]);   h_kv_k_host[v]   = nullptr; }
+            if (h_kv_v_host[v])   { cudaFreeHost(h_kv_v_host[v]);   h_kv_v_host[v]   = nullptr; }
+            if (h_kv_ksc_host[v]) { cudaFreeHost(h_kv_ksc_host[v]); h_kv_ksc_host[v] = nullptr; }
+            if (h_kv_vsc_host[v]) { cudaFreeHost(h_kv_vsc_host[v]); h_kv_vsc_host[v] = nullptr; }
+            kv_desc[v] = {};
             if (d_sconv_pool[v])  cudaFree(d_sconv_pool[v]);
         }
         auto fr = [](auto*& p) { if (p) { cudaFree(p); p = nullptr; } };

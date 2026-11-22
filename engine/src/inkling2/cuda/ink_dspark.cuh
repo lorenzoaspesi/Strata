@@ -1073,6 +1073,15 @@ struct InkDSpark {
     uint16_t* d_bf16_pool = nullptr;
     __half*   d_unembed_fp16 = nullptr;  // Optional FP16 unembed on V100 sm_70 (32GB) -> 0.67 ms TC screening!
     bool cache_is_fp16 = false;
+    bool ctx_is_host_mapped = false;
+    __half* h_ctx_k[3] = {};
+    __half* h_ctx_v[3] = {};
+    float*  h_f_rnn = nullptr;
+
+    static size_t ctx_vram_bytes(int ctx) noexcept {
+        return (size_t)ctx * (3ull * 2ull * kInkKVHeads * kInkHeadDim * sizeof(__half)
+                            + (size_t)kInkHidden * sizeof(float));
+    }
 
     InkDSpark(InkCudaRunner& runner) : r(runner), m(runner.m) {}
 
@@ -1080,11 +1089,31 @@ struct InkDSpark {
         if (!m.man.has_dspark) return;
         max_ctx = ctx;
         K_cand = k_cand;
-        for (int il = 0; il < 3; ++il) {
-            d_ctx_k[il] = dalloc<__half>((size_t)max_ctx * kInkKVHeads * kInkHeadDim);
-            d_ctx_v[il] = dalloc<__half>((size_t)max_ctx * kInkKVHeads * kInkHeadDim);
+        size_t vf_ctx = 0, vt_ctx = 0;
+        INK_CK(ink_cuda_mem_info(&vf_ctx, &vt_ctx));
+        const size_t need_ctx = ctx_vram_bytes(max_ctx);
+        // If VRAM is tight (e.g. 8/12 GB GPUs or long 256K context), place DSpark's context buffers in
+        // mapped pinned host RAM so DSpark engages cleanly without OOM!
+        if (vf_ctx < need_ctx + (320ull << 20)) {
+            ctx_is_host_mapped = true;
+            for (int il = 0; il < 3; ++il) {
+                INK_CK(cudaHostAlloc(&h_ctx_k[il], (size_t)max_ctx * kInkKVHeads * kInkHeadDim * sizeof(__half), cudaHostAllocMapped));
+                INK_CK(cudaHostAlloc(&h_ctx_v[il], (size_t)max_ctx * kInkKVHeads * kInkHeadDim * sizeof(__half), cudaHostAllocMapped));
+                INK_CK(cudaHostGetDevicePointer(&d_ctx_k[il], h_ctx_k[il], 0));
+                INK_CK(cudaHostGetDevicePointer(&d_ctx_v[il], h_ctx_v[il], 0));
+            }
+            INK_CK(cudaHostAlloc(&h_f_rnn, (size_t)max_ctx * kInkHidden * sizeof(float), cudaHostAllocMapped));
+            INK_CK(cudaHostGetDevicePointer(&d_f_rnn, h_f_rnn, 0));
+            std::fprintf(stderr, "[InkDSpark] Using mapped pinned host RAM for DSpark context (ctx=%d, %.0f MiB; %.0f MiB VRAM free)\n",
+                         max_ctx, (double)need_ctx / (1024.0 * 1024.0), (double)vf_ctx / (1024.0 * 1024.0));
+        } else {
+            ctx_is_host_mapped = false;
+            for (int il = 0; il < 3; ++il) {
+                d_ctx_k[il] = dalloc<__half>((size_t)max_ctx * kInkKVHeads * kInkHeadDim);
+                d_ctx_v[il] = dalloc<__half>((size_t)max_ctx * kInkKVHeads * kInkHeadDim);
+            }
+            d_f_rnn = dalloc<float>((size_t)max_ctx * kInkHidden);
         }
-        d_f_rnn = dalloc<float>((size_t)max_ctx * kInkHidden);
 
         const int B = kInkDsparkBlock;  // 8
         d_cur         = dalloc<float>(B * kInkHidden);
@@ -1662,12 +1691,22 @@ struct InkDSpark {
         bf16_cache.clear();
         if (d_bf16_pool) { cudaFree(d_bf16_pool); d_bf16_pool = nullptr; }
         if (d_unembed_fp16) { cudaFree(d_unembed_fp16); d_unembed_fp16 = nullptr; }
-        for (int il = 0; il < 3; ++il) {
-            if (d_ctx_k[il]) { cudaFree(d_ctx_k[il]); d_ctx_k[il] = nullptr; }
-            if (d_ctx_v[il]) { cudaFree(d_ctx_v[il]); d_ctx_v[il] = nullptr; }
+        if (ctx_is_host_mapped) {
+            for (int il = 0; il < 3; ++il) {
+                if (h_ctx_k[il]) { cudaFreeHost(h_ctx_k[il]); h_ctx_k[il] = nullptr; d_ctx_k[il] = nullptr; }
+                if (h_ctx_v[il]) { cudaFreeHost(h_ctx_v[il]); h_ctx_v[il] = nullptr; d_ctx_v[il] = nullptr; }
+            }
+            if (h_f_rnn) { cudaFreeHost(h_f_rnn); h_f_rnn = nullptr; d_f_rnn = nullptr; }
+            ctx_is_host_mapped = false;
+        } else {
+            for (int il = 0; il < 3; ++il) {
+                if (d_ctx_k[il]) { cudaFree(d_ctx_k[il]); d_ctx_k[il] = nullptr; }
+                if (d_ctx_v[il]) { cudaFree(d_ctx_v[il]); d_ctx_v[il] = nullptr; }
+            }
+            if (d_f_rnn) { cudaFree(d_f_rnn); d_f_rnn = nullptr; }
         }
         auto fr = [](auto*& p) { if (p) { cudaFree(p); p = nullptr; } };
-        fr(d_f_rnn); fr(d_cur); fr(d_h); fr(d_q); fr(d_k); fr(d_v); fr(d_qkv_fused); fr(d_gu_fused); fr(d_attn_out);
+        fr(d_cur); fr(d_h); fr(d_q); fr(d_k); fr(d_v); fr(d_qkv_fused); fr(d_gu_fused); fr(d_attn_out);
         fr(d_proj); fr(d_g); fr(d_u); fr(d_act); fr(d_ctx_tmp); fr(d_kc_tmp); fr(d_vc_tmp); fr(d_kv_ctx_fused);
         fr(d_base_logits); fr(d_cand_ids); fr(d_cand_base); fr(d_top_tmp_ids); fr(d_top_tmp_vals); fr(d_h_q8); fr(d_h_sc); fr(d_cand_scores);
         fr(d_rnn_state); fr(d_rnn_joint); fr(d_rnn_proj); fr(d_rnn_lat);

@@ -28,6 +28,7 @@ struct BackendOpts {
     double ram_experts_gb = -1.0;  // <0 = auto
     KvDtype kv_dtype = KvDtype::FP16;
     bool kv_dtype_auto = true;   // auto selects FP8_E4M3 when parallel >= 16 on <= 32 GiB GPU
+    int kv_resident = -1;        // >= 0 caps global KV tokens in VRAM; overflow spills to mapped pinned host RAM (-1 = auto)
     bool enable_dspark = true;
     std::string dspark_path;     // optional external mtp.safetensors or dspark-*.gguf
     std::string vision_path;
@@ -42,6 +43,21 @@ struct BackendStats {
     int active_slots = 0;
     int max_slots = 1;
     KvDtype kv_dtype = KvDtype::FP16;
+};
+
+struct InkSlotSnapshot {
+    uint64_t model_fp = 0;
+    uint64_t config_fp = 0;
+    int32_t  n_tokens = 0;
+    int32_t  kv_is_fp8 = 0;
+    int32_t  swa_len = 0;
+    int32_t  swa_start = 0;
+    std::vector<int32_t> tokens;
+    std::vector<uint8_t> payload;
+
+    size_t total_bytes() const noexcept {
+        return tokens.size() * sizeof(int32_t) + payload.size();
+    }
 };
 
 class InkBackend {
@@ -107,6 +123,18 @@ public:
 
     // Verify Section 5 selfcheck / golden ops parity on this backend
     virtual bool selfcheck(std::string& err) = 0;
+
+    // Export / import full conversation state for one slot (ShortConv4 + 8 Global KV + 40 SWA-1024 KV)
+    virtual bool export_slot(int slot, int n_tokens, InkSlotSnapshot& out, std::string& err) {
+        (void)slot; (void)n_tokens; (void)out;
+        err = "slot export not supported on this backend";
+        return false;
+    }
+    virtual bool import_slot(int slot, const InkSlotSnapshot& in, std::string& err) {
+        (void)slot; (void)in;
+        err = "slot import not supported on this backend";
+        return false;
+    }
 };
 
 // Factory functions (CPU always built; GPU backends plug in via CMake compile definitions!)

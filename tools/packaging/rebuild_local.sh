@@ -241,9 +241,9 @@ docker run --rm \
 
         . /src/tools/packaging/engine_targets.sh
         TARGETS="$(engine_targets cmake "/src/$BUILD_REL")"
-        EXTRA_TARGETS=()
+        EXTRA_TARGETS=(strata-inkling)
         if [[ "$RUN_TESTS" -eq 1 ]]; then
-            EXTRA_TARGETS=(conversation_file_test session_save_reclaim_test conversation_snapshot_test)
+            EXTRA_TARGETS+=(conversation_file_test session_save_reclaim_test conversation_snapshot_test)
         fi
         cmake --build "/src/$BUILD_REL" --target $TARGETS "${EXTRA_TARGETS[@]}" -j "$(nproc)"
 
@@ -337,6 +337,42 @@ docker run --rm \
         python3 /src/tools/packaging/package_engine.py --verify "$PKG_FOLDER"
         python3 /src/tools/packaging/binary_deps.py "$PKG_FOLDER"
         rm -rf "$STAGE_DIR"
+
+        # Package local strata-inkling shape-engine component (sm_61 CUDA 12) when built
+        INK_BIN="/src/$BUILD_REL/src/inkling2/strata-inkling"
+        if [[ -x "$INK_BIN" ]]; then
+            INK_STAGE="/src/$BUILD_REL/stage-pkg-inkling"
+            INK_OUT="/src/$BUILD_REL/out-pkg-inkling"
+            rm -rf "$INK_STAGE" "$INK_OUT"
+            mkdir -p "$INK_STAGE" "$INK_OUT"
+            cp "$INK_BIN" "$INK_STAGE/strata-inkling"
+            chmod 0755 "$INK_STAGE/strata-inkling"
+            printf "{\"version\": \"%s\", \"source\": \"tools/packaging/rebuild_local.sh\", \"shape\": \"inkling2\", \"archs\": [%s], \"ptx\": true, \"cuda\": \"%s\", \"portable\": true}\n" \
+                "$PKG_VER" "$CUDA_ARCH" "$CUDA_FULL" > "$INK_STAGE/BUILD.json"
+            python3 /src/tools/packaging/collect_libs.py \
+                --binary "$INK_STAGE/strata-inkling" \
+                --search /usr/local/cuda/lib64 \
+                --out "$INK_STAGE" \
+                --also "libcublasLt.so*" \
+                --bundle-system "libgomp.so*"
+            python3 /src/tools/packaging/package_engine.py \
+                --src "$INK_STAGE" \
+                --backend cuda \
+                --shape inkling2 \
+                --version "$PKG_VER" \
+                --out "$INK_OUT" \
+                --arch "sm_${CUDA_ARCH}" \
+                --arch "compute_${CUDA_ARCH}" \
+                --min-driver nvidia=575.51 \
+                --variant cuda12 \
+                --platform linux-x86_64 \
+                --build-id "$BUILD_ID" \
+                --include SYSTEM-LIBS.txt
+            INK_PKG_FOLDER="$INK_OUT/${PKG_VER}-linux-x86_64-cuda-cuda12"
+            python3 /src/tools/packaging/package_engine.py --verify "$INK_PKG_FOLDER"
+            python3 /src/tools/packaging/binary_deps.py "$INK_PKG_FOLDER"
+            rm -rf "$INK_STAGE"
+        fi
     '
 
 BUILT_PKG="$BUILD_ABS/out-pkg/${PKG_VER}-linux-x86_64-cuda-cuda12"
@@ -372,6 +408,26 @@ if [[ -d "$DEST_PKG" ]]; then
 fi
 mv "$TMP_DEST" "$DEST_PKG"
 rm -rf "$BUILD_ABS/out-pkg"
+
+BUILT_INK_PKG="$BUILD_ABS/out-pkg-inkling/${PKG_VER}-linux-x86_64-cuda-cuda12"
+if [[ -d "$BUILT_INK_PKG" ]]; then
+    DEST_INK_DIR="$COMPONENTS_DIR/shapes/inkling2/engine"
+    DEST_INK_PKG="$DEST_INK_DIR/$ENGINE_FOLDER_NAME"
+    mkdir -p "$DEST_INK_DIR"
+    echo "==> Installing strata-inkling shape-engine component to $DEST_INK_PKG"
+    TMP_INK="$DEST_INK_DIR/.${ENGINE_FOLDER_NAME}.installing.$$"
+    rm -rf "$TMP_INK"
+    cp -a "$BUILT_INK_PKG" "$TMP_INK"
+    python3 "$STRATA_REPO/tools/packaging/package_engine.py" --verify "$TMP_INK"
+    OLD_INK_DEST=""
+    if [[ -d "$DEST_INK_PKG" ]]; then
+        OLD_INK_DEST="$DEST_INK_DIR/.${ENGINE_FOLDER_NAME}.old.$$"
+        mv "$DEST_INK_PKG" "$OLD_INK_DEST"
+    fi
+    mv "$TMP_INK" "$DEST_INK_PKG"
+    [[ -n "$OLD_INK_DEST" ]] && rm -rf "$OLD_INK_DEST"
+    rm -rf "$BUILD_ABS/out-pkg-inkling"
+fi
 
 echo "==> Staging and activating Control component $PKG_VER from $STRATA_REPO"
 PYTHONDONTWRITEBYTECODE=1 python3 "$STRATA_REPO/tools/packaging/stage_local_control.py" \
