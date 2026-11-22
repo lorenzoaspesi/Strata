@@ -135,6 +135,10 @@ public:
         err = "slot import not supported on this backend";
         return false;
     }
+    // Lightweight prompt-end ShortConv4 checkpoint for multi-turn prefix reuse past discarded thinking (#6627)
+    virtual bool save_prompt_checkpoint(int slot, int n_tokens) { (void)slot; (void)n_tokens; return false; }
+    virtual bool restore_prompt_checkpoint(int slot, int n_tokens) { (void)slot; (void)n_tokens; return false; }
+    virtual int  swa_slack() const noexcept { return 0; }
 };
 
 // Factory functions (CPU always built; GPU backends plug in via CMake compile definitions!)

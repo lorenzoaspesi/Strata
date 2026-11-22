@@ -735,6 +735,8 @@ struct InkHybridEngine {
     std::vector<int> promo_owner;        // [n_promo_slots] -> expert key or -1
     std::vector<int> key_to_slot;        // [3072] -> slot or -1
     std::vector<uint64_t> orig_host_off; // [3072] original tier-1/2 offset
+    std::vector<float> h_use_cnt;        // [3072] host-side decayed frequency tracker (works in PCIe+DSpark mode!)
+    std::vector<int>   h_miss_keys;      // recent host expert misses for end-of-step promotion
     cudaStream_t promo_st = nullptr;
 
     // Double-Buffered Prefill Streaming Arena (2 x 16..64 MiB ping-pong VRAM buffers + pinned descriptors!)
@@ -935,32 +937,90 @@ struct InkHybridEngine {
         active = true;
     }
 
-    // Allocate ping-pong prefill streaming buffers (2 x 64 MiB) + optional dynamic decode promotion ring!
+    // Allocate ping-pong prefill streaming buffers (2 x 16..64 MiB) + dynamic decode promotion ring!
     void alloc_staging(size_t max_exp_bytes, size_t vram_avail) {
         if (!active) return;
         const size_t align_b = (max_exp_bytes + 255ull) & ~255ull;
         promo_slot_bytes = align_b;
-        // Reserve 2 x 16..64 MiB ping-pong staging buffers for ultra-fast prefill DMA streaming!
+        // On tight 8-12 GB cards (vram_avail <= 256 MiB), use 2 x 16 MiB ping-pong buffers (5-6 experts/chunk,
+        // still saturates PCIe 3.0 x16!) so ~120+ MiB stays free for the dynamic hot-expert promotion ring!
         if (vram_avail > (48ull << 20)) {
+            const size_t cap_each = (vram_avail <= (256ull << 20)) ? (16ull << 20) : (64ull << 20);
             const size_t max_each = (vram_avail - (16ull << 20)) / 2;
-            pf_stage_bytes = std::min<size_t>(64ull << 20, std::min(max_each, std::max<size_t>(16 * align_b, 32ull << 20)));
+            pf_stage_bytes = std::min<size_t>(cap_each, std::min(max_each, std::max<size_t>(6 * align_b, 16ull << 20)));
             pf_stage_bytes = std::max(pf_stage_bytes, align_b);
             INK_CK(cudaMalloc(&d_pf_stage[0], pf_stage_bytes));
             INK_CK(cudaMalloc(&d_pf_stage[1], pf_stage_bytes));
             vram_avail -= 2 * pf_stage_bytes;
         }
-        // Remaining spare VRAM (> 64 MiB headroom) becomes dynamic decayed-frequency promotion ring!
-        if (vram_avail > (96ull << 20) && align_b > 0) {
-            const size_t ring_bytes = std::min<size_t>(256ull << 20, vram_avail - (64ull << 20));
+        // Remaining spare VRAM (> 32 MiB headroom) becomes dynamic decayed-frequency promotion ring!
+        if (vram_avail > (48ull << 20) && align_b > 0) {
+            const size_t ring_bytes = std::min<size_t>(256ull << 20, vram_avail - (32ull << 20));
             n_promo_slots = (int)(ring_bytes / align_b);
             if (n_promo_slots >= 4) {
                 INK_CK(cudaMalloc(&d_promo_pool, (size_t)n_promo_slots * align_b));
                 promo_owner.assign(n_promo_slots, -1);
                 key_to_slot.assign(n_layers * n_experts, -1);
+                h_use_cnt.assign(n_layers * n_experts, 0.0f);
             } else {
                 n_promo_slots = 0;
             }
         }
+    }
+
+    // Record a host-expert miss during M<=16 PCIe decode/verify for end-of-step promotion
+    void record_host_miss(int key) {
+        if (n_promo_slots <= 0 || key < 0 || key >= (int)h_use_cnt.size()) return;
+        h_use_cnt[key] += 1.0f;
+        if (h_miss_keys.size() < 64) h_miss_keys.push_back(key);
+    }
+
+    // Host-driven promotion step (runs after M=1 or DSpark verify steps when n_promo_slots > 0)
+    void step_promote_host(uint8_t* d_sec4, InkExpertDev* const d_experts[24], cudaStream_t main_st) {
+        if (!active || n_promo_slots <= 0 || h_miss_keys.empty()) return;
+        std::sort(h_miss_keys.begin(), h_miss_keys.end(), [&](int a, int b) { return h_use_cnt[a] > h_use_cnt[b]; });
+        int promoted = 0;
+        for (int key : h_miss_keys) {
+            if (promoted >= 4) break;
+            if (key < 0 || key >= n_layers * n_experts || !host_meta[key].body) continue;
+            if (key_to_slot[key] >= 0) continue;
+            int victim = -1;
+            float vmin = h_use_cnt[key];
+            for (int sl = 0; sl < n_promo_slots; ++sl) {
+                if (promo_owner[sl] < 0) { victim = sl; break; }
+                if (h_use_cnt[promo_owner[sl]] < vmin) { vmin = h_use_cnt[promo_owner[sl]]; victim = sl; }
+            }
+            if (victim < 0) continue;
+            const int old_key = promo_owner[victim];
+            if (old_key >= 0) {
+                key_to_slot[old_key] = -1;
+                InkExpertDev dem{};
+                const auto& om = host_meta[old_key];
+                dem.body_off = orig_host_off[old_key];
+                dem.dn_off   = om.dn_off;
+                dem.gu_code  = om.gu_code;
+                dem.dn_code  = om.dn_code;
+                dem.tier     = 2;
+                INK_CK(cudaMemcpyAsync(&d_experts[old_key / n_experts][old_key % n_experts], &dem, sizeof(dem), cudaMemcpyHostToDevice, promo_st));
+            }
+            const auto& nm = host_meta[key];
+            uint8_t* dst_slot = d_promo_pool + (size_t)victim * promo_slot_bytes;
+            INK_CK(cudaMemcpyAsync(dst_slot, nm.body, nm.body_bytes, cudaMemcpyHostToDevice, promo_st));
+            InkExpertDev pro{};
+            pro.body_off = (uint64_t)((intptr_t)dst_slot - (intptr_t)d_sec4);
+            pro.dn_off   = nm.dn_off;
+            pro.gu_code  = nm.gu_code;
+            pro.dn_code  = nm.dn_code;
+            pro.tier     = 0;
+            INK_CK(cudaMemcpyAsync(&d_experts[key / n_experts][key % n_experts], &pro, sizeof(pro), cudaMemcpyHostToDevice, promo_st));
+            promo_owner[victim] = key;
+            key_to_slot[key] = victim;
+            ++promoted;
+        }
+        h_miss_keys.clear();
+        if (promoted > 0) INK_CK(cudaStreamSynchronize(promo_st));
+        for (float& c : h_use_cnt) c *= 0.96f;
+        (void)main_st;
     }
 
     // Token-end decayed-frequency promotion: promote up to 4 hottest cold experts into VRAM ring asynchronously!
@@ -1210,6 +1270,7 @@ inline void launch_ink_moe_hybrid(
                 if (hyb.host_meta[key].body != nullptr &&
                     (hyb.key_to_slot.empty() || hyb.key_to_slot[key] < 0)) {
                     ++hit_cnt[e];
+                    hyb.record_host_miss(key);
                 }
             }
             // Experts shared by >= 2 tokens ALWAYS go to GPU over PCIe (1 transfer amortizes across multiple tokens!).

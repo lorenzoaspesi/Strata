@@ -1551,6 +1551,7 @@ struct InkCudaRunner {
             return;
         }
         emit_48_visits(M, 2, slot0, p0, want_taps);
+        if (m.hybrid.active && m.n_host_experts > 0) m.hybrid.step_promote_host(m.d_sec4, m.d_experts, st);
     }
 
     // Batched multi-slot 1-token-per-slot step (B = 1..64 concurrent requests, captured in CUDA Graph when 100% VRAM!)

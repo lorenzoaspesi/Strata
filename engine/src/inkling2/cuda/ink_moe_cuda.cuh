@@ -2483,7 +2483,7 @@ __device__ __forceinline__ void dequant_sk_row_f32(
 }
 
 template <bool GU>
-__global__ void __launch_bounds__(128) k_ink_dequant_expert_f32(
+__global__ void __launch_bounds__(256) k_ink_dequant_expert_f32(
     const uint8_t* __restrict__ sec4_base,
     const InkExpertDev* __restrict__ experts,
     int eid,
@@ -2616,8 +2616,8 @@ inline void launch_ink_moe_dispatch_only(
             const int row0 = ws.h_off_pin[e];
             const int cnt  = ws.h_off_pin[e + 1] - row0;
             if (cnt <= 0) continue;
-            // 1. Dequantize Gate+Up [2304, 2304] ONCE, run cublasSgemm in <=128-row slices
-            k_ink_dequant_expert_f32<true><<<2 * kInkInter, 128, 0, st>>>(sec4_base, experts, e, ws.pf_w_f32);
+            // 1. Dequantize Gate+Up [2304, 2304] ONCE (256 threads/row), run cublasSgemm in <=128-row slices
+            k_ink_dequant_expert_f32<true><<<2 * kInkInter, 256, 0, st>>>(sec4_base, experts, e, ws.pf_w_f32);
             for (int r0 = 0; r0 < cnt; r0 += 128) {
                 const int nr = std::min(128, cnt - r0);
                 k_ink_moe_gather_x<<<nr, 256, 0, st>>>(x_f32, ws.tb.tok_idx + row0 + r0, ws.pf_x_f32, nr);
@@ -2629,8 +2629,8 @@ inline void launch_ink_moe_dispatch_only(
                 k_ink_moe_situ_store<<<nr, 256, 0, st>>>(
                     sec4_base, experts, e, ws.pf_y_f32, ws.h_f32 + (size_t)(row0 + r0) * kInkInter, nr);
             }
-            // 2. Dequantize Down [2304, 1152] ONCE, run cublasSgemm in <=128-row slices
-            k_ink_dequant_expert_f32<false><<<kInkHidden, 128, 0, st>>>(sec4_base, experts, e, ws.pf_w_f32);
+            // 2. Dequantize Down [2304, 1152] ONCE (256 threads/row), run cublasSgemm in <=128-row slices
+            k_ink_dequant_expert_f32<false><<<kInkHidden, 256, 0, st>>>(sec4_base, experts, e, ws.pf_w_f32);
             for (int r0 = 0; r0 < cnt; r0 += 128) {
                 const int nr = std::min(128, cnt - r0);
                 INK_CUBLAS_CK(cublasSgemm(

@@ -336,6 +336,7 @@ struct ActiveReq {
     bool cancelled = false;
     bool admitted = false;
     bool slot_read = false;
+    int  prompt_ckpt_len = 0;  // prompt-end ShortConv4 checkpoint for multi-turn prefix reuse past hidden thinking (#6627)
 };
 
 struct ServeConfig {
@@ -493,24 +494,38 @@ inline int run_serve_loop(const ServeConfig& cfg, InkModelFile& mf, InkBackend& 
             rq.active = false;
             return false;
         }
-        // Prefix reuse check (exact prefix match with no images)
+        // Prefix reuse check (exact prefix match with no images, including prompt-end rollback past hidden thinking #6627)
         int reuse = 0;
         if (pg.images.empty() && !rq.cached_prefix.empty()) {
             const int lim = std::min(static_cast<int>(rq.cached_prefix.size()), rq.prompt_len - 1);
             while (reuse < lim && rq.cached_prefix[reuse] == rq.prompt_ids[reuse]) ++reuse;
             if (reuse != static_cast<int>(rq.cached_prefix.size())) {
-                reuse = 0;  // Safe reset when SWA/ShortConv state diverged
+                const int gen_after = static_cast<int>(rq.cached_prefix.size()) - rq.prompt_ckpt_len;
+                if (rq.slot == 0 && rq.prompt_ckpt_len > 0 && reuse >= rq.prompt_ckpt_len &&
+                    gen_after >= 0 && gen_after <= backend.swa_slack() &&
+                    backend.restore_prompt_checkpoint(0, rq.prompt_ckpt_len)) {
+                    reuse = rq.prompt_ckpt_len;
+                    rq.cached_prefix.resize(static_cast<size_t>(reuse));
+                } else {
+                    reuse = 0;  // Safe reset when SWA/ShortConv state diverged beyond prompt checkpoint
+                }
             }
         }
         if (reuse == 0) {
             // Park outgoing slot-0 conversation into RAM/SSD conversation cache before resetting
             if (rq.slot == 0 && conv_cache.enabled() && rq.cached_prefix.size() >= 64) {
+                int park_len = static_cast<int>(rq.cached_prefix.size());
+                if (rq.prompt_ckpt_len >= 64 && park_len > rq.prompt_ckpt_len &&
+                    park_len - rq.prompt_ckpt_len <= backend.swa_slack() &&
+                    backend.restore_prompt_checkpoint(0, rq.prompt_ckpt_len)) {
+                    park_len = rq.prompt_ckpt_len;
+                }
                 InkSlotSnapshot parked;
                 std::string perr;
-                if (backend.export_slot(0, static_cast<int>(rq.cached_prefix.size()), parked, perr)) {
+                if (backend.export_slot(0, park_len, parked, perr)) {
                     parked.model_fp = model_fp;
                     parked.config_fp = config_fp;
-                    parked.tokens = rq.cached_prefix;
+                    parked.tokens.assign(rq.cached_prefix.begin(), rq.cached_prefix.begin() + park_len);
                     conv_cache.park(std::move(parked));
                 }
             }
@@ -523,6 +538,7 @@ inline int run_serve_loop(const ServeConfig& cfg, InkModelFile& mf, InkBackend& 
                     std::string ierr;
                     if (backend.import_slot(0, restored, ierr)) {
                         rq.cached_prefix = std::move(restored.tokens);
+                        rq.prompt_ckpt_len = 0;
                         reuse = static_cast<int>(rq.cached_prefix.size());
                         hit_cache = true;
                         std::fprintf(stderr, "strata-inkling serve: conversation cache hit (%s): %d tokens restored\n",
@@ -534,6 +550,7 @@ inline int run_serve_loop(const ServeConfig& cfg, InkModelFile& mf, InkBackend& 
             if (!hit_cache) {
                 backend.reset_slot(rq.slot);
                 rq.cached_prefix.clear();
+                rq.prompt_ckpt_len = 0;
             }
         } else {
             proto("RESUME %d", reuse);
@@ -606,15 +623,22 @@ inline int run_serve_loop(const ServeConfig& cfg, InkModelFile& mf, InkBackend& 
                 return true;
             }
             const double t0 = now_s();
+            int save_len = static_cast<int>(reqs[0].cached_prefix.size());
+            if (reqs[0].prompt_ckpt_len > 0 && save_len > reqs[0].prompt_ckpt_len &&
+                save_len - reqs[0].prompt_ckpt_len <= backend.swa_slack() &&
+                backend.restore_prompt_checkpoint(0, reqs[0].prompt_ckpt_len)) {
+                save_len = reqs[0].prompt_ckpt_len;
+                reqs[0].cached_prefix.resize(static_cast<size_t>(save_len));
+            }
             InkSlotSnapshot snap;
             std::string serr, kind = "io";
-            if (!backend.export_slot(0, static_cast<int>(reqs[0].cached_prefix.size()), snap, serr)) {
+            if (!backend.export_slot(0, save_len, snap, serr)) {
                 proto("SERR invalid 0 %s", serr.c_str());
                 return true;
             }
             snap.model_fp = model_fp;
             snap.config_fp = config_fp;
-            snap.tokens = reqs[0].cached_prefix;
+            snap.tokens.assign(reqs[0].cached_prefix.begin(), reqs[0].cached_prefix.begin() + save_len);
             uint64_t bytes = 0;
             if (!ink_session_write(path, snap, bytes, serr, kind)) {
                 proto("SERR %s 0 %s", kind.c_str(), serr.c_str());
@@ -926,6 +950,11 @@ inline int run_serve_loop(const ServeConfig& cfg, InkModelFile& mf, InkBackend& 
                 continue;
             }
             const bool just_finished_prefill = (prefill_fed[s] > 0);
+            if (just_finished_prefill && s == 0 && rq.prompt_len > 0) {
+                if (backend.save_prompt_checkpoint(0, rq.prompt_len)) {
+                    rq.prompt_ckpt_len = rq.prompt_len;
+                }
+            }
             if (!just_finished_prefill) {
                 rq.cached_prefix.push_back(rq.next_tok);
                 ++rq.cur_pos;

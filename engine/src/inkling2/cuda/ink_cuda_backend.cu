@@ -153,8 +153,10 @@ public:
             dspark_->init(eff_max_ctx_, 512);
         }
 
-        // Allocate snapshot buffer (3.83 MB) + selected hidden gather buffers + pinned D2H logits staging
-        d_sconv_snap_ = strata::ink::dalloc<float>((size_t)strata::ink::kInkVisits * 3 * strata::ink::kInkSconvCh);
+        // Allocate snapshot buffer (3.83 MB) + prompt-end checkpoint buffer (3.83 MB) + selected hidden gather buffers
+        d_sconv_snap_        = strata::ink::dalloc<float>((size_t)strata::ink::kInkVisits * 3 * strata::ink::kInkSconvCh);
+        d_sconv_prompt_snap_ = strata::ink::dalloc<float>((size_t)strata::ink::kInkVisits * 3 * strata::ink::kInkSconvCh);
+        prompt_snap_len_     = -1;
         d_h_sel_      = strata::ink::dalloc<float>((size_t)runner_->max_batch * strata::ink::kInkHidden);
         d_sel_idx_    = strata::ink::dalloc<int32_t>(runner_->max_batch);
         slot_alloc_.assign(max_slots_, false);
@@ -770,8 +772,30 @@ public:
         }
         // Reset DSpark tap state (taps are not serialized; DSpark resumes cleanly once new taps arrive)
         tree_snap_ready_ = false;
-        if (slot == 0) dspark_slot_ = -1;
+        if (slot == 0) { dspark_slot_ = -1; prompt_snap_len_ = -1; }
         return true;
+    }
+
+    bool save_prompt_checkpoint(int slot, int n_tokens) override {
+        if (!initialized_ || !runner_ || slot != 0 || n_tokens <= 0 || !d_sconv_prompt_snap_) return false;
+        strata::ink::k_ink_sconv_slot_copy<<<dim3(strata::ink::kInkVisits, 4), 256, 0, runner_->st>>>(
+            runner_->d_sconv_pool_arr, d_sconv_prompt_snap_, 0, runner_->max_slots, true);
+        prompt_snap_len_ = n_tokens;
+        return true;
+    }
+
+    bool restore_prompt_checkpoint(int slot, int n_tokens) override {
+        if (!initialized_ || !runner_ || slot != 0 || prompt_snap_len_ != n_tokens || !d_sconv_prompt_snap_) return false;
+        strata::ink::k_ink_sconv_slot_copy<<<dim3(strata::ink::kInkVisits, 4), 256, 0, runner_->st>>>(
+            runner_->d_sconv_pool_arr, d_sconv_prompt_snap_, 0, runner_->max_slots, false);
+        tree_snap_ready_ = false;
+        dspark_slot_ = -1;
+        return true;
+    }
+
+    int swa_slack() const noexcept override {
+        if (!runner_) return 0;
+        return std::max(0, runner_->swa_ring - strata::ink::kInkSwaWin);
     }
 
 private:
@@ -786,6 +810,8 @@ private:
         if (dspark_) { dspark_->free_all(); dspark_.reset(); }
         if (runner_) { runner_->free_all(); runner_.reset(); }
         if (d_sconv_snap_) { cudaFree(d_sconv_snap_); d_sconv_snap_ = nullptr; }
+        if (d_sconv_prompt_snap_) { cudaFree(d_sconv_prompt_snap_); d_sconv_prompt_snap_ = nullptr; }
+        prompt_snap_len_ = -1;
         if (d_h_sel_)      { cudaFree(d_h_sel_); d_h_sel_ = nullptr; }
         if (d_sel_idx_)    { cudaFree(d_sel_idx_); d_sel_idx_ = nullptr; }
         if (h_logits_pin_) { cudaFreeHost(h_logits_pin_); h_logits_pin_ = nullptr; h_logits_cap_ = 0; }
@@ -805,6 +831,8 @@ private:
     std::unique_ptr<strata::ink::InkCudaRunner> runner_;
     std::unique_ptr<strata::ink::InkDSpark> dspark_;
     float* d_sconv_snap_ = nullptr;
+    float* d_sconv_prompt_snap_ = nullptr;
+    int prompt_snap_len_ = -1;
     float* d_h_sel_ = nullptr;
     int32_t* d_sel_idx_ = nullptr;
     float* h_logits_pin_ = nullptr;
