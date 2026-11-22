@@ -2442,7 +2442,219 @@ struct InkLayerMoeInfo {
 
 // Shared GPU expert execution helper (bins tier<=1 experts in `experts` and writes weighted outputs to ws.y_pair)
 // ============================================================================
-// 4E. Pascal (sm_60/61) FP32 cuBLAS SGEMM MoE Prefill Path (6.5 TFLOPS on GTX 1070!)
+// 4E. Pascal (sm_61) Tiled 16-Token dp4a_i8 S_K MoE Prefill Kernels (26 TOPS, Zero FP32 Weight Staging!)
+//     Tiles 16 routed tokens x 1 superblock (5,120 B smem) -> reads compressed S_K weights ONCE per 16 tokens!
+// ============================================================================
+template <int FMT>
+__device__ __forceinline__ void sk_gu_tile16_sb(
+    const uint8_t* gr, const uint8_t* ur, int s, int g,
+    const InkQ8_1_G64 (&s_xq)[16][4], int n_e,
+    float (&ag)[16], float (&au)[16]) {
+    constexpr int SB = ink_sb_bytes(FMT);
+    constexpr float HALF = ink_sk_half(FMT);
+    constexpr bool HAS_HALF = (FMT != FMT_S8_K && FMT != FMT_S1_5);
+    const uint8_t* bg = gr + (size_t)s * SB;
+    const uint8_t* bu = ur + (size_t)s * SB;
+    const float eg = f16_to_f32(ld16_u(bg)) * ((float)bg[2 + g] * (1.0f / 255.0f));
+    const float eu = f16_to_f32(ld16_u(bu)) * ((float)bu[2 + g] * (1.0f / 255.0f));
+    uint32_t wg[16], wu[16];
+    sk_unpack64_g_to_u32<FMT>(bg + 6, g, wg);
+    sk_unpack64_g_to_u32<FMT>(bu + 6, g, wu);
+#pragma unroll
+    for (int m = 0; m < 16; ++m) {
+        if (m < n_e) {
+            const InkQ8_1_G64& xb = s_xq[m][g];
+            const int32_t ig = dp64_i8_smem(wg, xb);
+            const int32_t iu = dp64_i8_smem(wu, xb);
+            if constexpr (HAS_HALF) {
+                ag[m] = fmaf(eg, xb.d * (float)ig - HALF * xb.s, ag[m]);
+                au[m] = fmaf(eu, xb.d * (float)iu - HALF * xb.s, au[m]);
+            } else {
+                ag[m] = fmaf(eg, xb.d * (float)ig, ag[m]);
+                au[m] = fmaf(eu, xb.d * (float)iu, au[m]);
+            }
+        }
+    }
+}
+
+template <int FMT>
+__device__ __forceinline__ void sk_dn_tile16_sb(
+    const uint8_t* pr, int s, int g,
+    const InkQ8_1_G64 (&s_hq)[16][4], int n_e,
+    float (&a0)[16], float (&a1)[16]) {
+    constexpr int SB = ink_sb_bytes(FMT);
+    constexpr float HALF = ink_sk_half(FMT);
+    constexpr bool HAS_HALF = (FMT != FMT_S8_K && FMT != FMT_S1_5);
+    const uint8_t* blk = pr + (size_t)s * SB;
+    const float eff = f16_to_f32(ld16_u(blk)) * ((float)blk[2 + g] * (1.0f / 255.0f));
+    const bool is_r1 = ((s * 4 + g) >= 18);
+    uint32_t w[16];
+    sk_unpack64_g_to_u32<FMT>(blk + 6, g, w);
+#pragma unroll
+    for (int m = 0; m < 16; ++m) {
+        if (m < n_e) {
+            const InkQ8_1_G64& xb = s_hq[m][g];
+            const int32_t isum = dp64_i8_smem(w, xb);
+            const float term = HAS_HALF ? (eff * (xb.d * (float)isum - HALF * xb.s)) : (eff * xb.d * (float)isum);
+            if (is_r1) a1[m] += term; else a0[m] += term;
+        }
+    }
+}
+
+// Grid: (1152 / 32 = 36, max_tiles), Block: 128 (32 features/CTA, 4 lanes/feature, 5.1 KB smem -> max occupancy!)
+__global__ void __launch_bounds__(128) k_ink_moe_gu_sk_tile16(
+    const uint8_t* __restrict__ sec4_base,
+    const InkExpertDev* __restrict__ experts,
+    InkMoeTables tb,
+    const InkQ8_1_G64* __restrict__ x_sk,
+    float* __restrict__ h_f32) {
+    const int t_idx = blockIdx.y;
+    if (t_idx >= *tb.n_tiles) return;
+    const int2 tl = tb.tiles[t_idx];
+    const int e = tl.x;
+    const int row0 = tl.y;
+    const int n_e = min(16, tb.off[e + 1] - row0);
+    if (n_e <= 0) return;
+    const InkExpertDev ed = experts[e];
+    if (ed.tier > 1 || ed.gu_code == FMT_SF4 || ed.gu_code == FMT_MX8) return;
+
+    const int tid  = threadIdx.x;
+    const int sub  = tid >> 2;
+    const int g    = tid & 3;
+    const int feat = blockIdx.x * 32 + sub;
+
+    __shared__ int32_t s_tok[16];
+    __shared__ alignas(16) InkQ8_1_G64 s_xq[16][4];  // 5,120 B
+    if (tid < n_e) s_tok[tid] = tb.tok_idx[row0 + tid];
+    __syncthreads();
+
+    const uint8_t* body = sec4_base + ed.body_off;
+    const uint8_t* gu_base = body + kInkInter * 2;
+    const size_t row_b = (size_t)(kInkHidden / 256) * ink_sb_bytes(ed.gu_code);
+    const uint8_t* gr = gu_base + (size_t)(2 * feat) * row_b;
+    const uint8_t* ur = gr + row_b;
+    const float inv_sq = (feat < kInkInter) ? (1.0f / f16_to_f32(ld16_u(body + feat * 2))) : 0.0f;
+
+    float ag[16] = {}, au[16] = {};
+    const int tot_u4 = n_e * 20;
+
+    for (int s = 0; s < 9; ++s) {
+        for (int idx = tid; idx < tot_u4; idx += 128) {
+            const int m   = idx / 20;
+            const int rem = idx - m * 20;
+            const int gg  = rem / 5;
+            const int u4i = rem - gg * 5;
+            const uint4* src = reinterpret_cast<const uint4*>(&x_sk[(size_t)s_tok[m] * (kInkHidden / 64) + s * 4 + gg]);
+            uint4* dst = reinterpret_cast<uint4*>(&s_xq[m][gg]);
+            dst[u4i] = src[u4i];
+        }
+        __syncthreads();
+        if (feat < kInkInter) {
+            switch (ed.gu_code) {
+                case FMT_S2_K: sk_gu_tile16_sb<FMT_S2_K>(gr, ur, s, g, s_xq, n_e, ag, au); break;
+                case FMT_S3_K: sk_gu_tile16_sb<FMT_S3_K>(gr, ur, s, g, s_xq, n_e, ag, au); break;
+                case FMT_S4_K: sk_gu_tile16_sb<FMT_S4_K>(gr, ur, s, g, s_xq, n_e, ag, au); break;
+                case FMT_S5_K: sk_gu_tile16_sb<FMT_S5_K>(gr, ur, s, g, s_xq, n_e, ag, au); break;
+                case FMT_S6_K: sk_gu_tile16_sb<FMT_S6_K>(gr, ur, s, g, s_xq, n_e, ag, au); break;
+                case FMT_S8_K: sk_gu_tile16_sb<FMT_S8_K>(gr, ur, s, g, s_xq, n_e, ag, au); break;
+                case FMT_S1_5: sk_gu_tile16_sb<FMT_S1_5>(gr, ur, s, g, s_xq, n_e, ag, au); break;
+                default: break;
+            }
+        }
+        if (s < 8) __syncthreads();
+    }
+
+    if (feat < kInkInter) {
+#pragma unroll
+        for (int m = 0; m < 16; ++m) {
+            if (m < n_e) {
+                float gv = ag[m], uv = au[m];
+                gv += __shfl_xor_sync(0xFFFFFFFFu, gv, 2); gv += __shfl_xor_sync(0xFFFFFFFFu, gv, 1);
+                uv += __shfl_xor_sync(0xFFFFFFFFu, uv, 2); uv += __shfl_xor_sync(0xFFFFFFFFu, uv, 1);
+                if (g == 0) h_f32[(size_t)(row0 + m) * kInkInter + feat] = situ_f32(gv, uv) * inv_sq;
+            }
+        }
+    }
+}
+
+__global__ void __launch_bounds__(128) k_ink_moe_dn_sk_tile16(
+    const uint8_t* __restrict__ sec4_base,
+    const InkExpertDev* __restrict__ experts,
+    InkMoeTables tb,
+    const InkQ8_1_G64* __restrict__ h_sk,
+    const float* __restrict__ topk_w,
+    float* __restrict__ y_pair) {
+    const int t_idx = blockIdx.y;
+    if (t_idx >= *tb.n_tiles) return;
+    const int2 tl = tb.tiles[t_idx];
+    const int e = tl.x;
+    const int row0 = tl.y;
+    const int n_e = min(16, tb.off[e + 1] - row0);
+    if (n_e <= 0) return;
+    const InkExpertDev ed = experts[e];
+    if (ed.tier > 1 || ed.dn_code == FMT_SF4 || ed.dn_code == FMT_MX8) return;
+
+    const int tid    = threadIdx.x;
+    const int sub    = tid >> 2;
+    const int g      = tid & 3;
+    const int pair_r = blockIdx.x * 32 + sub;
+
+    __shared__ alignas(16) InkQ8_1_G64 s_hq[16][4];  // 5,120 B
+    const uint8_t* body = sec4_base + ed.body_off;
+    const size_t pair_b = 9ull * ink_sb_bytes(ed.dn_code);
+    const uint8_t* pr = body + ed.dn_off + (size_t)pair_r * pair_b;
+
+    float a0[16] = {}, a1[16] = {};
+    const int tot_u4 = n_e * 20;
+
+    for (int s = 0; s < 9; ++s) {
+        for (int idx = tid; idx < tot_u4; idx += 128) {
+            const int m   = idx / 20;
+            const int rem = idx - m * 20;
+            const int gg  = rem / 5;
+            const int u4i = rem - gg * 5;
+            const int sub_g = s * 4 + gg;
+            const int xg = (sub_g >= 18) ? (sub_g - 18) : sub_g;
+            const uint4* src = reinterpret_cast<const uint4*>(&h_sk[(size_t)(row0 + m) * (kInkInter / 64) + xg]);
+            uint4* dst = reinterpret_cast<uint4*>(&s_hq[m][gg]);
+            dst[u4i] = src[u4i];
+        }
+        __syncthreads();
+        if (pair_r < kInkHidden / 2) {
+            switch (ed.dn_code) {
+                case FMT_S2_K: sk_dn_tile16_sb<FMT_S2_K>(pr, s, g, s_hq, n_e, a0, a1); break;
+                case FMT_S3_K: sk_dn_tile16_sb<FMT_S3_K>(pr, s, g, s_hq, n_e, a0, a1); break;
+                case FMT_S4_K: sk_dn_tile16_sb<FMT_S4_K>(pr, s, g, s_hq, n_e, a0, a1); break;
+                case FMT_S5_K: sk_dn_tile16_sb<FMT_S5_K>(pr, s, g, s_hq, n_e, a0, a1); break;
+                case FMT_S6_K: sk_dn_tile16_sb<FMT_S6_K>(pr, s, g, s_hq, n_e, a0, a1); break;
+                case FMT_S8_K: sk_dn_tile16_sb<FMT_S8_K>(pr, s, g, s_hq, n_e, a0, a1); break;
+                case FMT_S1_5: sk_dn_tile16_sb<FMT_S1_5>(pr, s, g, s_hq, n_e, a0, a1); break;
+                default: break;
+            }
+        }
+        if (s < 8) __syncthreads();
+    }
+
+    if (pair_r < kInkHidden / 2) {
+#pragma unroll
+        for (int m = 0; m < 16; ++m) {
+            if (m < n_e) {
+                float y0 = a0[m], y1 = a1[m];
+                y0 += __shfl_xor_sync(0xFFFFFFFFu, y0, 2); y0 += __shfl_xor_sync(0xFFFFFFFFu, y0, 1);
+                y1 += __shfl_xor_sync(0xFFFFFFFFu, y1, 2); y1 += __shfl_xor_sync(0xFFFFFFFFu, y1, 1);
+                if (g == 0) {
+                    const int pid = tb.pairs[row0 + m];
+                    const float rw = topk_w[pid];
+                    y_pair[(size_t)pid * kInkHidden + 2 * pair_r]     = y0 * rw;
+                    y_pair[(size_t)pid * kInkHidden + 2 * pair_r + 1] = y1 * rw;
+                }
+            }
+        }
+    }
+}
+
+// ============================================================================
+// 4F. Pascal (sm_60/61) FP32 cuBLAS SGEMM MoE Prefill Path (6.5 TFLOPS on GTX 1070!)
 //     Dequantizes each active expert ONCE into pf_w_f32 and multiplies all routed tokens via cublasSgemm.
 // ============================================================================
 template <bool GU, int FMT>
@@ -2646,12 +2858,14 @@ inline void launch_ink_moe_dispatch_only(
     const bool use_sm120_tc = (!force_exact_dec && M >= 24 && sm120::available());
     const bool use_fp16_tc  = (!use_sm120_tc && M >= 24 && ink_has_int8_tc());
     const bool use_wmma_tc  = (!use_sm120_tc && !use_fp16_tc && M >= 24 && ink_has_wmma_f16());
-    const bool use_pascal_sgemm = (!use_sm120_tc && !use_fp16_tc && !use_wmma_tc && M >= 24 && cublas != nullptr && ws.pf_w_f32 != nullptr && ws.h_off_pin != nullptr);
+    const bool use_pascal_dp4a_sk = (!use_sm120_tc && !use_fp16_tc && !use_wmma_tc && M >= 24 && current_sm_arch() == 61 && info.has_sk);
+    const bool use_pascal_sgemm = (!use_sm120_tc && !use_fp16_tc && !use_wmma_tc && M >= 24 && cublas != nullptr && ws.pf_w_f32 != nullptr && ws.h_off_pin != nullptr
+                                   && (!use_pascal_dp4a_sk || info.has_sf4 || info.has_mx8));
     const int tile_rows = use_wmma_tc ? ((M <= 128) ? 16 : 64)
-                                      : ((M <= 128 || use_fp16_tc) ? 16 : 64);
+                                      : ((M <= 128 || use_fp16_tc || use_pascal_dp4a_sk) ? 16 : 64);
     k_ink_moe_bin<<<1, 128, 0, st>>>(experts, ws.topk_idx, M, tile_rows, ws.tb);
 
-    if (use_pascal_sgemm) {
+    if (use_pascal_sgemm && !use_pascal_dp4a_sk) {
         INK_CK(cudaMemcpyAsync(ws.h_off_pin, ws.tb.off, (size_t)(kInkExperts + 1) * sizeof(int32_t), cudaMemcpyDeviceToHost, st));
         INK_CK(cudaStreamSynchronize(st));
         for (int e = 0; e < kInkExperts; ++e) {
@@ -2731,7 +2945,14 @@ inline void launch_ink_moe_dispatch_only(
             const int nblk_x = M * (kInkHidden / 64);
             k_ink_quant_q8_1<<<(nblk_x + 7) / 8, 256, 0, st>>>(x_f32, ws.xq_sk, M, kInkHidden);
         }
-        if (M >= 24 && ink_has_int8_tc()) {
+        if (use_pascal_dp4a_sk) {
+            const int mt = ink_moe_max_tiles(M, 16);
+            dim3 g32(kInkInter / 32, mt);
+            k_ink_moe_gu_sk_tile16<<<g32, 128, 0, st>>>(sec4_base, experts, ws.tb, ws.xq_sk, ws.h_f32);
+            const int nblk_h = P * (kInkInter / 64);
+            k_ink_quant_q8_1<<<(nblk_h + 7) / 8, 256, 0, st>>>(ws.h_f32, ws.hq_sk, P, kInkInter);
+            k_ink_moe_dn_sk_tile16<<<g32, 128, 0, st>>>(sec4_base, experts, ws.tb, ws.hq_sk, ws.topk_w, ws.y_pair);
+        } else if (M >= 24 && ink_has_int8_tc()) {
             const int mt = ink_moe_max_tiles(M, tile_rows);
             const unsigned grid = (unsigned)std::min(std::max(1, mt * 18), 2048);
             if (tile_rows <= 16) k_ink_moe_sk_tc<true, 16><<<grid, 256, 0, st>>>(sec4_base, experts, ws.tb, ws.xq_sk, nullptr, ws.h_f32);

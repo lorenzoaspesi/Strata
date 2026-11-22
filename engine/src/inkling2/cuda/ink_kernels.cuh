@@ -1747,6 +1747,108 @@ __global__ void __launch_bounds__(256) k_ink_sk_to_bf16(const uint8_t* __restric
     dst[(size_t)row * K + col] = __float2bfloat16_rn(v);
 }
 
+// Dequantize S_K (S5_K / S6_K / S8_K) [N, K] -> F32 [N, K] directly for Pascal sm_60/61 cuBLAS SGEMM (zero BF16 round-trip!)
+template <int FMT>
+__global__ void __launch_bounds__(256) k_ink_sk_to_f32(const uint8_t* __restrict__ raw, float* __restrict__ dst, int N, int K) {
+    const int row = blockIdx.y;
+    const int col = blockIdx.x * 256 + threadIdx.x;
+    if (row >= N || col >= K) return;
+    constexpr int SB = ink_sb_bytes(FMT);
+    constexpr float HALF = ink_sk_half(FMT);
+    const int nsb = K >> 8;
+    const int s = col >> 8;
+    const int idx = col & 255;
+    const int g = idx >> 6;
+    const uint8_t* blk = raw + ((size_t)row * nsb + s) * SB;
+    const float D = f16_to_f32(ld16_u(blk));
+    const float eff = D * ((float)blk[2 + g] * (1.0f / 255.0f));
+    const uint8_t* pl = blk + 6;
+    float v = 0.0f;
+    if constexpr (FMT == FMT_S5_K) {
+        uint32_t lo = (pl[idx >> 1] >> ((idx & 1) * 4)) & 0x0Fu;
+        uint32_t hi = (pl[128 + (idx >> 3)] >> (idx & 7)) & 1u;
+        v = ((float)(lo | (hi << 4)) - HALF) * eff;
+    } else if constexpr (FMT == FMT_S6_K) {
+        uint32_t lo = (pl[idx >> 1] >> ((idx & 1) * 4)) & 0x0Fu;
+        uint32_t hi = (pl[128 + (idx >> 2)] >> ((idx & 3) * 2)) & 3u;
+        v = ((float)(lo | (hi << 4)) - HALF) * eff;
+    } else if constexpr (FMT == FMT_S8_K) {
+        v = (float)((int8_t)pl[idx]) * eff;
+    }
+    dst[(size_t)row * K + col] = v;
+}
+
+// Direct 4-lane dp4a_i8 S_K Dense GEMV for M <= 16 (S5_K / S6_K / S8_K, K % 256 == 0)!
+// Eliminates 16x VRAM traffic of S_K->BF16->FP32 tiling on Pascal sm_61 (unembed + DSpark + dense trunk)!
+// Grid: ((N + 31) / 32), Block: 128 (32 rows/CTA, 4 lanes/row = 1 lane per 64-elem subgroup).
+template <int FMT, int MAX_M>
+__global__ void __launch_bounds__(128) k_ink_gemv_sk_dp4a(
+    const uint8_t* __restrict__ raw,
+    const InkQ8_1_G64* __restrict__ x_sk,  // [M, K / 64]
+    float* __restrict__ Y,                 // [M, N]
+    int M, int N, int K) {
+    constexpr int SB = ink_sb_bytes(FMT);
+    constexpr float HALF = ink_sk_half(FMT);
+    constexpr bool HAS_HALF = (FMT != FMT_S8_K);
+    const int tid = threadIdx.x;
+    const int sub = tid >> 2;  // 0..31 rows per CTA
+    const int g   = tid & 3;   // 0..3 subgroup inside 256-elem superblock
+    const int row = blockIdx.x * 32 + sub;
+    const int nsb = K >> 8;
+    const int ng_row = K >> 6;
+
+    __shared__ alignas(16) InkQ8_1_G64 s_xq[MAX_M][4];  // <= 5,120 B for MAX_M=16!
+    float acc[MAX_M] = {};
+
+    const uint8_t* rptr = (row < N) ? (raw + (size_t)row * nsb * SB) : nullptr;
+    const int tot_u4 = M * 20;  // 4 InkQ8_1_G64 * 5 uint4/block = 20 uint4 per token
+
+    for (int s = 0; s < nsb; ++s) {
+        for (int idx = tid; idx < tot_u4; idx += 128) {
+            const int m   = idx / 20;
+            const int rem = idx - m * 20;
+            const int gg  = rem / 5;
+            const int u4i = rem - gg * 5;
+            const uint4* src = reinterpret_cast<const uint4*>(&x_sk[(size_t)m * ng_row + s * 4 + gg]);
+            uint4* dst = reinterpret_cast<uint4*>(&s_xq[m][gg]);
+            dst[u4i] = src[u4i];
+        }
+        __syncthreads();
+
+        if (row < N) {
+            const uint8_t* blk = rptr + (size_t)s * SB;
+            const float eff = f16_to_f32(ld16_u(blk)) * ((float)blk[2 + g] * (1.0f / 255.0f));
+            uint32_t w[16];
+            sk_unpack64_g_to_u32<FMT>(blk + 6, g, w);
+#pragma unroll
+            for (int m = 0; m < MAX_M; ++m) {
+                if (m < M) {
+                    const InkQ8_1_G64& xb = s_xq[m][g];
+                    const int32_t isum = dp64_i8_smem(w, xb);
+                    if constexpr (HAS_HALF) {
+                        acc[m] = fmaf(eff, xb.d * (float)isum - HALF * xb.s, acc[m]);
+                    } else {
+                        acc[m] = fmaf(eff, xb.d * (float)isum, acc[m]);
+                    }
+                }
+            }
+        }
+        if (s + 1 < nsb) __syncthreads();
+    }
+
+    if (row < N) {
+#pragma unroll
+        for (int m = 0; m < MAX_M; ++m) {
+            if (m < M) {
+                float v = acc[m];
+                v += __shfl_xor_sync(0xFFFFFFFFu, v, 2);
+                v += __shfl_xor_sync(0xFFFFFFFFu, v, 1);
+                if (g == 0) Y[(size_t)m * N + row] = v;
+            }
+        }
+    }
+}
+
 // ============================================================================
 // 7. Exact 2-Stage Cauchy-Schwarz Screened Unembed (0.25 ms on RTX 5090, 100.000% Bit-Exact Argmax!)
 //    Coarse plane: symmetric INT8 per-row quantized unembed [V, 2304] (460 MB) + per-row scale sc[V] + exact L2 error eps[V]!

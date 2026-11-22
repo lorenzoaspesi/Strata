@@ -1053,12 +1053,56 @@ struct InkCudaRunner {
                 gemm_bf16_compat(w_dst, X, Y, M, N, K, N, reuse_x_bf16, true);
             }
         } else {
-            // S5_K / S6_K / S8_K dense trunk tensor (dequant tile -> cuBLAS BF16/FP16/FP32 GEMM!)
+            // S5_K / S6_K / S8_K dense trunk tensor:
+            // On sm_61 / sm_75+, M <= 16 uses direct 4-lane dp4a_i8 GEMV (16x less VRAM traffic on unembed & DSpark)!
+            if (M <= 16 && (m.sm_cc == 61 || m.sm_cc >= 75) && (K % 256) == 0 &&
+                (ti.fmt == FMT_S5_K || ti.fmt == FMT_S6_K || ti.fmt == FMT_S8_K) &&
+                (size_t)M * (K / 64) <= (size_t)moe_ws.cap_M * (kInkHidden / 64)) {
+                const int nblk = M * (K / 64);
+                k_ink_quant_q8_1<<<(nblk + 7) / 8, 256, 0, st>>>(X, moe_ws.xq_sk, M, K);
+                const int grid = (N + 31) / 32;
+                if (ti.fmt == FMT_S5_K) {
+                    if (M == 1)      k_ink_gemv_sk_dp4a<FMT_S5_K, 1><<<grid, 128, 0, st>>>(W, moe_ws.xq_sk, Y, M, N, K);
+                    else if (M <= 4) k_ink_gemv_sk_dp4a<FMT_S5_K, 4><<<grid, 128, 0, st>>>(W, moe_ws.xq_sk, Y, M, N, K);
+                    else if (M <= 8) k_ink_gemv_sk_dp4a<FMT_S5_K, 8><<<grid, 128, 0, st>>>(W, moe_ws.xq_sk, Y, M, N, K);
+                    else             k_ink_gemv_sk_dp4a<FMT_S5_K, 16><<<grid, 128, 0, st>>>(W, moe_ws.xq_sk, Y, M, N, K);
+                } else if (ti.fmt == FMT_S6_K) {
+                    if (M == 1)      k_ink_gemv_sk_dp4a<FMT_S6_K, 1><<<grid, 128, 0, st>>>(W, moe_ws.xq_sk, Y, M, N, K);
+                    else if (M <= 4) k_ink_gemv_sk_dp4a<FMT_S6_K, 4><<<grid, 128, 0, st>>>(W, moe_ws.xq_sk, Y, M, N, K);
+                    else if (M <= 8) k_ink_gemv_sk_dp4a<FMT_S6_K, 8><<<grid, 128, 0, st>>>(W, moe_ws.xq_sk, Y, M, N, K);
+                    else             k_ink_gemv_sk_dp4a<FMT_S6_K, 16><<<grid, 128, 0, st>>>(W, moe_ws.xq_sk, Y, M, N, K);
+                } else {
+                    if (M == 1)      k_ink_gemv_sk_dp4a<FMT_S8_K, 1><<<grid, 128, 0, st>>>(W, moe_ws.xq_sk, Y, M, N, K);
+                    else if (M <= 4) k_ink_gemv_sk_dp4a<FMT_S8_K, 4><<<grid, 128, 0, st>>>(W, moe_ws.xq_sk, Y, M, N, K);
+                    else if (M <= 8) k_ink_gemv_sk_dp4a<FMT_S8_K, 8><<<grid, 128, 0, st>>>(W, moe_ws.xq_sk, Y, M, N, K);
+                    else             k_ink_gemv_sk_dp4a<FMT_S8_K, 16><<<grid, 128, 0, st>>>(W, moe_ws.xq_sk, Y, M, N, K);
+                }
+                return;
+            }
+            // M > 16 on Pascal sm_60/61: dequant S_K directly to FP32 (skips BF16 write+read round-trip!)
             const size_t cap = (size_t)kInkDsparkInter * kInkHidden;
-            const size_t max_tile = (m.sm_cc < 70) ? (cap / 3) : cap;
-            const int tile_n = std::min(N, (int)(max_tile / (size_t)K));
             const size_t row_b = (size_t)(K / 256) * ink_sb_bytes(ti.fmt);
-            __nv_bfloat16* w_dst = (m.sm_cc < 70) ? (d_w_scratch + 2 * (cap / 3)) : d_w_scratch;
+            if (m.sm_cc < 70) {
+                const size_t max_tile = cap / 2;
+                const int tile_n = std::min(N, (int)(max_tile / (size_t)K));
+                float* w_f32 = reinterpret_cast<float*>(d_w_scratch);
+                const float alpha = 1.0f, beta = 0.0f;
+                for (int n0 = 0; n0 < N; n0 += tile_n) {
+                    const int nt = std::min(tile_n, N - n0);
+                    dim3 dg((K + 255) / 256, nt);
+                    const uint8_t* Wsub = W + (size_t)n0 * row_b;
+                    if (ti.fmt == FMT_S5_K)      k_ink_sk_to_f32<FMT_S5_K><<<dg, 256, 0, st>>>(Wsub, w_f32, nt, K);
+                    else if (ti.fmt == FMT_S6_K) k_ink_sk_to_f32<FMT_S6_K><<<dg, 256, 0, st>>>(Wsub, w_f32, nt, K);
+                    else                         k_ink_sk_to_f32<FMT_S8_K><<<dg, 256, 0, st>>>(Wsub, w_f32, nt, K);
+                    INK_CUBLAS_CK(cublasSgemm(
+                        cublas, CUBLAS_OP_T, CUBLAS_OP_N,
+                        nt, M, K, &alpha, w_f32, K, X, K, &beta, Y + n0, N));
+                }
+                return;
+            }
+            // Volta+ (sm_70+): dequant tile -> BF16 -> cuBLAS Tensor Core GEMM
+            const int tile_n = std::min(N, (int)(cap / (size_t)K));
+            __nv_bfloat16* w_dst = d_w_scratch;
             for (int n0 = 0; n0 < N; n0 += tile_n) {
                 const int nt = std::min(tile_n, N - n0);
                 dim3 dg((K + 255) / 256, nt);
@@ -1444,40 +1488,38 @@ struct InkCudaRunner {
         }
         prof_mark_end(0); prof_mark_start();
 
+        const bool fuse_moe_sconv = ((mode == 0 && M == 1) || mode == 1 || mode == 2);
         if (m.layer_has_host[ip] && m.hybrid.active) {
             launch_ink_moe_hybrid(
                 st, cublas, m.d_sec4, m.d_experts[ip], m.moe_info[ip], ip, m.hybrid,
                 (const float*)m.trunk_ptr(p + ".mlp.gate.weight"),
                 (const float*)m.trunk_ptr(p + ".mlp.gate.bias"),
-                d_moe_in, d_moe_raw, M, moe_ws, m.man.c.route_scale, (mode == 2));
-            prof_mark_end(5); prof_mark_start();
-            run_sconv_uniform(d_moe_raw, m.d_sconv_mlp[ip], nullptr, d_cur, kInkHidden, 2 * kInkKVDim + kInkHidden, 0, true);
+                d_moe_in, d_moe_raw, M, moe_ws, m.man.c.route_scale, (mode == 2), !fuse_moe_sconv);
         } else {
-            const bool fuse_moe_sconv = ((mode == 0 && M == 1) || mode == 1 || mode == 2);
             launch_ink_moe(
                 st, cublas, m.d_sec4, m.d_experts[ip], m.moe_info[ip],
                 (const float*)m.trunk_ptr(p + ".mlp.gate.weight"),
                 (const float*)m.trunk_ptr(p + ".mlp.gate.bias"),
                 d_moe_in, d_moe_raw, M, moe_ws, m.man.c.route_scale, (mode == 2), !fuse_moe_sconv);
-            prof_mark_end(5); prof_mark_start();
-            if (fuse_moe_sconv) {
-                constexpr int mlp_ch_off = 2 * kInkKVDim + kInkHidden;
-                float* hbase = d_sconv_pool[visit] + (size_t)mlp_ch_off * 3 * max_slots;
-                if (mode == 0 && M == 1) {
-                    k_ink_moe_reduce8_sconv_m1<<<(kInkHidden + 255) / 256, 256, 0, st>>>(
-                        moe_ws.y_pair, m.d_sconv_mlp[ip], hbase + (size_t)slot0 * 3 * kInkHidden, d_cur);
-                } else if (mode == 1) {
-                    k_ink_moe_reduce8_sconv_batched<<<dim3((kInkHidden + 255) / 256, M), 256, 0, st>>>(
-                        moe_ws.y_pair, m.d_sconv_mlp[ip], hbase, d_slots, d_cur, M);
-                } else {
-                    k_ink_moe_reduce8_sconv_tree<<<(kInkHidden + 127) / 128, 128, 0, st>>>(
-                        moe_ws.y_pair, m.d_sconv_mlp[ip], hbase + (size_t)slot0 * 3 * kInkHidden,
-                        d_sconv_lag, d_stage_sconv + (size_t)visit * tree_cap * kInkSconvCh,
-                        mlp_ch_off, d_cur, M);
-                }
+        }
+        prof_mark_end(5); prof_mark_start();
+        if (fuse_moe_sconv) {
+            constexpr int mlp_ch_off = 2 * kInkKVDim + kInkHidden;
+            float* hbase = d_sconv_pool[visit] + (size_t)mlp_ch_off * 3 * max_slots;
+            if (mode == 0 && M == 1) {
+                k_ink_moe_reduce8_sconv_m1<<<(kInkHidden + 255) / 256, 256, 0, st>>>(
+                    moe_ws.y_pair, m.d_sconv_mlp[ip], hbase + (size_t)slot0 * 3 * kInkHidden, d_cur);
+            } else if (mode == 1) {
+                k_ink_moe_reduce8_sconv_batched<<<dim3((kInkHidden + 255) / 256, M), 256, 0, st>>>(
+                    moe_ws.y_pair, m.d_sconv_mlp[ip], hbase, d_slots, d_cur, M);
             } else {
-                run_sconv_uniform(d_moe_raw, m.d_sconv_mlp[ip], nullptr, d_cur, kInkHidden, 2 * kInkKVDim + kInkHidden, 0, true);
+                k_ink_moe_reduce8_sconv_tree<<<(kInkHidden + 127) / 128, 128, 0, st>>>(
+                    moe_ws.y_pair, m.d_sconv_mlp[ip], hbase + (size_t)slot0 * 3 * kInkHidden,
+                    d_sconv_lag, d_stage_sconv + (size_t)visit * tree_cap * kInkSconvCh,
+                    mlp_ch_off, d_cur, M);
             }
+        } else {
+            run_sconv_uniform(d_moe_raw, m.d_sconv_mlp[ip], nullptr, d_cur, kInkHidden, 2 * kInkKVDim + kInkHidden, 0, true);
         }
         prof_mark_end(2);
     }
@@ -1572,6 +1614,7 @@ struct InkCudaRunner {
 
     // ---- Launch Full 48-Visit Forward (with Automatic CUDA Graph Capture for Decode/Batched/Tree!) ----
     void forward_seq(const int32_t* tok_ids, int p0, int M, int slot0, bool want_taps) {
+        if (m.hybrid.active) m.hybrid.wait_promo();
         int32_t* slot_buf = h_meta_pin + (meta_ring_idx++ & 63ull) * meta_ring_stride;
         std::memcpy(slot_buf, tok_ids, (size_t)M * 4);
         int32_t* h_pos = slot_buf + M;
@@ -1603,6 +1646,7 @@ struct InkCudaRunner {
 
     // Speculative Tree-32 / Block-8 verify (100% CUDA-Graph capturable across ALL p0 when 100% VRAM!)
     void forward_tree_verify(const InkTreeSpec& tree, int p0, int slot0, bool want_taps) {
+        if (m.hybrid.active) m.hybrid.wait_promo();
         const int M = tree.M;
         int32_t* slot_buf = h_meta_pin + (meta_ring_idx++ & 63ull) * meta_ring_stride;
         int32_t* h_tok = slot_buf;

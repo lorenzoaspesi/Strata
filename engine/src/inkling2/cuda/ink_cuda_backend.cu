@@ -493,10 +493,13 @@ public:
             runner_->d_sconv_pool_arr, d_sconv_snap_, 0, runner_->max_slots, true);
 
         // 2. True W=4 Multi-Branch Sparse-MoE Bayes-Optimal Adaptive Beam Tree (tunable via STRATA_INK_DSPARK_*)!
+        //    When experts spill to host RAM over PCIe, smaller trees (max_nodes=6, moe_ratio=9.0) avoid cold-expert
+        //    PCIe fan-out while preserving high acceptance.
         strata::ink::InkTreeSpec tr{};
+        const bool spilled_pcie = (model_.n_host_experts > 0 && model_.hybrid.pcie_decode_enabled());
         int beam_w = 4;
-        int max_nodes = std::min(12, runner_->tree_cap);
-        float moe_ratio = 4.2f;
+        int max_nodes = std::min(spilled_pcie ? 6 : 12, runner_->tree_cap);
+        float moe_ratio = spilled_pcie ? 9.0f : 4.2f;
         if (const char* eb = std::getenv("STRATA_INK_DSPARK_BEAM")) beam_w = std::clamp(std::atoi(eb), 1, 4);
         if (const char* em = std::getenv("STRATA_INK_DSPARK_MAX_NODES")) max_nodes = std::clamp(std::atoi(em), 2, runner_->tree_cap);
         if (const char* er = std::getenv("STRATA_INK_DSPARK_MOE_RATIO")) moe_ratio = std::max(0.0f, std::strtof(er, nullptr));

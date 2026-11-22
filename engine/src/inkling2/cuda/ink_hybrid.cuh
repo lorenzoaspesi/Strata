@@ -738,6 +738,14 @@ struct InkHybridEngine {
     std::vector<float> h_use_cnt;        // [3072] host-side decayed frequency tracker (works in PCIe+DSpark mode!)
     std::vector<int>   h_miss_keys;      // recent host expert misses for end-of-step promotion
     cudaStream_t promo_st = nullptr;
+    bool promo_pending = false;
+
+    void wait_promo() {
+        if (promo_pending && promo_st) {
+            INK_CK(cudaStreamSynchronize(promo_st));
+            promo_pending = false;
+        }
+    }
 
     // Double-Buffered Prefill Streaming Arena (2 x 16..64 MiB ping-pong VRAM buffers + pinned descriptors!)
     uint8_t* d_pf_stage[2] = {};
@@ -975,9 +983,10 @@ struct InkHybridEngine {
         if (h_miss_keys.size() < 64) h_miss_keys.push_back(key);
     }
 
-    // Host-driven promotion step (runs after M=1 or DSpark verify steps when n_promo_slots > 0)
+    // Host-driven promotion step (runs after M=1 or DSpark verify steps when n_promo_slots > 0; overlaps with next draft!)
     void step_promote_host(uint8_t* d_sec4, InkExpertDev* const d_experts[24], cudaStream_t main_st) {
         if (!active || n_promo_slots <= 0 || h_miss_keys.empty()) return;
+        wait_promo();
         std::sort(h_miss_keys.begin(), h_miss_keys.end(), [&](int a, int b) { return h_use_cnt[a] > h_use_cnt[b]; });
         int promoted = 0;
         for (int key : h_miss_keys) {
@@ -1018,7 +1027,7 @@ struct InkHybridEngine {
             ++promoted;
         }
         h_miss_keys.clear();
-        if (promoted > 0) INK_CK(cudaStreamSynchronize(promo_st));
+        if (promoted > 0) promo_pending = true;
         for (float& c : h_use_cnt) c *= 0.96f;
         (void)main_st;
     }
@@ -1106,7 +1115,7 @@ struct InkHybridEngine {
         if (h_x_batch_pin) { cudaFreeHost(h_x_batch_pin); h_x_batch_pin = nullptr; }
         if (h_batch_buf) { cudaFreeHost(h_batch_buf); h_batch_buf = nullptr; d_batch_buf = nullptr; }
         if (h_sec4_pinned) { cudaFreeHost(h_sec4_pinned); h_sec4_pinned = nullptr; h_sec4_bytes = 0; }
-        if (promo_st) { cudaStreamDestroy(promo_st); promo_st = nullptr; }
+        if (promo_st) { wait_promo(); cudaStreamDestroy(promo_st); promo_st = nullptr; }
         if (pf_dma_st) { cudaStreamDestroy(pf_dma_st); pf_dma_st = nullptr; }
         for (int b = 0; b < 2; ++b) {
             if (pf_ev_dma[b])  { cudaEventDestroy(pf_ev_dma[b]);  pf_ev_dma[b] = nullptr; }
@@ -1133,7 +1142,8 @@ inline void launch_ink_moe_hybrid(
     int M,
     InkMoeWorkspace& ws,
     float route_scale = kInkRouteScale,
-    bool force_exact_dec = false) {
+    bool force_exact_dec = false,
+    bool run_reduce8 = true) {
     // 1. Exact Top-8 / 128 sigmoid router
     if (M <= 16) {
         if (M == 1)      k_ink_router_gemv_smallM<1><<<kInkExperts, 256, 0, st>>>(x_f32, gate_w, ws.r_logits, M);
@@ -1256,11 +1266,10 @@ inline void launch_ink_moe_hybrid(
         host_list.reserve(kInkExperts);
         int cpu_batch_nj = 0;
         uint32_t cpu_batch_seq = 0;
-        // Fast single-binning zero-sync Pascal SGEMM prefill path:
-        // Bins ALL 128 experts ONCE, copies h_off_pin ONCE, skips cnt==0 host experts before DMA,
-        // and runs resident + all ping-pong DMA chunks with ZERO mid-layer stream syncs!
+        // Fast single-binning zero-sync Pascal SGEMM prefill path (for SF4/MX8; S_K uses zero-sync tiled dp4a_i8!):
         const bool pascal_fast_pf = (M >= 24 && cublas != nullptr && ws.pf_w_f32 != nullptr && ws.h_off_pin != nullptr
-                                     && !sm120::available() && !ink_has_int8_tc() && !ink_has_wmma_f16());
+                                     && !sm120::available() && !ink_has_int8_tc() && !ink_has_wmma_f16()
+                                     && !(current_sm_arch() == 61 && info.has_sk && !info.has_sf4 && !info.has_mx8));
         std::vector<int> vram_list;
         if (pascal_fast_pf) {
             k_ink_moe_bin<<<1, 128, 0, st>>>(experts, ws.topk_idx, M, 16, ws.tb, /*max_tier=*/2);
@@ -1416,8 +1425,10 @@ inline void launch_ink_moe_hybrid(
     }
 
     // 3. Deterministic 8-slot weighted sum -> y_out [M, 2304]
-    dim3 rgrid((kInkHidden + 255) / 256, M);
-    k_ink_moe_reduce8<<<rgrid, 256, 0, st>>>(ws.y_pair, y_out, M);
+    if (run_reduce8) {
+        dim3 rgrid((kInkHidden + 255) / 256, M);
+        k_ink_moe_reduce8<<<rgrid, 256, 0, st>>>(ws.y_pair, y_out, M);
+    }
 }
 
 }  // namespace strata::ink
