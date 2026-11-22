@@ -336,6 +336,7 @@ struct ActiveReq {
     bool cancelled = false;
     bool admitted = false;
     bool slot_read = false;
+    int  reused = 0;
     int  prompt_ckpt_len = 0;  // prompt-end ShortConv4 checkpoint for multi-turn prefix reuse past hidden thinking (#6627)
 };
 
@@ -417,13 +418,17 @@ inline int run_serve_loop(const ServeConfig& cfg, InkModelFile& mf, InkBackend& 
     auto finish_req = [&](ActiveReq& rq, const char* reason) {
         const double dec_ms = (rq.decode_t0 > 0.0) ? (now_s() - rq.decode_t0) * 1000.0 : 0.0;
         if (rq.is_solo) {
-            proto("DONE %d %d %.1f %.1f %s", rq.generated, rq.prompt_len, rq.prompt_ms, dec_ms, reason);
+            proto("DONE %d %d %.1f %.1f %s %d %d %d",
+                  rq.generated, rq.prompt_len, rq.prompt_ms, dec_ms, reason,
+                  rq.drafts_accepted, rq.drafts_offered, rq.reused);
         } else if (rq.is_ext_gen) {
             proto("DONE %s %d %d %.1f %.1f %s", rq.req_id.c_str(), rq.generated, rq.prompt_len, rq.prompt_ms, dec_ms, reason);
             req_id_to_slot.erase(rq.req_id);
         } else {
             if (!rq.admitted) {
-                proto("DONE %d %d %.1f 0.0 %s", rq.generated, rq.prompt_len, rq.prompt_ms, reason);
+                proto("DONE %d %d %.1f 0.0 %s %d %d %d",
+                      rq.generated, rq.prompt_len, rq.prompt_ms, reason,
+                      rq.drafts_accepted, rq.drafts_offered, rq.reused);
                 proto("BADM %d 0", rq.slot);
             } else {
                 char dstr[64] = "";
@@ -555,6 +560,7 @@ inline int run_serve_loop(const ServeConfig& cfg, InkModelFile& mf, InkBackend& 
         } else {
             proto("RESUME %d", reuse);
         }
+        rq.reused = reuse;
         rq.prefill_pos = reuse;
         rq.cur_pos = reuse;
         rq.hist = rq.prompt_ids;
@@ -994,7 +1000,9 @@ inline int run_serve_loop(const ServeConfig& cfg, InkModelFile& mf, InkBackend& 
                     const bool cont = !(stop || hit_len || hit_hold || hit_loop);
                     if (!rq.slot_read) proto("T %d", tok);
                     const char* fin = stop ? "stop" : hit_hold ? "hold" : hit_len ? "length" : hit_loop ? "stop" : "admit";
-                    proto("DONE %d %d %.1f 0.0 %s", rq.slot_read ? 0 : 1, rq.prompt_len, rq.prompt_ms, fin);
+                    proto("DONE %d %d %.1f 0.0 %s %d %d %d",
+                          rq.slot_read ? 0 : 1, rq.prompt_len, rq.prompt_ms, fin,
+                          rq.drafts_accepted, rq.drafts_offered, rq.reused);
                     proto("BADM %d %d", rq.slot, cont ? 1 : 0);
                     if (rq.slot_read) proto("BT %d %d", rq.slot, tok);
                     rq.admitted = true;
