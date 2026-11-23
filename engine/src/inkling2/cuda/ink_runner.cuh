@@ -346,7 +346,9 @@ struct InkCudaModel {
         //    embedding tables (model.llm.embed.weight ~442 MiB + dspark.markov_head.markov_w1.weight ~50 MiB)
         //    to mapped pinned host RAM (only 1 row = 2.3 KB read per token -> ~0.2 us over PCIe!) to reclaim ~492 MiB VRAM!
         const bool offload_emb = (vtot_init <= (10ull << 30)) && (vfree_init < trunk_bytes + sec4_bytes + (1024ull << 20));
-        const bool use_unembed_arena = offload_emb && (sec4_bytes > (9ull << 30)) && man.trunk.count("model.llm.unembed.weight");
+        const bool use_unembed_arena = offload_emb
+            && man.trunk.count("model.llm.unembed.weight")
+            && (man.trunk.at("model.llm.unembed.weight").bytes >= (256ull << 20));
         if (offload_emb && man.trunk.count("model.llm.embed.weight")) {
             struct TEntry { std::string name; uint64_t orig_off; uint64_t bytes; bool is_dspark; };
             std::vector<TEntry> vram_list;
@@ -520,7 +522,7 @@ struct InkCudaModel {
             for (const auto& e : dir) max_body_all = std::max<size_t>(max_body_all, e.body_bytes);
             const size_t pf_bytes = 2 * InkHybridEngine::pf_stage_size(max_body_all);
             const size_t hyb_post_res = use_unembed_arena
-                ? (332ull << 20)
+                ? ((sec4_bytes > (9ull << 30)) ? (332ull << 20) : (460ull << 20))
                 : ultra_tight_8g
                     ? (360ull << 20)
                     : (vtot <= (10ull << 30))
