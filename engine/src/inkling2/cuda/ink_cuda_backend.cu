@@ -348,7 +348,7 @@ public:
         if (slot == 0 && dspark_ && dspark_->ready && dspark_slot_ == 0) {
             ck.dspark_k.clear(); ck.dspark_v.clear();
             for (int il = 0; il < 3; ++il) {
-                if (model_.man.c.dspark_is_swa[il] == 0) continue;
+                if (dspark_->ctx_is_fp8 || !dspark_->d_ctx_k[il] || model_.man.c.dspark_is_swa[il] == 0) continue;
                 const int cap = dspark_->ctx_cap[il];
                 const int s0 = std::max(0, seq_len - model_.man.c.dspark_swa_win);
                 const int np = seq_len - s0;
@@ -429,7 +429,7 @@ public:
         if (slot == 0 && ck.has_dspark && dspark_ && dspark_->ready) {
             size_t dk_o = 0, dv_o = 0;
             for (int il = 0; il < 3; ++il) {
-                if (model_.man.c.dspark_is_swa[il] == 0) continue;
+                if (dspark_->ctx_is_fp8 || !dspark_->d_ctx_k[il] || model_.man.c.dspark_is_swa[il] == 0) continue;
                 const int cap = dspark_->ctx_cap[il];
                 const int s0 = std::max(0, seq_len - model_.man.c.dspark_swa_win);
                 const int np = seq_len - s0;

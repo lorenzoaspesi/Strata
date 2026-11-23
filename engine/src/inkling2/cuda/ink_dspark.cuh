@@ -1399,10 +1399,10 @@ struct InkDSpark {
         if (vf_ctx < need_ctx + (320ull << 20)) {
             ctx_is_host_mapped = true;
             ctx_is_fp8 = true;
-            frnn_cap = max_ctx;
+            frnn_cap = std::max(64, r.max_batch + 32);
             const size_t kv_bytes = (size_t)max_ctx * kInkKVHeads * kInkHeadDim;
             const size_t sc_bytes = (size_t)max_ctx * kInkKVHeads * sizeof(float);
-            const size_t rnn_bytes = (size_t)max_ctx * kInkHidden * sizeof(float);
+            const size_t rnn_bytes = (size_t)frnn_cap * kInkHidden * sizeof(float);
             for (int il = 0; il < 3; ++il) {
                 ctx_cap[il] = max_ctx;
                 INK_CK(cudaHostAlloc(&h_ctx_k8[il],  kv_bytes, cudaHostAllocMapped));

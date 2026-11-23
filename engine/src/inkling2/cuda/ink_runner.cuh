@@ -520,7 +520,7 @@ struct InkCudaModel {
             for (const auto& e : dir) max_body_all = std::max<size_t>(max_body_all, e.body_bytes);
             const size_t pf_bytes = 2 * InkHybridEngine::pf_stage_size(max_body_all);
             const size_t hyb_post_res = use_unembed_arena
-                ? (280ull << 20)
+                ? (332ull << 20)
                 : ultra_tight_8g
                     ? (360ull << 20)
                     : (vtot <= (10ull << 30))
@@ -557,9 +557,11 @@ struct InkCudaModel {
             // pinned-RAM VRAM page tables can never starve pf_buf to 0 MB and silently skip host experts!
             if (n_host_experts > 0) {
                 hybrid.start_workers(cpu_threads);
-                if (!hybrid.alloc_pf_stage(max_exp_bytes)) {
-                    err = "not enough free VRAM for the 2x prefill staging buffers required by host experts; close other GPU apps or use a smaller pack";
-                    return false;
+                if (vtot > (10ull << 30)) {
+                    if (!hybrid.alloc_pf_stage(max_exp_bytes)) {
+                        err = "not enough free VRAM for the 2x prefill staging buffers required by host experts; close other GPU apps or use a smaller pack";
+                        return false;
+                    }
                 }
             }
             INK_CK(cudaMalloc(&d_sec4, std::max<size_t>(256, vram_used)));
@@ -2141,7 +2143,7 @@ struct InkCudaRunner {
             const size_t eff_extra = (vfree < (450ull << 20)) ? std::min(extra_post_reserve, (size_t)(24ull << 20)) : extra_post_reserve;
             const size_t ws_reserve = (vtot <= (10ull << 30) && m.n_host_experts > 0)
                 ? (((max_slots >= 8) ? (1400ull << 20)
-                  : (m.d_unembed_arena != nullptr) ? (104ull << 20)
+                  : (m.d_unembed_arena != nullptr) ? (92ull << 20)
                   : ((vfree < (450ull << 20)) ? (206ull << 20) : (456ull << 20))) + eff_extra)
                 : (((max_slots >= 8) ? (1280ull << 20) : (768ull << 20))
                   + (m.man.has_dspark ? (256ull << 20) : 0ull) + (wddm_fl / 2));
@@ -2375,11 +2377,12 @@ struct InkCudaRunner {
         meta_ring_idx = 0;
         h_meta_pin  = halloc_pinned<int32_t>(64ull * meta_ring_stride);
 
-        bool any_sf4_mx8 = false;
+        bool any_sf4_mx8 = false, any_mx8 = false;
         for (int il = 0; il < m.man.c.n_phys; ++il) {
-            if (m.moe_info[il].has_sf4 || m.moe_info[il].has_mx8) { any_sf4_mx8 = true; break; }
+            if (m.moe_info[il].has_sf4 || m.moe_info[il].has_mx8) any_sf4_mx8 = true;
+            if (m.moe_info[il].has_mx8) any_mx8 = true;
         }
-        moe_ws.alloc(decode_batch, any_sf4_mx8);
+        moe_ws.alloc(decode_batch, (m.sm_cc < 70) ? any_mx8 : any_sf4_mx8);
         snapshot_to(dec_ptrs);
 
         // When d_unembed_arena is active (8 GiB SQ-15), carve the entire M=max_batch prefill workspace

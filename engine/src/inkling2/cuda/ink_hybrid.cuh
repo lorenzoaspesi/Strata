@@ -1859,10 +1859,10 @@ inline void launch_ink_moe_hybrid(
         host_list.reserve(kInkExperts);
         std::vector<int> cpu_eids;
         std::vector<std::pair<int, int>> cpu_pairs;  // (pair_id, expert_id)
-        // Fast single-binning Pascal SGEMM prefill path (for SF4/MX8; S_K uses zero-sync tiled dp4a_i8!):
+        // Fast single-binning Pascal SGEMM prefill path (for MX8; S_K & SF4 both use zero-sync 26 TOPS tiled dp4a_i8 on sm_61!):
         const bool pascal_fast_pf = (M >= 24 && !hyb.ssd_only && cublas != nullptr && ws.pf_w_f32 != nullptr && ws.h_off_pin != nullptr
                                      && !sm120::available() && !ink_has_int8_tc() && !ink_has_wmma_f16()
-                                     && !(current_sm_arch() == 61 && info.has_sk && !info.has_sf4 && !info.has_mx8));
+                                     && !(current_sm_arch() == 61 && !info.has_mx8));
         std::vector<int> vram_list;
         auto is_off_gpu = [&](int key) -> bool {
             return (hyb.host_meta[key].body != nullptr || hyb.host_meta[key].cold_ssd) &&
@@ -1900,7 +1900,8 @@ inline void launch_ink_moe_hybrid(
             }
             // Zero-cliff small-spill fast path: when <= 6 cold experts miss (~2-6 MB) and PCIe staging is ready,
             // stream ALL of them asynchronously over PCIe H2D to GPU Tensor Cores (< 0.15 ms, zero x_f32 D2H, zero CPU wait!)
-            const bool stream_all_pcie = (hyb.dec_pcie_share < 0.0) && (host_list.size() <= 6) &&
+            const bool stream_all_pcie = (hyb.dec_pcie_share < 0.0) &&
+                                         (host_list.size() <= 6 || hyb.n_threads <= 4) &&
                                          (hyb.d_pf_stage[0] != nullptr) && (hyb.pf_stage_bytes > 0);
             const double share = (hyb.dec_pcie_share >= 0.0) ? hyb.dec_pcie_share
                                : (stream_all_pcie ? 1.0 : (hyb.sec4_is_pinned ? 0.65 : 0.55));

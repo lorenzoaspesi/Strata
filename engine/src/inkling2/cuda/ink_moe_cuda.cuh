@@ -1304,6 +1304,67 @@ __device__ __forceinline__ void mx8_decode16_h2(const uint4& wv, __half2 (&w)[8]
     w[6] = c2((uint16_t)(wv.w & 0xFFFFu)); w[7] = c2((uint16_t)(wv.w >> 16));
 }
 
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 610)
+// Pascal sm_61 direct FP32 decode helpers: eliminates ALL slow __floats2half2_rn / __half22float2 round-trips!
+__device__ __forceinline__ float sf4_dot16_f32(uint32_t w0, uint32_t w1, const float* xf) {
+    const float4 x0 = *reinterpret_cast<const float4*>(xf +  0);
+    const float4 x1 = *reinterpret_cast<const float4*>(xf +  4);
+    const float4 x2 = *reinterpret_cast<const float4*>(xf +  8);
+    const float4 x3 = *reinterpret_cast<const float4*>(xf + 12);
+    const float2 f0 = e2m1x2_byte_to_f32x2((uint8_t)(w0 & 0xFFu));
+    const float2 f1 = e2m1x2_byte_to_f32x2((uint8_t)((w0 >> 8) & 0xFFu));
+    const float2 f2 = e2m1x2_byte_to_f32x2((uint8_t)((w0 >> 16) & 0xFFu));
+    const float2 f3 = e2m1x2_byte_to_f32x2((uint8_t)(w0 >> 24));
+    const float2 f4 = e2m1x2_byte_to_f32x2((uint8_t)(w1 & 0xFFu));
+    const float2 f5 = e2m1x2_byte_to_f32x2((uint8_t)((w1 >> 8) & 0xFFu));
+    const float2 f6 = e2m1x2_byte_to_f32x2((uint8_t)((w1 >> 16) & 0xFFu));
+    const float2 f7 = e2m1x2_byte_to_f32x2((uint8_t)(w1 >> 24));
+    float a0 = f0.x * x0.x, a1 = f0.y * x0.y;
+    a0 = fmaf(f1.x, x0.z, a0); a1 = fmaf(f1.y, x0.w, a1);
+    a0 = fmaf(f2.x, x1.x, a0); a1 = fmaf(f2.y, x1.y, a1);
+    a0 = fmaf(f3.x, x1.z, a0); a1 = fmaf(f3.y, x1.w, a1);
+    a0 = fmaf(f4.x, x2.x, a0); a1 = fmaf(f4.y, x2.y, a1);
+    a0 = fmaf(f5.x, x2.z, a0); a1 = fmaf(f5.y, x2.w, a1);
+    a0 = fmaf(f6.x, x3.x, a0); a1 = fmaf(f6.y, x3.y, a1);
+    a0 = fmaf(f7.x, x3.z, a0); a1 = fmaf(f7.y, x3.w, a1);
+    return a0 + a1;
+}
+
+__device__ __forceinline__ void sf4_decode16_f32(uint32_t w0, uint32_t w1, float2 (&w)[8]) {
+    w[0] = e2m1x2_byte_to_f32x2((uint8_t)(w0 & 0xFFu));
+    w[1] = e2m1x2_byte_to_f32x2((uint8_t)((w0 >> 8) & 0xFFu));
+    w[2] = e2m1x2_byte_to_f32x2((uint8_t)((w0 >> 16) & 0xFFu));
+    w[3] = e2m1x2_byte_to_f32x2((uint8_t)(w0 >> 24));
+    w[4] = e2m1x2_byte_to_f32x2((uint8_t)(w1 & 0xFFu));
+    w[5] = e2m1x2_byte_to_f32x2((uint8_t)((w1 >> 8) & 0xFFu));
+    w[6] = e2m1x2_byte_to_f32x2((uint8_t)((w1 >> 16) & 0xFFu));
+    w[7] = e2m1x2_byte_to_f32x2((uint8_t)(w1 >> 24));
+}
+
+__device__ __forceinline__ void mx8_decode16_f32(const uint4& wv, float2 (&w)[8]) {
+    w[0] = e4m3x2_to_f32x2((uint16_t)(wv.x & 0xFFFFu)); w[1] = e4m3x2_to_f32x2((uint16_t)(wv.x >> 16));
+    w[2] = e4m3x2_to_f32x2((uint16_t)(wv.y & 0xFFFFu)); w[3] = e4m3x2_to_f32x2((uint16_t)(wv.y >> 16));
+    w[4] = e4m3x2_to_f32x2((uint16_t)(wv.z & 0xFFFFu)); w[5] = e4m3x2_to_f32x2((uint16_t)(wv.z >> 16));
+    w[6] = e4m3x2_to_f32x2((uint16_t)(wv.w & 0xFFFFu)); w[7] = e4m3x2_to_f32x2((uint16_t)(wv.w >> 16));
+}
+
+__device__ __forceinline__ float dot16_f32_2acc(const float2 (&w)[8], const float* xf) {
+    const float4 x0 = *reinterpret_cast<const float4*>(xf +  0);
+    const float4 x1 = *reinterpret_cast<const float4*>(xf +  4);
+    const float4 x2 = *reinterpret_cast<const float4*>(xf +  8);
+    const float4 x3 = *reinterpret_cast<const float4*>(xf + 12);
+    float a0 = w[0].x * x0.x, a1 = w[0].y * x0.y;
+    a0 = fmaf(w[1].x, x0.z, a0); a1 = fmaf(w[1].y, x0.w, a1);
+    a0 = fmaf(w[2].x, x1.x, a0); a1 = fmaf(w[2].y, x1.y, a1);
+    a0 = fmaf(w[3].x, x1.z, a0); a1 = fmaf(w[3].y, x1.w, a1);
+    a0 = fmaf(w[4].x, x2.x, a0); a1 = fmaf(w[4].y, x2.y, a1);
+    a0 = fmaf(w[5].x, x2.z, a0); a1 = fmaf(w[5].y, x2.w, a1);
+    a0 = fmaf(w[6].x, x3.x, a0); a1 = fmaf(w[6].y, x3.y, a1);
+    a0 = fmaf(w[7].x, x3.z, a0); a1 = fmaf(w[7].y, x3.w, a1);
+    return a0 + a1;
+}
+#endif
+
 __device__ __forceinline__ float dot16_h2_2acc(const __half2 (&w)[8], const __half2* xh2) {
     // 2x 128-bit LDS.128 loads + 2 independent accumulators -> zero pipeline stall!
     const uint4 v0 = *reinterpret_cast<const uint4*>(xh2);
@@ -1340,7 +1401,7 @@ __device__ __forceinline__ float dot16_h2_2acc(const __half2 (&w)[8], const __ha
 // ---- Ultra-Lean 128B-Coalesced uint4 High-Occupancy SF4/MX8 Gate+Up+SITU Kernel ----
 // Grid: (1152 / 16 = 72, max_active), Block: 128 (16 features/CTA, 8 lanes/feature -> 576 CTAs at M=1 = 3.4 full waves on 170 SMs!)
 // Uses 1-instruction hardware e4m3x2_to_f32x2 (zero branches!) + hoisted w_outer + dedicated n_e==1 fast path!
-template <int MAX_M>
+template <int MAX_M, bool MX8_ONLY = false>
 __global__ void __launch_bounds__(128) k_ink_moe_gu_sf4_mx8(
     const uint8_t* __restrict__ sec4_base,
     const InkExpertDev* __restrict__ experts,
@@ -1353,7 +1414,7 @@ __global__ void __launch_bounds__(128) k_ink_moe_gu_sf4_mx8(
     const int row0 = tb.off[e];
     const int n_total = tb.cnt[e];
     const InkExpertDev ed = experts[e];
-    if (ed.tier > 1 || (ed.gu_code != FMT_SF4 && ed.gu_code != FMT_MX8)) return;
+    if (ed.tier > 1 || (MX8_ONLY ? (ed.gu_code != FMT_MX8) : (ed.gu_code != FMT_SF4 && ed.gu_code != FMT_MX8))) return;
 
     const int tid  = threadIdx.x;
     const int sub  = tid >> 3;    // 0..15 features per CTA
@@ -1367,6 +1428,137 @@ __global__ void __launch_bounds__(128) k_ink_moe_gu_sf4_mx8(
         const float2 h01 = *reinterpret_cast<const float2*>(body);
         w_outer = h01.x / h01.y;
     }
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 610)
+    __shared__ alignas(16) float s_x[MAX_M][kInkHidden];
+    for (int off_m = 0; off_m < n_total; off_m += MAX_M) {
+        const int n_e = min(MAX_M, n_total - off_m);
+        for (int m = 0; m < n_e; ++m) {
+            const float4* src4 = reinterpret_cast<const float4*>(x_f32 + (size_t)tb.tok_idx[row0 + off_m + m] * kInkHidden);
+            float4* dst4 = reinterpret_cast<float4*>(s_x[m]);
+            for (int i = tid; i < (kInkHidden / 4); i += 128) dst4[i] = src4[i];
+        }
+        __syncthreads();
+        if (n_e == 1) {
+            float ag0 = 0.0f, au0 = 0.0f;
+            if (ed.gu_code == FMT_SF4) {
+                constexpr size_t W_P_ROW = kInkHidden / 2;
+                constexpr size_t W_S_ROW = kInkHidden / 16;
+                const uint8_t* base_p = body + 16;
+                const uint8_t* base_s = base_p + (size_t)(2 * kInkInter) * W_P_ROW;
+                const uint4* gp16 = reinterpret_cast<const uint4*>(base_p + (size_t)(2 * feat) * W_P_ROW);
+                const uint4* up16 = reinterpret_cast<const uint4*>(base_p + (size_t)(2 * feat + 1) * W_P_ROW);
+                const uint16_t* gs2 = reinterpret_cast<const uint16_t*>(base_s + (size_t)(2 * feat) * W_S_ROW);
+                const uint16_t* us2 = reinterpret_cast<const uint16_t*>(base_s + (size_t)(2 * feat + 1) * W_S_ROW);
+                for (int i = lg; i < 72; i += 8) {
+                    const uint4 gv = gp16[i], uv = up16[i];
+                    const float2 sg = e4m3x2_to_f32x2(gs2[i]);
+                    const float2 su = e4m3x2_to_f32x2(us2[i]);
+                    const float* xf0 = s_x[0] + i * 32;
+                    ag0 = fmaf(sf4_dot16_f32(gv.x, gv.y, xf0), sg.x, ag0);
+                    au0 = fmaf(sf4_dot16_f32(uv.x, uv.y, xf0), su.x, au0);
+                    ag0 = fmaf(sf4_dot16_f32(gv.z, gv.w, xf0 + 16), sg.y, ag0);
+                    au0 = fmaf(sf4_dot16_f32(uv.z, uv.w, xf0 + 16), su.y, au0);
+                }
+                ag0 *= w_outer; au0 *= w_outer;
+            } else {
+                constexpr size_t W_P_ROW = kInkHidden;
+                constexpr size_t W_S_ROW = kInkHidden / 32;
+                const uint8_t* base_p = body;
+                const uint8_t* base_s = base_p + (size_t)(2 * kInkInter) * W_P_ROW;
+                const uint4* gp16 = reinterpret_cast<const uint4*>(base_p + (size_t)(2 * feat) * W_P_ROW);
+                const uint4* up16 = reinterpret_cast<const uint4*>(base_p + (size_t)(2 * feat + 1) * W_P_ROW);
+                const uint8_t* gs = base_s + (size_t)(2 * feat) * W_S_ROW;
+                const uint8_t* us = base_s + (size_t)(2 * feat + 1) * W_S_ROW;
+                for (int i = lg; i < 144; i += 8) {
+                    const float sg = ue8m0_to_f32(gs[i >> 1]);
+                    const float su = ue8m0_to_f32(us[i >> 1]);
+                    float2 gw[8], uw[8];
+                    mx8_decode16_f32(gp16[i], gw);
+                    mx8_decode16_f32(up16[i], uw);
+                    const float* xf = s_x[0] + i * 16;
+                    ag0 = fmaf(dot16_f32_2acc(gw, xf), sg, ag0);
+                    au0 = fmaf(dot16_f32_2acc(uw, xf), su, au0);
+                }
+            }
+#pragma unroll
+            for (int o = 4; o >= 1; o >>= 1) {
+                ag0 += __shfl_xor_sync(0xFFFFFFFFu, ag0, o);
+                au0 += __shfl_xor_sync(0xFFFFFFFFu, au0, o);
+            }
+            if (lg == 0) h_f32[(size_t)(row0 + off_m) * kInkInter + feat] = situ_f32(ag0, au0);
+        } else {
+            float ag[MAX_M] = {}, au[MAX_M] = {};
+            if (ed.gu_code == FMT_SF4) {
+                constexpr size_t W_P_ROW = kInkHidden / 2;
+                constexpr size_t W_S_ROW = kInkHidden / 16;
+                const uint8_t* base_p = body + 16;
+                const uint8_t* base_s = base_p + (size_t)(2 * kInkInter) * W_P_ROW;
+                const uint4* gp16 = reinterpret_cast<const uint4*>(base_p + (size_t)(2 * feat) * W_P_ROW);
+                const uint4* up16 = reinterpret_cast<const uint4*>(base_p + (size_t)(2 * feat + 1) * W_P_ROW);
+                const uint16_t* gs2 = reinterpret_cast<const uint16_t*>(base_s + (size_t)(2 * feat) * W_S_ROW);
+                const uint16_t* us2 = reinterpret_cast<const uint16_t*>(base_s + (size_t)(2 * feat + 1) * W_S_ROW);
+                for (int i = lg; i < 72; i += 8) {
+                    const uint4 gv = gp16[i], uv = up16[i];
+                    const float2 sg = e4m3x2_to_f32x2(gs2[i]);
+                    const float2 su = e4m3x2_to_f32x2(us2[i]);
+                    float2 gw[8], uw[8];
+                    sf4_decode16_f32(gv.x, gv.y, gw);
+                    sf4_decode16_f32(uv.x, uv.y, uw);
+#pragma unroll
+                    for (int m = 0; m < MAX_M; ++m) if (m < n_e) {
+                        const float* xf = s_x[m] + i * 32;
+                        ag[m] = fmaf(dot16_f32_2acc(gw, xf), sg.x, ag[m]);
+                        au[m] = fmaf(dot16_f32_2acc(uw, xf), su.x, au[m]);
+                    }
+                    sf4_decode16_f32(gv.z, gv.w, gw);
+                    sf4_decode16_f32(uv.z, uv.w, uw);
+#pragma unroll
+                    for (int m = 0; m < MAX_M; ++m) if (m < n_e) {
+                        const float* xf = s_x[m] + i * 32 + 16;
+                        ag[m] = fmaf(dot16_f32_2acc(gw, xf), sg.y, ag[m]);
+                        au[m] = fmaf(dot16_f32_2acc(uw, xf), su.y, au[m]);
+                    }
+                }
+#pragma unroll
+                for (int m = 0; m < MAX_M; ++m) { ag[m] *= w_outer; au[m] *= w_outer; }
+            } else {
+                constexpr size_t W_P_ROW = kInkHidden;
+                constexpr size_t W_S_ROW = kInkHidden / 32;
+                const uint8_t* base_p = body;
+                const uint8_t* base_s = base_p + (size_t)(2 * kInkInter) * W_P_ROW;
+                const uint4* gp16 = reinterpret_cast<const uint4*>(base_p + (size_t)(2 * feat) * W_P_ROW);
+                const uint4* up16 = reinterpret_cast<const uint4*>(base_p + (size_t)(2 * feat + 1) * W_P_ROW);
+                const uint8_t* gs = base_s + (size_t)(2 * feat) * W_S_ROW;
+                const uint8_t* us = base_s + (size_t)(2 * feat + 1) * W_S_ROW;
+                for (int i = lg; i < 144; i += 8) {
+                    const float sg = ue8m0_to_f32(gs[i >> 1]);
+                    const float su = ue8m0_to_f32(us[i >> 1]);
+                    float2 gw[8], uw[8];
+                    mx8_decode16_f32(gp16[i], gw);
+                    mx8_decode16_f32(up16[i], uw);
+#pragma unroll
+                    for (int m = 0; m < MAX_M; ++m) if (m < n_e) {
+                        const float* xf = s_x[m] + i * 16;
+                        ag[m] = fmaf(dot16_f32_2acc(gw, xf), sg, ag[m]);
+                        au[m] = fmaf(dot16_f32_2acc(uw, xf), su, au[m]);
+                    }
+                }
+            }
+#pragma unroll
+            for (int m = 0; m < MAX_M; ++m) if (m < n_e) {
+                float gv = ag[m], uv = au[m];
+#pragma unroll
+                for (int o = 4; o >= 1; o >>= 1) {
+                    gv += __shfl_xor_sync(0xFFFFFFFFu, gv, o);
+                    uv += __shfl_xor_sync(0xFFFFFFFFu, uv, o);
+                }
+                if (lg == 0) h_f32[(size_t)(row0 + off_m + m) * kInkInter + feat] = situ_f32(gv, uv);
+            }
+        }
+        if (off_m + MAX_M < n_total) __syncthreads();
+    }
+    return;
+#else
     __shared__ alignas(16) __half2 s_x[MAX_M][kInkHidden / 2];
 
     for (int off_m = 0; off_m < n_total; off_m += MAX_M) {
@@ -1518,11 +1710,12 @@ __global__ void __launch_bounds__(128) k_ink_moe_gu_sf4_mx8(
         }
         if (off_m + MAX_M < n_total) __syncthreads();
     }
+#endif
 }
 
 // ---- Ultra-Lean 128B-Coalesced uint4 High-Occupancy SF4/MX8 Down Projection Kernel ----
 // Grid: (1152 / 16 = 72, max_active), Block: 128 (16 row-pairs/CTA -> 32 outputs/CTA, 576 CTAs at M=1 = 3.4 waves on 170 SMs!)
-template <int MAX_M>
+template <int MAX_M, bool MX8_ONLY = false>
 __global__ void __launch_bounds__(128) k_ink_moe_dn_sf4_mx8(
     const uint8_t* __restrict__ sec4_base,
     const InkExpertDev* __restrict__ experts,
@@ -1536,7 +1729,7 @@ __global__ void __launch_bounds__(128) k_ink_moe_dn_sf4_mx8(
     const int row0 = tb.off[e];
     const int n_total = tb.cnt[e];
     const InkExpertDev ed = experts[e];
-    if (ed.tier > 1 || (ed.dn_code != FMT_SF4 && ed.dn_code != FMT_MX8)) return;
+    if (ed.tier > 1 || (MX8_ONLY ? (ed.dn_code != FMT_MX8) : (ed.dn_code != FMT_SF4 && ed.dn_code != FMT_MX8))) return;
 
     const int tid    = threadIdx.x;
     const int sub    = tid >> 3;    // 0..15 row-pairs per CTA
@@ -1550,6 +1743,147 @@ __global__ void __launch_bounds__(128) k_ink_moe_dn_sf4_mx8(
         const float2 h23 = *reinterpret_cast<const float2*>(body + 8);
         w_outer = h23.x / h23.y;
     }
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 610)
+    __shared__ alignas(16) float s_h[MAX_M][kInkInter];
+    for (int off_m = 0; off_m < n_total; off_m += MAX_M) {
+        const int n_e = min(MAX_M, n_total - off_m);
+        for (int m = 0; m < n_e; ++m) {
+            const float4* src4 = reinterpret_cast<const float4*>(h_f32 + (size_t)(row0 + off_m + m) * kInkInter);
+            float4* dst4 = reinterpret_cast<float4*>(s_h[m]);
+            for (int i = tid; i < (kInkInter / 4); i += 128) dst4[i] = src4[i];
+        }
+        __syncthreads();
+        if (n_e == 1) {
+            float y0 = 0.0f, y1 = 0.0f;
+            if (ed.dn_code == FMT_SF4) {
+                constexpr size_t W_P_ROW = kInkInter / 2;
+                constexpr size_t W_S_ROW = kInkInter / 16;
+                const uint8_t* base_p = body + ed.dn_off;
+                const uint8_t* base_s = base_p + (size_t)kInkHidden * W_P_ROW;
+                const uint4* p0 = reinterpret_cast<const uint4*>(base_p + (size_t)(2 * pair_r) * W_P_ROW);
+                const uint4* p1 = reinterpret_cast<const uint4*>(base_p + (size_t)(2 * pair_r + 1) * W_P_ROW);
+                const uint16_t* s0 = reinterpret_cast<const uint16_t*>(base_s + (size_t)(2 * pair_r) * W_S_ROW);
+                const uint16_t* s1 = reinterpret_cast<const uint16_t*>(base_s + (size_t)(2 * pair_r + 1) * W_S_ROW);
+                for (int i = lg; i < 36; i += 8) {
+                    const uint4 v0 = p0[i], v1 = p1[i];
+                    const float2 sc0 = e4m3x2_to_f32x2(s0[i]);
+                    const float2 sc1 = e4m3x2_to_f32x2(s1[i]);
+                    const float* hf = s_h[0] + i * 32;
+                    y0 = fmaf(sf4_dot16_f32(v0.x, v0.y, hf), sc0.x, y0);
+                    y1 = fmaf(sf4_dot16_f32(v1.x, v1.y, hf), sc1.x, y1);
+                    y0 = fmaf(sf4_dot16_f32(v0.z, v0.w, hf + 16), sc0.y, y0);
+                    y1 = fmaf(sf4_dot16_f32(v1.z, v1.w, hf + 16), sc1.y, y1);
+                }
+                y0 *= w_outer; y1 *= w_outer;
+            } else {
+                constexpr size_t W_P_ROW = kInkInter;
+                constexpr size_t W_S_ROW = kInkInter / 32;
+                const uint8_t* base_p = body + ed.dn_off;
+                const uint8_t* base_s = base_p + (size_t)kInkHidden * W_P_ROW;
+                const uint4* p0 = reinterpret_cast<const uint4*>(base_p + (size_t)(2 * pair_r) * W_P_ROW);
+                const uint4* p1 = reinterpret_cast<const uint4*>(base_p + (size_t)(2 * pair_r + 1) * W_P_ROW);
+                const uint8_t* s0 = base_s + (size_t)(2 * pair_r) * W_S_ROW;
+                const uint8_t* s1 = base_s + (size_t)(2 * pair_r + 1) * W_S_ROW;
+                for (int i = lg; i < 72; i += 8) {
+                    const float sc0 = ue8m0_to_f32(s0[i >> 1]);
+                    const float sc1 = ue8m0_to_f32(s1[i >> 1]);
+                    float2 w0[8], w1[8];
+                    mx8_decode16_f32(p0[i], w0);
+                    mx8_decode16_f32(p1[i], w1);
+                    const float* hf = s_h[0] + i * 16;
+                    y0 = fmaf(dot16_f32_2acc(w0, hf), sc0, y0);
+                    y1 = fmaf(dot16_f32_2acc(w1, hf), sc1, y1);
+                }
+            }
+#pragma unroll
+            for (int o = 4; o >= 1; o >>= 1) {
+                y0 += __shfl_xor_sync(0xFFFFFFFFu, y0, o);
+                y1 += __shfl_xor_sync(0xFFFFFFFFu, y1, o);
+            }
+            if (lg == 0) {
+                const int pid = tb.pairs[row0 + off_m];
+                const float rw = topk_w[pid];
+                y_pair[(size_t)pid * kInkHidden + 2 * pair_r]     = y0 * rw;
+                y_pair[(size_t)pid * kInkHidden + 2 * pair_r + 1] = y1 * rw;
+            }
+        } else {
+            float a0[MAX_M] = {}, a1[MAX_M] = {};
+            if (ed.dn_code == FMT_SF4) {
+                constexpr size_t W_P_ROW = kInkInter / 2;
+                constexpr size_t W_S_ROW = kInkInter / 16;
+                const uint8_t* base_p = body + ed.dn_off;
+                const uint8_t* base_s = base_p + (size_t)kInkHidden * W_P_ROW;
+                const uint4* p0 = reinterpret_cast<const uint4*>(base_p + (size_t)(2 * pair_r) * W_P_ROW);
+                const uint4* p1 = reinterpret_cast<const uint4*>(base_p + (size_t)(2 * pair_r + 1) * W_P_ROW);
+                const uint16_t* s0 = reinterpret_cast<const uint16_t*>(base_s + (size_t)(2 * pair_r) * W_S_ROW);
+                const uint16_t* s1 = reinterpret_cast<const uint16_t*>(base_s + (size_t)(2 * pair_r + 1) * W_S_ROW);
+                for (int i = lg; i < 36; i += 8) {
+                    const uint4 v0 = p0[i], v1 = p1[i];
+                    const float2 sc0 = e4m3x2_to_f32x2(s0[i]);
+                    const float2 sc1 = e4m3x2_to_f32x2(s1[i]);
+                    float2 w0[8], w1[8];
+                    sf4_decode16_f32(v0.x, v0.y, w0);
+                    sf4_decode16_f32(v1.x, v1.y, w1);
+#pragma unroll
+                    for (int m = 0; m < MAX_M; ++m) if (m < n_e) {
+                        const float* hf = s_h[m] + i * 32;
+                        a0[m] = fmaf(dot16_f32_2acc(w0, hf), sc0.x, a0[m]);
+                        a1[m] = fmaf(dot16_f32_2acc(w1, hf), sc1.x, a1[m]);
+                    }
+                    sf4_decode16_f32(v0.z, v0.w, w0);
+                    sf4_decode16_f32(v1.z, v1.w, w1);
+#pragma unroll
+                    for (int m = 0; m < MAX_M; ++m) if (m < n_e) {
+                        const float* hf = s_h[m] + i * 32 + 16;
+                        a0[m] = fmaf(dot16_f32_2acc(w0, hf), sc0.y, a0[m]);
+                        a1[m] = fmaf(dot16_f32_2acc(w1, hf), sc1.y, a1[m]);
+                    }
+                }
+#pragma unroll
+                for (int m = 0; m < MAX_M; ++m) { a0[m] *= w_outer; a1[m] *= w_outer; }
+            } else {
+                constexpr size_t W_P_ROW = kInkInter;
+                constexpr size_t W_S_ROW = kInkInter / 32;
+                const uint8_t* base_p = body + ed.dn_off;
+                const uint8_t* base_s = base_p + (size_t)kInkHidden * W_P_ROW;
+                const uint4* p0 = reinterpret_cast<const uint4*>(base_p + (size_t)(2 * pair_r) * W_P_ROW);
+                const uint4* p1 = reinterpret_cast<const uint4*>(base_p + (size_t)(2 * pair_r + 1) * W_P_ROW);
+                const uint8_t* s0 = base_s + (size_t)(2 * pair_r) * W_S_ROW;
+                const uint8_t* s1 = base_s + (size_t)(2 * pair_r + 1) * W_S_ROW;
+                for (int i = lg; i < 72; i += 8) {
+                    const float sc0 = ue8m0_to_f32(s0[i >> 1]);
+                    const float sc1 = ue8m0_to_f32(s1[i >> 1]);
+                    float2 w0[8], w1[8];
+                    mx8_decode16_f32(p0[i], w0);
+                    mx8_decode16_f32(p1[i], w1);
+#pragma unroll
+                    for (int m = 0; m < MAX_M; ++m) if (m < n_e) {
+                        const float* hf = s_h[m] + i * 16;
+                        a0[m] = fmaf(dot16_f32_2acc(w0, hf), sc0, a0[m]);
+                        a1[m] = fmaf(dot16_f32_2acc(w1, hf), sc1, a1[m]);
+                    }
+                }
+            }
+#pragma unroll
+            for (int m = 0; m < MAX_M; ++m) if (m < n_e) {
+                float y0 = a0[m], y1 = a1[m];
+#pragma unroll
+                for (int o = 4; o >= 1; o >>= 1) {
+                    y0 += __shfl_xor_sync(0xFFFFFFFFu, y0, o);
+                    y1 += __shfl_xor_sync(0xFFFFFFFFu, y1, o);
+                }
+                if (lg == 0) {
+                    const int pid = tb.pairs[row0 + off_m + m];
+                    const float rw = topk_w[pid];
+                    y_pair[(size_t)pid * kInkHidden + 2 * pair_r]     = y0 * rw;
+                    y_pair[(size_t)pid * kInkHidden + 2 * pair_r + 1] = y1 * rw;
+                }
+            }
+        }
+        if (off_m + MAX_M < n_total) __syncthreads();
+    }
+    return;
+#else
     __shared__ alignas(16) __half2 s_h[MAX_M][kInkInter / 2];
 
     for (int off_m = 0; off_m < n_total; off_m += MAX_M) {
@@ -1711,6 +2045,7 @@ __global__ void __launch_bounds__(128) k_ink_moe_dn_sf4_mx8(
         }
         if (off_m + MAX_M < n_total) __syncthreads();
     }
+#endif
 }
 
 // ---- Ultra-Fast 4-Lane/Feature (32 Features/CTA, Zero Inner Shuffles!) S_K Decode/Verify Kernels! ----
@@ -3584,6 +3919,230 @@ __global__ void __launch_bounds__(128) k_ink_moe_dn_sk_tile16(
 }
 
 // ============================================================================
+// 4E-2. Pascal (sm_61) Tiled 16-Token dp4a_i8 SF4 (NVFP4) MoE Prefill Kernels (26 TOPS, Zero FP32 Staging!)
+//       2 * E2M1 is bit-exact int8_t -> {0, +/-1, +/-2, +/-3, +/-4, +/-6, +/-8, +/-12}.
+//       Eliminates ~390 GB/chunk of FP32 weight dequant DRAM round-trips on SQ-15 Core & Prelude/Coda!
+// ============================================================================
+__device__ __forceinline__ uint32_t sf4_unpack4_i8x4(uint16_t b2) {
+    // 2 packed bytes -> 4 E2M1 nibbles -> 4 signed int8_t (2x exact value) packed in uint32_t!
+    static constexpr int8_t kLut[16] = {0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12};
+    const uint32_t v0 = (uint8_t)kLut[b2 & 0xFu];
+    const uint32_t v1 = (uint8_t)kLut[(b2 >> 4) & 0xFu];
+    const uint32_t v2 = (uint8_t)kLut[(b2 >> 8) & 0xFu];
+    const uint32_t v3 = (uint8_t)kLut[(b2 >> 12) & 0xFu];
+    return v0 | (v1 << 8) | (v2 << 16) | (v3 << 24);
+}
+
+__device__ __forceinline__ void sf4_unpack64_i8x4(
+    const uint4* __restrict__ p16_2,  // 2 x uint4 = 32 bytes = 64 E2M1 nibbles
+    uint32_t (&w)[16]) {
+    const uint4 v0 = p16_2[0];
+    const uint4 v1 = p16_2[1];
+    w[ 0] = sf4_unpack4_i8x4((uint16_t)(v0.x & 0xFFFFu));
+    w[ 1] = sf4_unpack4_i8x4((uint16_t)(v0.x >> 16));
+    w[ 2] = sf4_unpack4_i8x4((uint16_t)(v0.y & 0xFFFFu));
+    w[ 3] = sf4_unpack4_i8x4((uint16_t)(v0.y >> 16));
+    w[ 4] = sf4_unpack4_i8x4((uint16_t)(v0.z & 0xFFFFu));
+    w[ 5] = sf4_unpack4_i8x4((uint16_t)(v0.z >> 16));
+    w[ 6] = sf4_unpack4_i8x4((uint16_t)(v0.w & 0xFFFFu));
+    w[ 7] = sf4_unpack4_i8x4((uint16_t)(v0.w >> 16));
+    w[ 8] = sf4_unpack4_i8x4((uint16_t)(v1.x & 0xFFFFu));
+    w[ 9] = sf4_unpack4_i8x4((uint16_t)(v1.x >> 16));
+    w[10] = sf4_unpack4_i8x4((uint16_t)(v1.y & 0xFFFFu));
+    w[11] = sf4_unpack4_i8x4((uint16_t)(v1.y >> 16));
+    w[12] = sf4_unpack4_i8x4((uint16_t)(v1.z & 0xFFFFu));
+    w[13] = sf4_unpack4_i8x4((uint16_t)(v1.z >> 16));
+    w[14] = sf4_unpack4_i8x4((uint16_t)(v1.w & 0xFFFFu));
+    w[15] = sf4_unpack4_i8x4((uint16_t)(v1.w >> 16));
+}
+
+__device__ __forceinline__ float sf4_dp64_smem(
+    const uint32_t (&w)[16], uint32_t sc4, const InkQ8_1_G64& xb) {
+    const uint4* x4 = reinterpret_cast<const uint4*>(xb.qs);
+    const float2 s01 = e4m3x2_to_f32x2((uint16_t)(sc4 & 0xFFFFu));
+    const float2 s23 = e4m3x2_to_f32x2((uint16_t)(sc4 >> 16));
+    int32_t i0 = dp4a_i8(w[ 0], x4[0].x, dp4a_i8(w[ 1], x4[0].y, dp4a_i8(w[ 2], x4[0].z, dp4a_i8(w[ 3], x4[0].w, 0))));
+    int32_t i1 = dp4a_i8(w[ 4], x4[1].x, dp4a_i8(w[ 5], x4[1].y, dp4a_i8(w[ 6], x4[1].z, dp4a_i8(w[ 7], x4[1].w, 0))));
+    int32_t i2 = dp4a_i8(w[ 8], x4[2].x, dp4a_i8(w[ 9], x4[2].y, dp4a_i8(w[10], x4[2].z, dp4a_i8(w[11], x4[2].w, 0))));
+    int32_t i3 = dp4a_i8(w[12], x4[3].x, dp4a_i8(w[13], x4[3].y, dp4a_i8(w[14], x4[3].z, dp4a_i8(w[15], x4[3].w, 0))));
+    float sum = fmaf(s01.x, (float)i0, fmaf(s01.y, (float)i1, fmaf(s23.x, (float)i2, s23.y * (float)i3)));
+    return sum * xb.d;
+}
+
+// Grid: (1152 / 32 = 36, max_tiles), Block: 128 (32 features/CTA, 4 lanes/feature, 5.1 KB smem -> max occupancy!)
+__global__ void __launch_bounds__(128) k_ink_moe_gu_sf4_tile16(
+    const uint8_t* __restrict__ sec4_base,
+    const InkExpertDev* __restrict__ experts,
+    InkMoeTables tb,
+    const InkQ8_1_G64* __restrict__ x_sk,
+    float* __restrict__ h_f32) {
+    const int t_idx = blockIdx.y;
+    if (t_idx >= *tb.n_tiles) return;
+    const int2 tl = tb.tiles[t_idx];
+    const int e = tl.x;
+    const int row0 = tl.y;
+    const int n_e = min(16, tb.off[e + 1] - row0);
+    if (n_e <= 0) return;
+    const InkExpertDev ed = experts[e];
+    if (ed.tier > 1 || ed.gu_code != FMT_SF4) return;
+
+    const int tid  = threadIdx.x;
+    const int sub  = tid >> 2;
+    const int g    = tid & 3;
+    const int feat = blockIdx.x * 32 + sub;
+
+    __shared__ int32_t s_tok[16];
+    __shared__ alignas(16) InkQ8_1_G64 s_xq[16][4];  // 5,120 B
+    if (tid < n_e) s_tok[tid] = tb.tok_idx[row0 + tid];
+    __syncthreads();
+
+    const uint8_t* body = sec4_base + ed.body_off;
+    const float2 h01 = *reinterpret_cast<const float2*>(body);
+    const float w_scale = 0.5f * (h01.x / h01.y);
+    constexpr size_t W_P_ROW = kInkHidden / 2;   // 1152 B
+    constexpr size_t W_S_ROW = kInkHidden / 16;  // 144 B
+    const uint8_t* base_p = body + 16;
+    const uint8_t* base_s = base_p + (size_t)(2 * kInkInter) * W_P_ROW;
+    const uint4* gp = reinterpret_cast<const uint4*>(base_p + (size_t)(2 * feat) * W_P_ROW);
+    const uint4* up = reinterpret_cast<const uint4*>(base_p + (size_t)(2 * feat + 1) * W_P_ROW);
+    const uint32_t* gs = reinterpret_cast<const uint32_t*>(base_s + (size_t)(2 * feat) * W_S_ROW);
+    const uint32_t* us = reinterpret_cast<const uint32_t*>(base_s + (size_t)(2 * feat + 1) * W_S_ROW);
+
+    float ag[16] = {}, au[16] = {};
+    const int tot_u4 = n_e * 20;
+
+    for (int s = 0; s < 9; ++s) {
+        for (int idx = tid; idx < tot_u4; idx += 128) {
+            const int m   = idx / 20;
+            const int rem = idx - m * 20;
+            const int gg  = rem / 5;
+            const int u4i = rem - gg * 5;
+            const uint4* src = reinterpret_cast<const uint4*>(&x_sk[(size_t)s_tok[m] * (kInkHidden / 64) + s * 4 + gg]);
+            uint4* dst = reinterpret_cast<uint4*>(&s_xq[m][gg]);
+            dst[u4i] = src[u4i];
+        }
+        __syncthreads();
+        if (feat < kInkInter) {
+            const int g_idx = s * 4 + g;
+            uint32_t wg[16], wu[16];
+            sf4_unpack64_i8x4(gp + g_idx * 2, wg);
+            sf4_unpack64_i8x4(up + g_idx * 2, wu);
+            const uint32_t sg4 = gs[g_idx];
+            const uint32_t su4 = us[g_idx];
+#pragma unroll
+            for (int m = 0; m < 16; ++m) {
+                if (m < n_e) {
+                    const InkQ8_1_G64& xb = s_xq[m][g];
+                    ag[m] += sf4_dp64_smem(wg, sg4, xb);
+                    au[m] += sf4_dp64_smem(wu, su4, xb);
+                }
+            }
+        }
+        if (s < 8) __syncthreads();
+    }
+
+    if (feat < kInkInter) {
+#pragma unroll
+        for (int m = 0; m < 16; ++m) {
+            if (m < n_e) {
+                float gv = ag[m], uv = au[m];
+                gv += __shfl_xor_sync(0xFFFFFFFFu, gv, 2); gv += __shfl_xor_sync(0xFFFFFFFFu, gv, 1);
+                uv += __shfl_xor_sync(0xFFFFFFFFu, uv, 2); uv += __shfl_xor_sync(0xFFFFFFFFu, uv, 1);
+                if (g == 0) h_f32[(size_t)(row0 + m) * kInkInter + feat] = situ_f32(gv * w_scale, uv * w_scale);
+            }
+        }
+    }
+}
+
+__global__ void __launch_bounds__(128) k_ink_moe_dn_sf4_tile16(
+    const uint8_t* __restrict__ sec4_base,
+    const InkExpertDev* __restrict__ experts,
+    InkMoeTables tb,
+    const InkQ8_1_G64* __restrict__ h_sk,
+    const float* __restrict__ topk_w,
+    float* __restrict__ y_pair) {
+    const int t_idx = blockIdx.y;
+    if (t_idx >= *tb.n_tiles) return;
+    const int2 tl = tb.tiles[t_idx];
+    const int e = tl.x;
+    const int row0 = tl.y;
+    const int n_e = min(16, tb.off[e + 1] - row0);
+    if (n_e <= 0) return;
+    const InkExpertDev ed = experts[e];
+    if (ed.tier > 1 || ed.dn_code != FMT_SF4) return;
+
+    const int tid    = threadIdx.x;
+    const int sub    = tid >> 2;
+    const int g      = tid & 3;
+    const int pair_r = blockIdx.x * 32 + sub;
+
+    __shared__ alignas(16) InkQ8_1_G64 s_hq[16][4];  // 5,120 B
+    const uint8_t* body = sec4_base + ed.body_off;
+    const float2 h23 = *reinterpret_cast<const float2*>(body + 8);
+    const float w_scale = 0.5f * (h23.x / h23.y);
+    constexpr size_t W_P_ROW = kInkInter / 2;   // 576 B
+    constexpr size_t W_S_ROW = kInkInter / 16;  // 72 B
+    const uint8_t* base_p = body + ed.dn_off;
+    const uint8_t* base_s = base_p + (size_t)kInkHidden * W_P_ROW;
+    const uint4* p0 = reinterpret_cast<const uint4*>(base_p + (size_t)(2 * pair_r) * W_P_ROW);
+    const uint4* p1 = reinterpret_cast<const uint4*>(base_p + (size_t)(2 * pair_r + 1) * W_P_ROW);
+    const uint32_t* s0 = reinterpret_cast<const uint32_t*>(base_s + (size_t)(2 * pair_r) * W_S_ROW);
+    const uint32_t* s1 = reinterpret_cast<const uint32_t*>(base_s + (size_t)(2 * pair_r + 1) * W_S_ROW);
+
+    float a0[16] = {}, a1[16] = {};
+    constexpr int NG = kInkInter / 64;  // 18
+
+    for (int s = 0; s < 5; ++s) {
+        const int ng_step = min(4, NG - s * 4);
+        const int tot_u4 = n_e * ng_step * 5;
+        for (int idx = tid; idx < tot_u4; idx += 128) {
+            const int m   = idx / (ng_step * 5);
+            const int rem = idx - m * (ng_step * 5);
+            const int gg  = rem / 5;
+            const int u4i = rem - gg * 5;
+            const uint4* src = reinterpret_cast<const uint4*>(&h_sk[(size_t)(row0 + m) * NG + s * 4 + gg]);
+            uint4* dst = reinterpret_cast<uint4*>(&s_hq[m][gg]);
+            dst[u4i] = src[u4i];
+        }
+        __syncthreads();
+        if (pair_r < kInkHidden / 2 && g < ng_step) {
+            const int g_idx = s * 4 + g;
+            uint32_t w0[16], w1[16];
+            sf4_unpack64_i8x4(p0 + g_idx * 2, w0);
+            sf4_unpack64_i8x4(p1 + g_idx * 2, w1);
+            const uint32_t sc0 = s0[g_idx];
+            const uint32_t sc1 = s1[g_idx];
+#pragma unroll
+            for (int m = 0; m < 16; ++m) {
+                if (m < n_e) {
+                    const InkQ8_1_G64& xb = s_hq[m][g];
+                    a0[m] += sf4_dp64_smem(w0, sc0, xb);
+                    a1[m] += sf4_dp64_smem(w1, sc1, xb);
+                }
+            }
+        }
+        if (s < 4) __syncthreads();
+    }
+
+    if (pair_r < kInkHidden / 2) {
+#pragma unroll
+        for (int m = 0; m < 16; ++m) {
+            if (m < n_e) {
+                float y0 = a0[m], y1 = a1[m];
+                y0 += __shfl_xor_sync(0xFFFFFFFFu, y0, 2); y0 += __shfl_xor_sync(0xFFFFFFFFu, y0, 1);
+                y1 += __shfl_xor_sync(0xFFFFFFFFu, y1, 2); y1 += __shfl_xor_sync(0xFFFFFFFFu, y1, 1);
+                if (g == 0) {
+                    const int pid = tb.pairs[row0 + m];
+                    const float rw = topk_w[pid] * w_scale;
+                    y_pair[(size_t)pid * kInkHidden + 2 * pair_r]     = y0 * rw;
+                    y_pair[(size_t)pid * kInkHidden + 2 * pair_r + 1] = y1 * rw;
+                }
+            }
+        }
+    }
+}
+
+// ============================================================================
 // 4F. Pascal (sm_60/61) FP32 cuBLAS SGEMM MoE Prefill Path (6.5 TFLOPS on GTX 1070!)
 //     Dequantizes each active expert ONCE into pf_w_f32 and multiplies all routed tokens via cublasSgemm.
 // ============================================================================
@@ -3788,14 +4347,15 @@ inline void launch_ink_moe_dispatch_only(
     const bool use_sm120_tc = (!force_exact_dec && M >= 24 && sm120::available());
     const bool use_fp16_tc  = (!use_sm120_tc && M >= 24 && ink_has_int8_tc());
     const bool use_wmma_tc  = (!use_sm120_tc && !use_fp16_tc && M >= 24 && ink_has_wmma_f16());
-    const bool use_pascal_dp4a_sk = (!use_sm120_tc && !use_fp16_tc && !use_wmma_tc && M >= 24 && current_sm_arch() == 61 && info.has_sk);
+    const bool use_pascal_dp4a_sk  = (!use_sm120_tc && !use_fp16_tc && !use_wmma_tc && M >= 24 && current_sm_arch() == 61 && info.has_sk);
+    const bool use_pascal_dp4a_sf4 = (!use_sm120_tc && !use_fp16_tc && !use_wmma_tc && M >= 24 && current_sm_arch() == 61 && info.has_sf4);
     const bool use_pascal_sgemm = (!use_sm120_tc && !use_fp16_tc && !use_wmma_tc && M >= 24 && cublas != nullptr && ws.pf_w_f32 != nullptr && ws.h_off_pin != nullptr
-                                   && (!use_pascal_dp4a_sk || info.has_sf4 || info.has_mx8));
+                                   && ((!use_pascal_dp4a_sk && !use_pascal_dp4a_sf4) || info.has_mx8));
     const int tile_rows = use_wmma_tc ? ((M <= 128) ? 16 : 64)
-                                      : ((M <= 128 || use_fp16_tc || use_pascal_dp4a_sk) ? 16 : 64);
+                                      : ((M <= 128 || use_fp16_tc || use_pascal_dp4a_sk || use_pascal_dp4a_sf4) ? 16 : 64);
     k_ink_moe_bin<<<1, 128, 0, st>>>(experts, ws.topk_idx, M, tile_rows, ws.tb);
 
-    if (use_pascal_sgemm && !use_pascal_dp4a_sk) {
+    if (use_pascal_sgemm && !use_pascal_dp4a_sk && !use_pascal_dp4a_sf4) {
         INK_CK(cudaMemcpyAsync(ws.h_off_pin, ws.tb.off, (size_t)(kInkExperts + 1) * sizeof(int32_t), cudaMemcpyDeviceToHost, st));
         INK_CK(cudaStreamSynchronize(st));
         for (int e = 0; e < kInkExperts; ++e) {
@@ -3857,6 +4417,23 @@ inline void launch_ink_moe_dispatch_only(
             const unsigned grid = (unsigned)std::min(std::max(1, mt * 18), 2048);
             k_ink_moe_sf4_mx8_fp16tc<true><<<grid, 256, 0, st>>>(sec4_base, experts, ws.tb, x_f32, nullptr, ws.h_f32);
             k_ink_moe_sf4_mx8_fp16tc<false><<<grid, 256, 0, st>>>(sec4_base, experts, ws.tb, ws.h_f32, ws.topk_w, ws.y_pair);
+        } else if (use_pascal_dp4a_sf4) {
+            if (!quant_x_done) {
+                const int nblk_x = M * (kInkHidden / 64);
+                k_ink_quant_q8_1<<<(nblk_x + 7) / 8, 256, 0, st>>>(x_f32, ws.xq_sk, M, kInkHidden);
+                quant_x_done = true;
+            }
+            const int mt = ink_moe_max_tiles(M, 16);
+            dim3 g32(kInkInter / 32, mt);
+            k_ink_moe_gu_sf4_tile16<<<g32, 128, 0, st>>>(sec4_base, experts, ws.tb, ws.xq_sk, ws.h_f32);
+            const int nblk_h = P * (kInkInter / 64);
+            k_ink_quant_q8_1_active<<<(nblk_h + 7) / 8, 256, 0, st>>>(ws.h_f32, ws.hq_sk, ws.tb.off + kInkExperts, kInkInter);
+            k_ink_moe_dn_sf4_tile16<<<g32, 128, 0, st>>>(sec4_base, experts, ws.tb, ws.hq_sk, ws.topk_w, ws.y_pair);
+            if (info.has_mx8) {
+                dim3 g16(kInkInter / 16, max_act);
+                k_ink_moe_gu_sf4_mx8<4, true><<<g16, 128, 0, st>>>(sec4_base, experts, ws.tb, x_f32, ws.h_f32);
+                k_ink_moe_dn_sf4_mx8<4, true><<<g16, 128, 0, st>>>(sec4_base, experts, ws.tb, ws.h_f32, ws.topk_w, ws.y_pair);
+            }
         } else {
             dim3 g16(kInkInter / 16, max_act);
             if (M == 1) {
