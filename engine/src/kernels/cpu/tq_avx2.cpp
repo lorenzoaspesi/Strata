@@ -207,9 +207,80 @@ void tq_rows_avx2_tqp(int kb, const uint8_t* w, size_t row_bytes, int n, const T
     else rows_tqp_t<7>(w, row_bytes, n, a, nt, out, r0, r1);
 }
 
+// Specialized bit-exact TQ2_T (KB=8) AVX2 kernel: vectorized 32-state extraction (_mm_alignr_epi8 + unpack)
+// and 8x vpgatherqq from the state table, split into two 64-weight halves to prevent YMM register spills.
+// Bit-for-bit identical to rows_t<8> (+39-42% faster at nt=1, +26% at nt=4 on Intel Kaby Lake).
+template <int NT_CONST>
+void rows_tq2_gather(const int16_t* table, const uint8_t* w, size_t row_bytes, int n, const TqAct* const* a, int nt_rt,
+                     float* const* out, int r0, int r1) {
+    const int nt = (NT_CONST > 0) ? NT_CONST : nt_rt;
+    const int nb = n / 128;
+    constexpr size_t bsz = 34;
+    const long long* tab = (const long long*) table;
+    const __m128i vmask15 = _mm_set1_epi16(0x7fff);
+    for (int r = r0; r < r1; ++r) {
+        const uint8_t* x = w + (size_t) r * row_bytes;
+        __m128 acc[NT_CONST > 0 ? NT_CONST : kTqMaxTokens];
+        for (int t = 0; t < nt; ++t) acc[t] = _mm_setzero_ps();
+        for (int i = 0; i < nb; ++i) {
+            const uint8_t* blk = x + (size_t) i * bsz;
+            const uint8_t* qs = blk + 2;
+            const __m128i lo16 = _mm_loadu_si128((const __m128i*) qs);
+            const __m128i hi16 = _mm_loadu_si128((const __m128i*) (qs + 16));
+            const __m128i prev_lo16 = _mm_alignr_epi8(lo16, hi16, 15);
+            const __m128i prev_hi16 = _mm_alignr_epi8(hi16, lo16, 15);
+            const __m128i st0 = _mm_and_si128(_mm_unpacklo_epi8(lo16, prev_lo16), vmask15);
+            const __m128i st1 = _mm_and_si128(_mm_unpackhi_epi8(lo16, prev_lo16), vmask15);
+            const __m128i st2 = _mm_and_si128(_mm_unpacklo_epi8(hi16, prev_hi16), vmask15);
+            const __m128i st3 = _mm_and_si128(_mm_unpackhi_epi8(hi16, prev_hi16), vmask15);
+            const __m128 dx = _mm_set1_ps(tq_half_to_float(tq_ld16(blk)));
+
+            const __m256i w0 = _mm256_i32gather_epi64(tab, _mm_cvtepu16_epi32(st0), 8);
+            const __m256i w1 = _mm256_i32gather_epi64(tab, _mm_cvtepu16_epi32(_mm_srli_si128(st0, 8)), 8);
+            const __m256i w2 = _mm256_i32gather_epi64(tab, _mm_cvtepu16_epi32(st1), 8);
+            const __m256i w3 = _mm256_i32gather_epi64(tab, _mm_cvtepu16_epi32(_mm_srli_si128(st1, 8)), 8);
+            __m256i lo_h[NT_CONST > 0 ? NT_CONST : kTqMaxTokens];
+            for (int t = 0; t < nt; ++t) {
+                const __m256i* q = (const __m256i*) (a[t]->q + 128 * i);
+                const __m256i p0 = _mm256_add_epi32(_mm256_madd_epi16(w0, _mm256_load_si256(q + 0)),
+                                                    _mm256_madd_epi16(w1, _mm256_load_si256(q + 1)));
+                const __m256i p1 = _mm256_add_epi32(_mm256_madd_epi16(w2, _mm256_load_si256(q + 2)),
+                                                    _mm256_madd_epi16(w3, _mm256_load_si256(q + 3)));
+                lo_h[t] = _mm256_hadd_epi32(p0, p1);
+            }
+
+            const __m256i w4 = _mm256_i32gather_epi64(tab, _mm_cvtepu16_epi32(st2), 8);
+            const __m256i w5 = _mm256_i32gather_epi64(tab, _mm_cvtepu16_epi32(_mm_srli_si128(st2, 8)), 8);
+            const __m256i w6 = _mm256_i32gather_epi64(tab, _mm_cvtepu16_epi32(st3), 8);
+            const __m256i w7 = _mm256_i32gather_epi64(tab, _mm_cvtepu16_epi32(_mm_srli_si128(st3, 8)), 8);
+            for (int t = 0; t < nt; ++t) {
+                const __m256i* q = (const __m256i*) (a[t]->q + 128 * i);
+                const __m256i p2 = _mm256_add_epi32(_mm256_madd_epi16(w4, _mm256_load_si256(q + 4)),
+                                                    _mm256_madd_epi16(w5, _mm256_load_si256(q + 5)));
+                const __m256i p3 = _mm256_add_epi32(_mm256_madd_epi16(w6, _mm256_load_si256(q + 6)),
+                                                    _mm256_madd_epi16(w7, _mm256_load_si256(q + 7)));
+                const __m256i h = _mm256_hadd_epi32(lo_h[t], _mm256_hadd_epi32(p2, p3));
+                const __m128i s = _mm_add_epi32(_mm256_castsi256_si128(h), _mm256_extracti128_si256(h, 1));
+                const __m128 sc = _mm_mul_ps(dx, _mm_loadu_ps(a[t]->d + 4 * i));
+                acc[t] = _mm_fmadd_ps(_mm_cvtepi32_ps(s), sc, acc[t]);
+            }
+        }
+        for (int t = 0; t < nt; ++t) {
+            alignas(16) float v[4];
+            _mm_store_ps(v, acc[t]);
+            out[t][r] = ((v[0] + v[1]) + (v[2] + v[3])) * (1.0f / 8192.0f);
+        }
+    }
+}
+
 void tq_rows_avx2(int kb, const int16_t* table, const uint8_t* w, size_t row_bytes, int n, const TqAct* const* a, int nt,
                   float* const* out, int r0, int r1) {
-    if (kb == 8) rows_t<8>(table, w, row_bytes, n, a, nt, out, r0, r1);
+    if (kb == 8) {
+        if (nt == 1) rows_tq2_gather<1>(table, w, row_bytes, n, a, 1, out, r0, r1);
+        else if (nt == 2) rows_tq2_gather<2>(table, w, row_bytes, n, a, 2, out, r0, r1);
+        else if (nt == 4) rows_tq2_gather<4>(table, w, row_bytes, n, a, 4, out, r0, r1);
+        else rows_tq2_gather<0>(table, w, row_bytes, n, a, nt, out, r0, r1);
+    }
     else if (kb == 6) rows_t<6>(table, w, row_bytes, n, a, nt, out, r0, r1);
     else if (kb == 5) rows_t<5>(table, w, row_bytes, n, a, nt, out, r0, r1);   // experimental TQK5X
     else if (kb == 4) rows_t<4>(table, w, row_bytes, n, a, nt, out, r0, r1);   // experimental TQK4X

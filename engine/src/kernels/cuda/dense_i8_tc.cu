@@ -1690,13 +1690,15 @@ struct Q81F32Block {
 };
 static_assert(sizeof(Q81F32Block) == 40);
 
-__global__ void quantize_f16_to_q8_1_f32_kernel(const uint16_t* __restrict__ x_f16, Q81F32Block* __restrict__ out,
+template <bool X_BF16>
+__global__ void quantize_f16_to_q8_1_f32_kernel(const uint16_t* __restrict__ x_16, Q81F32Block* __restrict__ out,
                                                 int64_t total_blocks) {
     const int lane = threadIdx.x & 31;
     const int64_t warps_per_blk = (int64_t) (blockDim.x >> 5);
     const int64_t stride = (int64_t) gridDim.x * warps_per_blk;
     for (int64_t b = (int64_t) blockIdx.x * warps_per_blk + (threadIdx.x >> 5); b < total_blocks; b += stride) {
-        const float rv = __half2float(__ushort_as_half(x_f16[b * 32 + lane]));
+        const uint16_t raw = x_16[b * 32 + lane];
+        const float rv = X_BF16 ? __uint_as_float((uint32_t) raw << 16) : __half2float(__ushort_as_half(raw));
         const float v = isfinite(rv) ? rv : 0.0f;
         float amax = fabsf(v);
         float sum = v;
@@ -2058,9 +2060,9 @@ bool dense_i8_tc_prefill(const uint16_t* X_f16, int ggml_type, const void* W_blo
     return cudaGetLastError() == cudaSuccess;
 }
 
-bool dense_dp4a_prefill(const uint16_t* X_f16, int ggml_type, const void* W_blocks, float* Y,
+bool dense_dp4a_prefill(const uint16_t* X_16, int ggml_type, const void* W_blocks, float* Y,
                         int64_t T, int64_t N, int64_t K, int64_t ldy, float beta,
-                        void* scratch, size_t scratch_bytes, void* stream) {
+                        void* scratch, size_t scratch_bytes, void* stream, bool x_bf16) {
     static const int env = [] {
         const char* v = std::getenv("STRATA_DENSE_Q8_DP4A");
         return (v != nullptr && v[0] != '\0') ? (std::atoi(v) != 0 ? 1 : 0) : -1;
@@ -2070,7 +2072,7 @@ bool dense_dp4a_prefill(const uint16_t* X_f16, int ggml_type, const void* W_bloc
     if (env < 0 && cc != 61) return false;
     if (cc < 61) return false;
     if (ggml_type != kTypeQ8_0 && ggml_type != kTypeQ4_K && ggml_type != kTypeQ5_K && ggml_type != kTypeQ6_K) return false;
-    if (X_f16 == nullptr || W_blocks == nullptr || Y == nullptr || scratch == nullptr) return false;
+    if (X_16 == nullptr || W_blocks == nullptr || Y == nullptr || scratch == nullptr) return false;
     const int align_k = (ggml_type == kTypeQ8_0) ? 32 : 256;
     if (T < 64 || N <= 0 || K <= 0 || (K % align_k) != 0) return false;
     if (ldy <= 0) ldy = N;
@@ -2082,7 +2084,8 @@ bool dense_dp4a_prefill(const uint16_t* X_f16, int ggml_type, const void* W_bloc
     auto* xq = reinterpret_cast<Q81F32Block*>(scratch);
     const int64_t total_blocks = T * (K >> 5);
     const unsigned q_grid = (unsigned) std::min<int64_t>((total_blocks + 7) / 8, 0x7fffffffLL);
-    quantize_f16_to_q8_1_f32_kernel<<<q_grid, 256, 0, s>>>(X_f16, xq, total_blocks);
+    if (x_bf16) quantize_f16_to_q8_1_f32_kernel<true><<<q_grid, 256, 0, s>>>(X_16, xq, total_blocks);
+    else quantize_f16_to_q8_1_f32_kernel<false><<<q_grid, 256, 0, s>>>(X_16, xq, total_blocks);
 
     const unsigned gx = (unsigned) ((T + 63) / 64);
     const unsigned gy = (unsigned) ((N + 127) / 128);

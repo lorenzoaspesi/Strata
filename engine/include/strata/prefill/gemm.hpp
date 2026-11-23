@@ -60,6 +60,9 @@ public:
     void native(const uint16_t* X, int ggml_type, const void* W_blocks, float* Y, int64_t T, int64_t N, int64_t K,
                 int64_t ldy = 0, float beta = 0.0f, int64_t ldx = 0);
 
+    /// Direct Q8_0 dp4a prefill for hyper-connection projections (STRATA_HC_Q8=1) on sm_61 without BF16 dequant round-trip.
+    bool hc_q8_dp4a(const uint16_t* X, const void* W_q8, float* Y, int64_t T, int64_t N, int64_t K, bool x_bf16 = false);
+
     /// HIP gfx103x (prompt_f16()): bf16() takes X as the FP16 image the prompt path's kernels write (set_act_f16),
     /// and bf16() / f16() / native() run the GEMM with FP16 out (rocBLAS's tuned kernels there), widened in place in
     /// Y's own rows.  Off (default): every call is what it was.  Set by Prefill::init, together with set_act_f16.

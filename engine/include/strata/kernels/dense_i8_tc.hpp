@@ -44,10 +44,10 @@ bool dense_i8_tc_prefill(const uint16_t* X_f16, int ggml_type, const void* W_blo
                          int64_t T, int64_t N, int64_t K, int64_t ldy, float beta,
                          void* scratch, size_t scratch_bytes, void* stream);
 
-/// Pascal sm_61 dp4a dense prefill GEMM (Q8_0=8, Q4_K=12, Q5_K=13, Q6_K=14): quantizes FP16 activations -> Q8_1
+/// Pascal sm_61 dp4a dense prefill GEMM (Q8_0=8, Q4_K=12, Q5_K=13, Q6_K=14): quantizes FP16/BF16 activations -> Q8_1
 /// into `scratch` and computes Y = beta*Y + X * W^T using 26 TOPS __dp4a (no FP16/FP32 weight dequant round-trip).
-bool dense_dp4a_prefill(const uint16_t* X_f16, int ggml_type, const void* W_blocks, float* Y,
+bool dense_dp4a_prefill(const uint16_t* X_16, int ggml_type, const void* W_blocks, float* Y,
                         int64_t T, int64_t N, int64_t K, int64_t ldy, float beta,
-                        void* scratch, size_t scratch_bytes, void* stream);
+                        void* scratch, size_t scratch_bytes, void* stream, bool x_bf16 = false);
 
 }  // namespace strata::kernels

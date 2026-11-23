@@ -83,9 +83,15 @@ using I8P = const I8_AS uint8_t*;
 using I8P16 = const I8_AS uint16_t*;
 using I8P32 = const I8_AS uint32_t*;
 #define I8_GPTR(x) ((I8P) (uintptr_t) (x))
+#if !defined(__HIPCC__) && defined(__CUDA_ARCH__) && __CUDA_ARCH__ <= 610
+__device__ __forceinline__ uint32_t i8_ld16(I8P p) { return (uint32_t) __ldg((const unsigned short*) p); }   // 2-byte aligned only
+__device__ __forceinline__ uint32_t i8_ld8(I8P p) { return (uint32_t) __ldg((const unsigned char*) p); }
+__device__ __forceinline__ uint32_t i8_ldw(I8P p) { return __ldg((const unsigned int*) p); }   // 4-byte aligned
+#else
 __device__ __forceinline__ uint32_t i8_ld16(I8P p) { return *(I8P16) p; }   // 2-byte aligned only
 __device__ __forceinline__ uint32_t i8_ld8(I8P p) { return *p; }
 __device__ __forceinline__ uint32_t i8_ldw(I8P p) { return *(I8P32) p; }   // 4-byte aligned
+#endif
 __device__ __forceinline__ float i8_half(uint32_t w) { return __half2float(__ushort_as_half((unsigned short) w)); }
 // The activation image of these kernels (the call's x rows and the H the gate/up epilogue writes): blocks of 32 values {float d; int8 q[32]}, 36 bytes (the q8_1 block's size, so the
 // tables and strides are unchanged), numbers as MMQ's quantizer (quantize_mmq_q8_1, layout D4): d_inv = 127 / amax, q = round(x * d_inv), d = 1 / d_inv, the scale kept in FP32.

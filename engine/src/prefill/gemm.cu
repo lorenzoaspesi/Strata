@@ -1686,4 +1686,21 @@ void Gemm::native(const uint16_t* X, int ggml_type, const void* W_blocks, float*
     f16(X, scratch_, Y, T, N, K, ldy, beta);
 }
 
+bool Gemm::hc_q8_dp4a(const uint16_t* X, const void* W_q8, float* Y, int64_t T, int64_t N, int64_t K, bool x_bf16) {
+#if !defined(__HIPCC__)
+    // Only beneficial when K is large enough (e.g., hc_down K=10240 -> 1.77x faster); tiny K=320 (hc_up) is faster in cuBLAS.
+    if (T < 64 || K < 1024 || W_q8 == nullptr || scratch_ == nullptr) return false;
+    if (side_scratch_) (void) cudaStreamWaitEvent((cudaStream_t) stream_, (cudaEvent_t) side_ready_[0], 0);
+    if (strata::kernels::dense_dp4a_prefill(X, 8 /* Q8_0 */, W_q8, Y, T, N, K, 0, 0.0f,
+                                            scratch_, (size_t) scratch_elems_ * sizeof(uint16_t), stream_, x_bf16)) {
+        if (side_scratch_) (void) cudaEventRecord((cudaEvent_t) side_free_[0], (cudaStream_t) stream_);
+        return true;
+    }
+    return false;
+#else
+    (void) X; (void) W_q8; (void) Y; (void) T; (void) N; (void) K; (void) x_bf16;
+    return false;
+#endif
+}
+
 }  // namespace strata::prefill
