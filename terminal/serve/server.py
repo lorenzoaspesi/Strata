@@ -1267,20 +1267,23 @@ class StrataEngine:
         finally:
             ctl.release()
 
-    def vram(self, reserve_mib: int | None, timeout: float = 120.0, device: int | None = None) -> dict:
+    def vram(self, reserve_mib: int | None, timeout: float = 120.0, device: int | None = None, drain: bool = False) -> dict:
         with self._exclusive_control():
-            return self._vram(reserve_mib, timeout, device)
+            return self._vram(reserve_mib, timeout, device, drain=drain)
 
-    def _vram(self, reserve_mib: int | None, timeout: float = 120.0, device: int | None = None) -> dict:
+    def _vram(self, reserve_mib: int | None, timeout: float = 120.0, device: int | None = None, drain: bool = False) -> dict:
         """#533: `VRAM <reserve_mib>` between requests (the caller holds the service's FIFO): the engine shrinks its
         expert cache until that much VRAM is free, or grows it back when more is free; None: back to the reserve it
-        started with.  -> the engine's figures (expert_slots, expert_cache_mib, vram_free_mib, ...); raises ValueError
-        with the engine's reason (e.g. it was not started with --vram-elastic), EngineDied when it ended."""
+        started with.  `drain=True` allows temporarily releasing all expert cache segments down to 0 while idle (e.g.
+        for GPU vision wake) before restoring 100% of the cache prior to prefill.  -> the engine's figures; raises
+        ValueError with the engine's reason (e.g. it was not started with --vram-elastic), EngineDied when it ended."""
         if not self.alive():
             raise EngineDied("the engine is not running")
         if device is not None and reserve_mib is None:   # per-GPU (#533): a device only makes sense with an explicit reserve.
             raise ValueError("VRAM with a device needs an explicit reserve_mib")
         cmd = "VRAM" + ("" if reserve_mib is None else f" {int(reserve_mib)}" + (f" {int(device)}" if device is not None else ""))
+        if drain:
+            cmd += " drain"
         self.proc.stdin.write(cmd + "\n")
         self.proc.stdin.flush()
         deadline = time.time() + timeout
@@ -4569,13 +4572,19 @@ class Service:
             yield
             return
 
+        def _shrink_for_vision(mib: int):
+            try:
+                self.engine.vram(mib, drain=True)
+            except TypeError:
+                self.engine.vram(mib)
+
         shrunk = False
         wake_ms = 0.0
         try:
             if not v.alive():
                 if hasattr(self.engine, "vram") and self.loaded() and not self.vision_no_shrink:
                     try:
-                        self.engine.vram((self._engine_reserve() or 0) + v.swap_mib)
+                        _shrink_for_vision((self._engine_reserve() or 0) + v.swap_mib)
                         shrunk = True
                         time.sleep(0.1)
                     except ValueError as e:
@@ -4588,7 +4597,7 @@ class Service:
             if getattr(v, "swap_supported", False) and not getattr(v, "on_cpu", False):
                 if not shrunk and hasattr(self.engine, "vram") and self.loaded() and not self.vision_no_shrink:
                     try:
-                        self.engine.vram((self._engine_reserve() or 0) + v.swap_mib)
+                        _shrink_for_vision((self._engine_reserve() or 0) + v.swap_mib)
                         shrunk = True
                     except ValueError as e:
                         self.vision_no_shrink = "--vram-elastic" in str(e)
@@ -4600,7 +4609,7 @@ class Service:
                 except RuntimeError as e:
                     if shrunk and "GPU memory" in str(e) and hasattr(self.engine, "vram") and self.loaded():
                         v.swap_mib += 256
-                        self.engine.vram((self._engine_reserve() or 0) + v.swap_mib)
+                        _shrink_for_vision((self._engine_reserve() or 0) + v.swap_mib)
                         if not v.alive():
                             v.restart()
                         wake_ms = v.wake()

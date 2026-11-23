@@ -16511,12 +16511,14 @@ int main(int argc, char** argv) {
             };
             long long reserve = o.vram_reserve_mib;
             int dev_sel = -1;
+            bool drain = false;
+            if (!tk.empty() && tk.back() == "drain") { drain = true; tk.pop_back(); }
             if (tk.empty()) { /* bare: start reserve, every card */ }
             else if (tk.size() == 1 && is_nonneg_int(tk[0])) { reserve = std::strtoll(tk[0].c_str(), nullptr, 10); }
             else if (tk.size() == 2 && is_nonneg_int(tk[0]) && is_nonneg_int(tk[1])) {
                 reserve = std::strtoll(tk[0].c_str(), nullptr, 10);
                 dev_sel = (int) std::strtoll(tk[1].c_str(), nullptr, 10);
-            } else { e = "expected: VRAM [reserve_mib] [dev]"; return false; }
+            } else { e = "expected: VRAM [reserve_mib] [dev] [drain]"; return false; }
             if (!xcache.segmented()) {
                 e = "VRAM needs an engine started with --vram-elastic (NVIDIA GPU, --serve)";
                 return false;
@@ -16561,13 +16563,13 @@ int main(int argc, char** argv) {
                 cudaMemGetInfo(&fb, &tb);
                 const int64_t mapped = cd.c->mapped_bytes();
                 if ((int64_t) fb < want_free) {
-                    const int64_t floor_slots = std::min<int64_t>(cd.c->full_slots(),
+                    const int64_t floor_slots = drain ? 0 : std::min<int64_t>(cd.c->full_slots(),
                         g_lend_keep + (cd.part != nullptr && cd.part->first >= 0 ? part_slots(*cd.part, 256) : 0));
                     const int64_t floor_b = cd.c->bytes_of(floor_slots);
                     int64_t keep = mapped - (want_free - (int64_t) fb);
                     if (keep < floor_b) {
                         keep = floor_b;
-                        note = " (a cache keeps its smallest size: the prompt path's buffers)";
+                        if (!drain) note = " (a cache keeps its smallest size: the prompt path's buffers)";
                     }
                     const bool shrunk = cd.c->shrink(keep, e);
                     strata::core::evict_slots_past(host_res, cd.c->slots(), cd.lo, cd.hi, g.n_expert, vram_evicted);
