@@ -22,7 +22,7 @@ bool adapt_fetch_default_card(int major, int minor, uint64_t vram_bytes) {
     const int cc = strata::cc_of(major, minor);
     if (vram_bytes == 0) return false;
     if ((cc / 10) == 12) return vram_bytes <= kAdaptFetchMaxVramBytes;
-    if (cc == 86 || cc == 89) return vram_bytes <= kAdaptFetchLowVramBytes;
+    if (cc == 86 || cc == 89 || cc == 61) return vram_bytes <= kAdaptFetchLowVramBytes;
     return false;
 }
 
@@ -161,6 +161,31 @@ std::vector<std::pair<std::string, std::string>> nv_default_env(int major, int m
             {"STRATA_TOPK_SAMPLE", "1"},
             {"STRATA_SELECT_LONG", "1"},
         };
+    } else if (mj == 6 && mn == 1) {
+        // Pascal consumer / workstation (GTX 1070 / 1080 / 1080 Ti / Titan Xp / P40, sm_61):
+        // bit-exact decode/pipeline fusions + Pascal FP32 dense GEMM (STRATA_DENSE_F32=1, 4.3 -> 8.4-9.8 TFLOPS)
+        // + ADAPT_FETCH=2 on <= 13 GiB partial-VRAM cards. STRATA_SM61_PERF=0 and STRATA_DEFAULTS=026 turn them off.
+        if (off("STRATA_SM61_PERF") || defaults026) return t;
+        t = {
+            {"STRATA_ADAPT_LAG", "2"},
+            {"STRATA_SIDE_MIXER", "2"},
+            {"STRATA_ATTN_DAILY", "1"},
+            {"STRATA_GR_UP75", "1"},
+            {"STRATA_GU_SWIGLU", "1"},
+            {"STRATA_QSA_ROWS", "1"},
+            {"STRATA_B6_MMVQ_ROWS", "1"},
+            {"STRATA_DEQUANT_SIDE", "1"},
+            {"STRATA_LFUSE", "1"},
+            {"STRATA_PLE_COMPACT", "1"},
+            {"STRATA_PLE_COPY_STREAM", "1"},
+            {"STRATA_HC_UPMIX", "1"},
+            {"STRATA_Q80_ROWS1", "1"},
+            {"STRATA_FUSE_DECODE", "1"},
+            {"STRATA_FUSE_WAIT", "2"},
+            {"STRATA_SELECT_LONG", "1"},
+            {"STRATA_DENSE_F32", "1"},
+        };
+        if (adapt_fetch_default_card(major, minor, main_vram_bytes)) t.push_back({"STRATA_ADAPT_FETCH", "2"});
     } else if (mj == 6 && mn == 0) {
         if (off("STRATA_SM60_PERF")) return t;
         t = {
@@ -243,11 +268,12 @@ std::vector<std::string> apply_nv_defaults(int major, int minor, uint64_t main_v
         // paths they replace (24 of 24 greedy answers were identical on the Spark; no KL run), so the line does not say "exact".
         const bool sm120 = mj == 12 && mn == 0;
         const bool sm70 = mj == 7 && mn == 0;
+        const bool sm61 = mj == 6 && mn == 1;
         // ADAPT_FETCH (a card of 16 GiB or less) is not bit-exact either: the line then says so and names its own way back
         std::fprintf(stderr, "strata: %s: %zu %sspeed switches on by default (%s=0 turns them off%s; a switch you set is kept%s): ",
-                     sm86 ? "sm_86 (Ampere)" : sm89 ? "sm_89 (Ada)" : sm121 ? "sm_121 (GB10)" : sm120 ? "sm_120 (Blackwell)" : sm70 ? "sm_70 (Volta)" : "sm_60 (Pascal)", set.size(), sm121 || fetch_set ? "" : "exact ",
-                     sm86 ? "STRATA_SM86_PERF" : sm89 ? "STRATA_SM89_PERF" : sm121 ? "STRATA_SM121_PERF" : sm120 ? "STRATA_SM120_PERF" : sm70 ? "STRATA_SM70_PERF" : "STRATA_SM60_PERF",
-                     sm89 || sm121 || sm120 || sm70 ? ", as does STRATA_DEFAULTS=026" : "",
+                     sm86 ? "sm_86 (Ampere)" : sm89 ? "sm_89 (Ada)" : sm121 ? "sm_121 (GB10)" : sm120 ? "sm_120 (Blackwell)" : sm70 ? "sm_70 (Volta)" : sm61 ? "sm_61 (Pascal)" : "sm_60 (Pascal)", set.size(), sm121 || fetch_set ? "" : "exact ",
+                     sm86 ? "STRATA_SM86_PERF" : sm89 ? "STRATA_SM89_PERF" : sm121 ? "STRATA_SM121_PERF" : sm120 ? "STRATA_SM120_PERF" : sm70 ? "STRATA_SM70_PERF" : sm61 ? "STRATA_SM61_PERF" : "STRATA_SM60_PERF",
+                     sm89 || sm121 || sm120 || sm70 || sm61 ? ", as does STRATA_DEFAULTS=026" : "",
                      fetch_set ? "; ADAPT_FETCH is on because this card has 16 GiB of memory or less, it does not give bit-for-bit the same text, STRATA_ADAPT_FETCH=0 turns it off" : "");
         for (size_t i = 0; i < set.size(); ++i) std::fprintf(stderr, "%s%s", i ? " " : "", set[i].c_str() + 7);
         std::fprintf(stderr, "\n");

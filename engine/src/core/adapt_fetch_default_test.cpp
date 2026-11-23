@@ -71,6 +71,9 @@ int main() {
     CHECK(!adapt_fetch_default_card(8, 9, 16 * GiB));                    // RTX 4080 16 GB (> 13 GiB)
     CHECK(!adapt_fetch_default_card(9, 0, 16 * GiB));
     CHECK(!adapt_fetch_default_card(10, 0, 16 * GiB));
+    CHECK(adapt_fetch_default_card(6, 1, 8 * GiB));                      // GTX 1070 / 1080 8 GB
+    CHECK(adapt_fetch_default_card(6, 1, 12 * GiB));                     // Titan Xp 12 GB
+    CHECK(!adapt_fetch_default_card(6, 1, 24 * GiB));                    // Tesla P40 24 GB (> 13 GiB)
     CHECK(!adapt_fetch_default_card(6, 0, 16 * GiB));                    // P100 16 GB
 
     auto unset_sm120 = [] {

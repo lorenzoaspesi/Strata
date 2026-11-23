@@ -1011,7 +1011,7 @@ bool dense_f32_on() {
 int64_t dense_f32_min_t(int64_t N, int64_t K) {
     if (K == 2560 && (N == 10240 || N == 12288)) return 256;
     if (K == 2560 && N == 6144) return 512;
-    if (N == 2560 && (K == 6144 || K == 4096)) return 4096;
+    if (N == 2560 && (K == 6144 || K == 4096)) return 512;
     return 0;
 }
 #endif

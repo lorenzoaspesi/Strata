@@ -63,10 +63,13 @@ const char* name_of(int t) {
         case 13: return "Q5_K";
         case 14: return "Q6_K";
         case 7: return "Q5_1";
+        case 144: return "TQ2_T";
+        case 145: return "TQK6";
+        case 146: return "TQK7";
         default: return "?";
     }
 }
-int block_values(int t) { return t == 20 || t == 6 || t == 8 || t == 7 ? 32 : t == 42 ? 64 : 256; }
+int block_values(int t) { return t == 20 || t == 6 || t == 8 || t == 7 ? 32 : t == 42 ? 64 : (t == 144 || t == 145 || t == 146) ? 128 : 256; }
 
 // `rows` rows of `n` values of format t: random bytes (every code is valid for these formats), then a finite fp16 scale in every block
 std::vector<uint8_t> random_rows(int t, int64_t rows, int64_t n, std::mt19937& rng) {
@@ -441,6 +444,11 @@ int main() {
     for (const auto& pr : std::vector<std::pair<int, int>>{{12, 13}, {12, 14}, {13, 14}, {14, 13}, {14, 14}, {8, 8}, {8, 13}, {16, 13}, {23, 14}, {14, 8}}) {
         check(pr.first, pr.second, 512, 256, s, rng);
         check(pr.first, pr.second, 2048, 512, s, rng);
+    }
+    // fifth wave: Gyro-M (TQ2_T / TQ2_T) and Gyro-S (TQK6 / TQK7) trellis pairs at Flash-Next shape (2560 / 640)
+    for (const auto& pr : std::vector<std::pair<int, int>>{{144, 144}, {145, 146}}) {
+        check(pr.first, pr.second, 512, 256, s, rng);
+        check(pr.first, pr.second, 2560, 640, s, rng);
     }
     if (g_run == 0) { std::printf("native_i8_parity: nothing ran (%d skipped: not covered on this device)\n", g_skipped); return 77; }
     if (g_skipped) std::printf("native_i8_parity: %d format rows skipped: not covered on this device\n", g_skipped);

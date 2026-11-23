@@ -2109,10 +2109,13 @@ const MmqPlan& mmq_plan() {
                 bool staged_ok = true;                                      // the staged entry: no fold; a tail only where the fused kernels take the pair (fz_staged: they apply the tail's scales inside)
                 if (lay.native) {
                     const auto& f = lay.fmt[(size_t) l];
-                    unfolded = !f.tail_off && !f.had_gu && !f.had_d;
+                    unfolded = !f.tail_off && (!(f.had_gu || f.had_d) || f.had_block == 128);
                     staged_ok = !f.had_gu && !f.had_d && (!f.tail_off || fo);
-                    if (unfolded)
-                        i8 = strata::kernels::native_expert_i8_prompt(strata::kernels::native_expert_layout(f.gu_type, f.d_type, f.n_embd, f.n_ff), (int64_t) 1 << 20);
+                    if (unfolded) {
+                        auto L = strata::kernels::native_expert_layout(f.gu_type, f.d_type, f.n_embd, f.n_ff);
+                        L.had_block = f.had_d ? f.had_block : 0;
+                        i8 = strata::kernels::native_expert_i8_prompt(L, (int64_t) 1 << 20);
+                    }
                 }
                 strata::prefill::own_only_count_layer(big, small, fo, i8, i8_gated, entry_on, staged_ok);
             }
@@ -2198,8 +2201,9 @@ bool i8_wants_identity() {
         const auto& lay = strata::kernels::cpu::expert_layout();
         if (!lay.native) return false;
         for (const auto& f : lay.fmt) {
-            if (f.tail_off || f.had_gu || f.had_d) continue;
-            const strata::kernels::NativeExpertLayout L = strata::kernels::native_expert_layout(f.gu_type, f.d_type, f.n_embd, f.n_ff);
+            if (f.tail_off || ((f.had_gu || f.had_d) && f.had_block != 128)) continue;
+            strata::kernels::NativeExpertLayout L = strata::kernels::native_expert_layout(f.gu_type, f.d_type, f.n_embd, f.n_ff);
+            L.had_block = f.had_d ? f.had_block : 0;
             if (strata::kernels::native_expert_i8_prompt(L, (int64_t) 1 << 20)) return true;
         }
         return false;
@@ -2367,6 +2371,8 @@ uint64_t moe_set_bytes(size_t T, int64_t n_expert, bool fused, int64_t tail = -1
         // APR: the rotated copy of `mixed` for the MMQ path (carve's m.Xr) - it must be counted here too, or the MoE
         // set outgrows the region `carve` sizes from this, and `init` fails with "do not fit" at any chunk
         if (strata::kernels::cpu::hadamard_spec().any()) a.take<float>(T * N, ok);
+    } else if (i8_wants_identity() && strata::kernels::cpu::hadamard_spec().any()) {
+        a.take<float>(T * N, ok);
     }
     return a.used;
 }
@@ -2831,6 +2837,8 @@ bool Prefill::carve(size_t T, void* alloc) {
             m.row_sd = c.take<float>(T * K, ok);
             // APR: the rotated expert input (only for Hadamard-folded packs)
             m.Xr = strata::kernels::cpu::hadamard_spec().any() ? c.take<float>(T * N, ok) : nullptr;
+        } else if (i8_wants_identity() && strata::kernels::cpu::hadamard_spec().any()) {
+            m.Xr = c.take<float>(T * N, ok);
         }
         if (hcr) {   // STRATA_PF_HC_REGION: the hyper-connection read's set, from the region's start like the others
             Alloc h;
@@ -6367,7 +6375,8 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         const bool i8_peer_ok = on_peer.empty()
                                                     ? (!m.pp || (m.pp->compact && m.pp->fr_xq != nullptr && m.pp->i8_rec != nullptr))
                                                     : (m.pp && m.pp->compact && m.pp->fr_xq != nullptr && m.pp->i8_rec != nullptr);
-                        if (lay.native && strata::kernels::i8_order_allows(fused_l, fz_staged) && !wmma_l && !had_gu && !had_d && share_keeps_own_kernels(rows_cpu) && i8_peer_ok &&
+                        const bool i8_had_ok = !(had_gu || had_d) || (had_block == 128 && (!had_gu || m.Xr != nullptr) && on_peer.empty());
+                        if (lay.native && strata::kernels::i8_order_allows(fused_l, fz_staged) && !wmma_l && i8_had_ok && share_keeps_own_kernels(rows_cpu) && i8_peer_ok &&
                             m.group_cap == 0 && (!m.fused_bufs || !stream_all) && !lay.fmt[(size_t) l].tail_off && ws::mode() == 0 &&
                             !(m.cache && mmq_plan().direct[(size_t) l]) && i8_group_env && (!order.empty() || !order_peer.empty()) &&
                             (!strata::kernels::native_expert_i8_floor_gated() || strata::kernels::i8_chunk_default_allows(-1, true, true, (int64_t) T, stream_all_min())) &&   // the P100 class rule: from the stream floor up the unset default is the FP16 path (i8_expert_rule.hpp)
@@ -6378,6 +6387,10 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             true) {
                             const auto& f = lay.fmt[(size_t) l];
                             i8_L = strata::kernels::native_expert_layout(f.gu_type, f.d_type, f.n_embd, f.n_ff);
+                            if (had_d) {
+                                i8_L.had_block = had_block;
+                                i8_L.d_signs = had_sh;
+                            }
                             const int64_t i8_experts = (int64_t) order.size() + (int64_t) order_peer.size();
                             const int64_t i8_rows = rows_local + rows_peer;
                             const int64_t i8_groups = (i8_experts + MMQ_GROUP - 1) / MMQ_GROUP;
@@ -6466,10 +6479,14 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 err = "prefill: int8 experts: no memory for the group record";
                                 return false;
                             }
+                            if (had_gu) {
+                                strata::kernels::hadamard_rows(m.mixed, m.Xr, T, N, had_block, had_sx, m.cs);
+                                xsrc = m.Xr;
+                            }
                             if (i8_few)   // the few-rows route: the grouped kernels read q8_1 with FP16 scales (the same 36 bytes a block)
-                                strata::kernels::quantize_q8_1_rows(m.mixed, T, N, m.fr_xq, m.cs);
+                                strata::kernels::quantize_q8_1_rows(xsrc, T, N, m.fr_xq, m.cs);
                             else
-                                strata::kernels::native_expert_i8_quantize(m.mixed, T, N, m.fr_xq, m.cs);   // the kernels' own image (FP32 scales), 36 bytes per block as q8_1
+                                strata::kernels::native_expert_i8_quantize(xsrc, T, N, m.fr_xq, m.cs);   // the kernels' own image (FP32 scales), 36 bytes per block as q8_1
                         }
                         if (use_mmq || fz_staged) {   // (fz_staged without use_mmq: a fused-only layer with the entry on (staged_fo_on(), staged_fo_rule.hpp); the block builds the group bounds)
                             // step 2b: the layer's activations as q8_1 rows in expert order, straight from `mixed` (APR:
@@ -6480,7 +6497,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 gather_rows16(m.mixed_h, m.src_dev, m.Xs, T * K, N, m.cs);
                                 if (had_gu) strata::kernels::hadamard_rows_f16(m.Xs, T * K, N, had_block, had_sx, m.cs);
                             } else {
-                                if (had_gu) {
+                                if (had_gu && xsrc == m.mixed) {
                                     strata::kernels::hadamard_rows(m.mixed, m.Xr, T, N, had_block, had_sx, m.cs);
                                     xsrc = m.Xr;
                                 }
@@ -6606,7 +6623,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             if (had_gu) strata::kernels::hadamard_rows_f16(m.Xs, T * K, N, had_block, had_sx, m.cs);
                         }
                         // multi-GPU: the peer's share, enqueued before the primary's own experts so both cards work at once
-                        const bool peer_i8 = i8_l && !wmma_l && m.pp && m.pp->compact && m.pp->fr_xq != nullptr && m.pp->i8_rec != nullptr;
+                        const bool peer_i8 = i8_l && !wmma_l && !had_gu && !had_d && m.pp && m.pp->compact && m.pp->fr_xq != nullptr && m.pp->i8_rec != nullptr;
                         peer_now = (use_mmq || peer_i8) && !order_peer.empty();
                         if (peer_now) {
                             PeerPrefill& P = *m.pp;

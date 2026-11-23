@@ -6951,7 +6951,8 @@ size_t native_expert_i8_scratch_bytes(int64_t cap_entries, int64_t cap_groups, i
 }
 
 bool native_expert_i8_supported(const NativeExpertLayout& L) noexcept {
-    return i8_gu_type(L.gu_type) && i8_d_type(L.d_type) && !L.gu_nib && L.tail_off == 0 && L.had_block == 0 && L.n_embd % 256 == 0 &&
+    return i8_gu_type(L.gu_type) && i8_d_type(L.d_type) && !L.gu_nib && L.tail_off == 0 &&
+           (L.had_block == 0 || (L.had_block == 128 && L.n_ff % 128 == 0)) && L.n_embd % 256 == 0 &&
            L.n_ff % 128 == 0 && ((L.d_type != 13 && L.d_type != 14) || L.n_ff % 256 == 0) && L.n_embd % 64 == 0 && L.bytes < ((size_t) 1 << 32) &&   // 32-bit byte offsets inside one expert's blob
            i8_smem_bytes(L.gu_type, L.d_type, 2) <= i8_smem_limit();                  // the smallest tile fits the device's shared memory per block
 }
@@ -6997,10 +6998,13 @@ void native_expert_i8(const NativeExpertLayout& L, const unsigned long long* grp
         std::exit(1);
     }
     cudaStream_t s = (cudaStream_t) stream;
-    // scratch: the H blocks (q8_1, one per 32 features and entry), then the tile table (cap_groups + 1 ints)
+    // scratch: the H blocks (q8_1, one per 32 features and entry), the tile table (cap_groups + 1 ints),
+    // and when Hadamard-folded (L.had_block > 0), FP32 H (cap_entries * n_ff floats) for hadamard_rows + quantize
     block_q8_1* hq = (block_q8_1*) scratch;
     const size_t hqb = ((size_t) cap_entries * (size_t) (L.n_ff / 32) * sizeof(block_q8_1) + 255) & ~(size_t) 255;
     int32_t* tile_off = (int32_t*) ((uint8_t*) scratch + hqb);
+    const size_t toff_b = ((size_t) (cap_groups + 1) * sizeof(int32_t) + 255) & ~(size_t) 255;
+    float* h_f32 = L.had_block > 0 ? (float*) ((uint8_t*) scratch + hqb + toff_b) : nullptr;
     int tm = i8_env_int("STRATA_I8_TM", 0);   // research: the tile code (2, 3 or 4 rows of 16 entries per thread -> 32, 48 or 64 entries; 8 = variant B, 128 entries)
     const int64_t avg = cap_entries / cap_groups;
     const bool b_ok = L.n_embd % 128 == 0 && L.n_ff % 64 == 0;
@@ -7011,10 +7015,10 @@ void native_expert_i8(const NativeExpertLayout& L, const unsigned long long* grp
 #if defined(__HIPCC__)
     const bool h_ok = false;   // (i8h_volta.cuh is CUDA only: i8_volta() is off on HIP)
 #else
-    const bool h_ok = vo.on && i8h_type(L.gu_type) && i8h_type(L.d_type) && L.n_ff % 32 == 0 && L.n_embd % 64 == 0;
+    const bool h_ok = vo.on && i8h_type(L.gu_type) && i8h_type(L.d_type) && L.n_ff % 32 == 0 && L.n_embd % 64 == 0 && L.had_block == 0;
 #endif
     if (tm == 5 && !h_ok) tm = 4;
-    if (tm != 5) tm = tm <= 2 ? 2 : tm == 3 ? 3 : tm >= 8 && b_ok && i8_tile8_type(L.gu_type) && i8_tile8_type(L.d_type) ? 8 : 4;   // (the K-quants and Q5_1 have no tile 8)
+    if (tm != 5) tm = tm <= 2 ? 2 : tm == 3 ? 3 : tm >= 8 && b_ok && L.had_block == 0 && i8_tile8_type(L.gu_type) && i8_tile8_type(L.d_type) ? 8 : 4;   // (the K-quants, Q5_1, trellis and Hadamard-folded layers have no tile 8)
     // Volta (i8_expert_rule.hpp, i8_tile_two_blocks): the big-grid formats read their grid from global memory, and the pick is lowered to the largest tile that keeps two blocks
     // per multiprocessor (a tile set by STRATA_I8_TM is kept; STRATA_I8_SM70=0 turns both off)
     const bool gg = vo.on && i8_gg_type(L.gu_type);
@@ -7025,7 +7029,7 @@ void native_expert_i8(const NativeExpertLayout& L, const unsigned long long* grp
     while (tm > 2 && i8_smem_bytes(L.gu_type, L.d_type, tm, gg) > smem_limit) tm = tm == 8 || tm == 5 ? 4 : tm - 1;
     const int bm = tm == 8 ? 128 : tm == 5 ? 64 : 16 * tm;
     i8_tiles_kernel<<<1, 256, 0, s>>>(grp_start, n_groups, bm, tile_off);
-    I8Args a{grp_ptr, grp_start, n_groups, tile_off, ent_tok, ent_dst, (const block_q8_1*) x_q8_1, hq, out, L,
+    I8Args a{grp_ptr, grp_start, n_groups, tile_off, ent_tok, ent_dst, (const block_q8_1*) x_q8_1, hq, h_f32, out, L,
              cap_entries / bm + cap_groups, i8_env_int("STRATA_I8_BISECT", 0), i8_n8_takes(i8_switch_parse(std::getenv("STRATA_I8_N8")), tm), gg};   // 8-entry slices: tile 2 by default, 2-4 with STRATA_I8_N8=1, none with 0
     switch (L.gu_type) {
         case 16: i8_launch<16, true>(tm, a, s); break;
@@ -7039,15 +7043,25 @@ void native_expert_i8(const NativeExpertLayout& L, const unsigned long long* grp
         case 13: i8_launch<13, true>(tm, a, s); break;
         case 14: i8_launch<14, true>(tm, a, s); break;
         case 8: i8_launch<8, true>(tm, a, s); break;
+        case 144: i8_launch<144, true>(tm, a, s); break;
+        case 145: i8_launch<145, true>(tm, a, s); break;
         default: i8_launch<22, true>(tm, a, s); break;
     }
     check("native_expert_i8/gu");
+    if (L.had_block > 0) {
+        hadamard_rows(h_f32, h_f32, cap_entries, L.n_ff, L.had_block, L.d_signs, s);
+        const long long nh = (long long) cap_entries * L.n_ff;
+        i8_quantize_kernel<<<(unsigned) ((nh + 255) / 256), 256, 0, s>>>(h_f32, hq, nh);
+        check("native_expert_i8/had_q");
+    }
     if (L.d_type == 20) i8_launch<20, false>(tm, a, s);
     else if (L.d_type == 6) i8_launch<6, false>(tm, a, s);
     else if (L.d_type == 8) i8_launch<8, false>(tm, a, s);
     else if (L.d_type == 7) i8_launch<7, false>(tm, a, s);
     else if (L.d_type == 13) i8_launch<13, false>(tm, a, s);
     else if (L.d_type == 14) i8_launch<14, false>(tm, a, s);
+    else if (L.d_type == 144) i8_launch<144, false>(tm, a, s);
+    else if (L.d_type == 146) i8_launch<146, false>(tm, a, s);
     else i8_launch<42, false>(tm, a, s);
     check("native_expert_i8/down");
 }
