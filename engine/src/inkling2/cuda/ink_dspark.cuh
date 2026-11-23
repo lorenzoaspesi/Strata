@@ -1782,13 +1782,13 @@ struct InkDSpark {
             } else if ((m.sm_cc == 61 || m.sm_cc >= 75) && ti_un.fmt == FMT_S6_K) {
                 k_ink_quant_q8_1<<<(kInkHidden / 64 + 7) / 8, 256, 0, r.st>>>(d_corr, r.moe_ws.xq_sk, 1, kInkHidden);
                 k_dspark_score_cand_sk_dp4a_batch<FMT_S6_K><<<(K_cand + 15) / 16, 64, 0, r.st>>>(
-                    m.d_trunk + ti_un.off, r.moe_ws.xq_sk,
+                    m.unembed_ptr(), r.moe_ws.xq_sk,
                     d_cand_ids + (size_t)s * K_cand,
                     m.unembed_screen.ready ? nullptr : (d_cand_base + (size_t)s * K_cand),
                     K_cand, 1, d_cand_scores);
             } else {
                 k_dspark_score_cand_eval<<<(K_cand + 7) / 8, 256, 0, r.st>>>(
-                    m.d_trunk + ti_un.off, ti_un.fmt, (int)ti_un.rows(),
+                    m.unembed_ptr(), ti_un.fmt, (int)ti_un.rows(),
                     d_corr, d_cand_ids + (size_t)s * K_cand,
                     m.unembed_screen.ready ? nullptr : (d_cand_base + (size_t)s * K_cand),
                     K_cand, d_cand_scores);
@@ -1835,14 +1835,14 @@ struct InkDSpark {
                 const int nblk = nw * (kInkHidden / 64);
                 k_ink_quant_q8_1<<<(nblk + 7) / 8, 256, 0, r.st>>>(d_corr_b, r.moe_ws.xq_sk, nw, kInkHidden);
                 k_dspark_score_cand_sk_dp4a_batch<FMT_S6_K><<<(K_cand + 15) / 16, 64, 0, r.st>>>(
-                    m.d_trunk + ti_un.off, r.moe_ws.xq_sk,
+                    m.unembed_ptr(), r.moe_ws.xq_sk,
                     d_cand_ids + (size_t)s * K_cand,
                     m.unembed_screen.ready ? nullptr : (d_cand_base + (size_t)s * K_cand),
                     K_cand, nw, d_cand_scores_b);
             } else {
                 for (int b = 0; b < nw; ++b) {
                     k_dspark_score_cand_eval<<<(K_cand + 7) / 8, 256, 0, r.st>>>(
-                        m.d_trunk + ti_un.off, ti_un.fmt, (int)ti_un.rows(),
+                        m.unembed_ptr(), ti_un.fmt, (int)ti_un.rows(),
                         d_corr_b + (size_t)b * kInkHidden, d_cand_ids + (size_t)s * K_cand,
                         m.unembed_screen.ready ? nullptr : (d_cand_base + (size_t)s * K_cand),
                         K_cand, d_cand_scores_b + (size_t)b * K_cand);
@@ -1858,6 +1858,7 @@ struct InkDSpark {
 
     // Draft 7 tokens (Block-8) + Top-2 candidates per slot on GPU (CUDA Graph captured!)
     void draft_block8(int32_t anchor_tok, int apos, int32_t* out_ids_7, float* out_conf_7 = nullptr) {
+        r.ensure_decode_ready();
         const int B = kInkDsparkBlock;  // 8
         h_meta_pin[0] = anchor_tok;
         h_meta_pin[1] = apos;
@@ -1891,6 +1892,7 @@ struct InkDSpark {
     // Draft True W=2..4 Multi-Branch Bayes-Optimal Connected Tree (M <= 16..32 nodes, CUDA Graph captured!)
     // When adaptive_moe_ratio > 0, dynamically picks M* in {4, 6, 8, 10, 12, 16} maximizing E[emit(M)] / (1 + ratio*(1-(15/16)^M))!
     void draft_beam_tree(int32_t anchor_tok, int apos, int beam_w, int max_nodes, InkTreeSpec& out_tree, float adaptive_moe_ratio = 0.0f) {
+        r.ensure_decode_ready();
         beam_w = std::max(1, std::min(kInkMaxBeam, beam_w));
         max_nodes = std::max(2, std::min(r.tree_cap, max_nodes));
         const int B = kInkDsparkBlock;  // 8

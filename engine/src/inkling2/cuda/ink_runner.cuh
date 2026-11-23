@@ -70,10 +70,14 @@ struct InkCudaModel {
     bool trunk_attn_fp16 = false;  // true on sm_70/75: .attn.* BF16 weights converted in-place to FP16 at load!
 
     uint8_t* d_trunk = nullptr;
-    uint8_t* h_embed_pinned = nullptr;  // optional host-mapped embed.weight on tight 8 GiB GPUs (+442 MiB VRAM!)
+    uint8_t* h_embed_pinned = nullptr;    // optional host-mapped embed.weight on tight 8 GiB GPUs (+442 MiB VRAM!)
     uint8_t* d_embed_ptr    = nullptr;
-    uint8_t* h_mw1_pinned   = nullptr;  // optional host-mapped dspark markov_w1 on tight 8 GiB GPUs (+50 MiB VRAM!)
+    uint8_t* h_mw1_pinned   = nullptr;    // optional host-mapped dspark markov_w1 on tight 8 GiB GPUs (+50 MiB VRAM!)
     uint8_t* d_mw1_ptr      = nullptr;
+    uint8_t* d_unembed_arena  = nullptr;  // optional swappable unembed.weight (~360 MiB): doubles as M=512 prefill arena on 8 GiB SQ-15!
+    uint8_t* h_unembed_pinned = nullptr;
+    size_t   unembed_bytes    = 0;
+    bool     unembed_resident = true;
     uint8_t* d_sec4  = nullptr;
     uint8_t* h_sec4_pinned = nullptr;  // optional pinned overflow for 8/12/16 GB GPUs
     size_t trunk_bytes = 0, sec4_bytes = 0;
@@ -104,6 +108,14 @@ struct InkCudaModel {
     const uint8_t* mw1_ptr() const {
         return d_mw1_ptr ? d_mw1_ptr : trunk_ptr("dspark.markov_head.markov_w1.weight");
     }
+    const uint8_t* unembed_ptr() const {
+        return d_unembed_arena ? d_unembed_arena : trunk_ptr("model.llm.unembed.weight");
+    }
+    void restore_unembed(cudaStream_t st) {
+        if (!d_unembed_arena || unembed_resident) return;
+        INK_CK(cudaMemcpyAsync(d_unembed_arena, h_unembed_pinned, unembed_bytes, cudaMemcpyHostToDevice, st));
+        unembed_resident = true;
+    }
     const TensorInfo& tinfo(const std::string& name) const {
         return man.get(name);
     }
@@ -131,6 +143,7 @@ struct InkCudaModel {
         //    embedding tables (model.llm.embed.weight ~442 MiB + dspark.markov_head.markov_w1.weight ~50 MiB)
         //    to mapped pinned host RAM (only 1 row = 2.3 KB read per token -> ~0.2 us over PCIe!) to reclaim ~492 MiB VRAM!
         const bool offload_emb = (vtot_init <= (10ull << 30)) && (vfree_init < trunk_bytes + sec4_bytes + (1024ull << 20));
+        const bool use_unembed_arena = offload_emb && (sec4_bytes > (9ull << 30)) && man.trunk.count("model.llm.unembed.weight");
         if (offload_emb && man.trunk.count("model.llm.embed.weight")) {
             struct TEntry { std::string name; uint64_t orig_off; uint64_t bytes; bool is_dspark; };
             std::vector<TEntry> vram_list;
@@ -138,6 +151,7 @@ struct InkCudaModel {
             size_t compact_bytes = 0;
             for (const auto& kv : man.trunk) {
                 if (kv.first == "model.llm.embed.weight") continue;
+                if (use_unembed_arena && kv.first == "model.llm.unembed.weight") continue;
                 vram_list.push_back({kv.first, kv.second.off, kv.second.bytes, false});
             }
             for (const auto& kv : man.dspark) {
@@ -180,7 +194,16 @@ struct InkCudaModel {
             };
             if (!load_mapped(man.trunk,  "model.llm.embed.weight", h_embed_pinned, d_embed_ptr)) return false;
             if (!load_mapped(man.dspark, "dspark.markov_head.markov_w1.weight", h_mw1_pinned, d_mw1_ptr)) return false;
-            trunk_bytes = compact_bytes;
+            if (use_unembed_arena) {
+                const auto& ui = man.trunk.at("model.llm.unembed.weight");
+                unembed_bytes = (size_t)ui.bytes;
+                INK_CK(cudaHostAlloc(&h_unembed_pinned, unembed_bytes, cudaHostAllocDefault));
+                if (!rd.read_at(hdr.sections[1].file_offset + ui.off, h_unembed_pinned, unembed_bytes, err)) return false;
+                INK_CK(cudaMalloc(&d_unembed_arena, unembed_bytes));
+                INK_CK(cudaMemcpy(d_unembed_arena, h_unembed_pinned, unembed_bytes, cudaMemcpyHostToDevice));
+                unembed_resident = true;
+            }
+            trunk_bytes = compact_bytes + unembed_bytes;
         } else {
             INK_CK(cudaMalloc(&d_trunk, trunk_bytes));
             const size_t CH = 64ull << 20;
@@ -276,10 +299,15 @@ struct InkCudaModel {
                 for (int i = 0; i < n_total; ++i) order[i] = (uint16_t)i;
             }
             // Reserve exact headroom for runner+KV+DSpark fixed buffers (host-mapped DSpark/KV/embed saves ~1.5 GiB on 8 GB cards!)
-            const size_t hyb_post_res = ultra_tight_8g
-                ? (360ull << 20)
-                : std::max(reserve, (size_t)(vtot <= (10ull << 30) ? (640ull << 20) : (1664ull << 20)));
-            const size_t hyb_reserve = hyb_post_res + (ultra_tight_8g ? (32ull << 20) : (vtot <= (10ull << 30) ? (64ull << 20) : (256ull << 20)));
+            // When use_unembed_arena is active, M=512 prefill workspaces live inside d_unembed_arena -> permanent decode workspaces shrink by ~115 MiB!
+            const size_t hyb_post_res = use_unembed_arena
+                ? (280ull << 20)
+                : ultra_tight_8g
+                    ? (360ull << 20)
+                    : std::max(reserve, (size_t)(vtot <= (10ull << 30) ? (640ull << 20) : (1664ull << 20)));
+            const size_t hyb_reserve = hyb_post_res + (use_unembed_arena ? (40ull << 20)
+                                                    : ultra_tight_8g     ? (32ull << 20)
+                                                    : (vtot <= (10ull << 30) ? (64ull << 20) : (256ull << 20)));
             const size_t vram_budget = (vfree > hyb_reserve) ? (vfree - hyb_reserve) : 0;
             size_t vram_used = 0, host_used = 0, max_exp_bytes = 0;
             std::vector<uint8_t> in_vram(n_total, 0);
@@ -400,11 +428,11 @@ struct InkCudaModel {
                 unembed_screen.eps = dalloc<float>(unembed_screen.V);
                 if (ui.fmt == FMT_BF16) {
                     k_ink_build_unembed_screen_bf16<<<(unembed_screen.V + 7) / 8, 256>>>(
-                        reinterpret_cast<const uint16_t*>(d_trunk + ui.off),
+                        reinterpret_cast<const uint16_t*>(unembed_ptr()),
                         unembed_screen.q8, unembed_screen.sc, unembed_screen.eps, unembed_screen.V);
                 } else {
                     k_ink_build_unembed_screen_s6k<<<(unembed_screen.V + 7) / 8, 256>>>(
-                        d_trunk + ui.off,
+                        unembed_ptr(),
                         unembed_screen.q8, unembed_screen.sc, unembed_screen.eps, unembed_screen.V);
                 }
                 INK_CK(cudaDeviceSynchronize());
@@ -434,6 +462,9 @@ struct InkCudaModel {
         if (h_sec4_pinned) { cudaFreeHost(h_sec4_pinned); h_sec4_pinned = nullptr; }
         if (h_embed_pinned) { cudaFreeHost(h_embed_pinned); h_embed_pinned = nullptr; d_embed_ptr = nullptr; }
         if (h_mw1_pinned)   { cudaFreeHost(h_mw1_pinned);   h_mw1_pinned = nullptr;   d_mw1_ptr = nullptr; }
+        if (d_unembed_arena)  { cudaFree(d_unembed_arena); d_unembed_arena = nullptr; }
+        if (h_unembed_pinned) { cudaFreeHost(h_unembed_pinned); h_unembed_pinned = nullptr; }
+        unembed_bytes = 0; unembed_resident = true;
         if (d_trunk) { cudaFree(d_trunk); d_trunk = nullptr; }
     }
 };
@@ -527,6 +558,79 @@ struct InkCudaRunner {
 
     InkMoeWorkspace moe_ws;
 
+    // Swappable workspace pointer bank: when m.d_unembed_arena != nullptr (SQ-15 on 8 GiB GPUs),
+    // dec_ptrs holds permanent decode_batch=16 buffers (CUDA-Graph invariant!) and pf_ptrs carves
+    // M=512 prefill activations + MoE workspace + FP32 Flash-cuBLAS attention inside d_unembed_arena!
+    struct InkWorkPtrs {
+        float *d_cur = nullptr, *d_prelude = nullptr, *d_bank_out = nullptr;
+        float *d_blocks[8] = {}, *d_prelude_blocks[2] = {}, *d_bank[4] = {};
+        float *d_mixed = nullptr, *d_msgs = nullptr, *d_inp0 = nullptr, *d_inp1 = nullptr, *d_inp2 = nullptr;
+        float *d_q = nullptr, *d_k_raw = nullptr, *d_v_raw = nullptr, *d_k = nullptr, *d_v = nullptr, *d_r = nullptr;
+        float *d_k_dyn = nullptr, *d_v_dyn = nullptr, *d_sinks = nullptr, *d_gate_attn = nullptr, *d_rel_table = nullptr;
+        float *d_attn_out = nullptr, *d_wo_raw = nullptr, *d_moe_in = nullptr, *d_moe_raw = nullptr, *d_h_norm = nullptr;
+        float *d_taps[4] = {};
+        float *d_ctrl_cat = nullptr, *d_ctrl_gate = nullptr, *d_ctrl_gain = nullptr, *d_ctrl_forget = nullptr;
+        __nv_bfloat16 *d_x_bf16 = nullptr;
+    };
+    InkWorkPtrs dec_ptrs{}, pf_ptrs{};
+    uint8_t* pf_moe_base = nullptr;
+    int decode_batch = 0;
+    bool in_prefill_arena = false;
+    bool pf32_in_arena = false;
+
+    void snapshot_to(InkWorkPtrs& dst) const {
+        dst.d_cur = d_cur; dst.d_prelude = d_prelude; dst.d_bank_out = d_bank_out;
+        for (int i = 0; i < 8; ++i) dst.d_blocks[i] = d_blocks[i];
+        for (int i = 0; i < 2; ++i) dst.d_prelude_blocks[i] = d_prelude_blocks[i];
+        for (int i = 0; i < 4; ++i) dst.d_bank[i] = d_bank[i];
+        dst.d_mixed = d_mixed; dst.d_msgs = d_msgs; dst.d_inp0 = d_inp0; dst.d_inp1 = d_inp1; dst.d_inp2 = d_inp2;
+        dst.d_q = d_q; dst.d_k_raw = d_k_raw; dst.d_v_raw = d_v_raw; dst.d_k = d_k; dst.d_v = d_v; dst.d_r = d_r;
+        dst.d_k_dyn = d_k_dyn; dst.d_v_dyn = d_v_dyn; dst.d_sinks = d_sinks; dst.d_gate_attn = d_gate_attn; dst.d_rel_table = d_rel_table;
+        dst.d_attn_out = d_attn_out; dst.d_wo_raw = d_wo_raw; dst.d_moe_in = d_moe_in; dst.d_moe_raw = d_moe_raw; dst.d_h_norm = d_h_norm;
+        for (int i = 0; i < 4; ++i) dst.d_taps[i] = d_taps[i];
+        dst.d_ctrl_cat = d_ctrl_cat; dst.d_ctrl_gate = d_ctrl_gate; dst.d_ctrl_gain = d_ctrl_gain; dst.d_ctrl_forget = d_ctrl_forget;
+        dst.d_x_bf16 = d_x_bf16;
+    }
+
+    void apply_ptrs(const InkWorkPtrs& src) {
+        d_cur = src.d_cur; d_prelude = src.d_prelude; d_bank_out = src.d_bank_out;
+        for (int i = 0; i < 8; ++i) d_blocks[i] = src.d_blocks[i];
+        for (int i = 0; i < 2; ++i) d_prelude_blocks[i] = src.d_prelude_blocks[i];
+        for (int i = 0; i < 4; ++i) d_bank[i] = src.d_bank[i];
+        d_mixed = src.d_mixed; d_msgs = src.d_msgs; d_inp0 = src.d_inp0; d_inp1 = src.d_inp1; d_inp2 = src.d_inp2;
+        d_q = src.d_q; d_k_raw = src.d_k_raw; d_v_raw = src.d_v_raw; d_k = src.d_k; d_v = src.d_v; d_r = src.d_r;
+        d_k_dyn = src.d_k_dyn; d_v_dyn = src.d_v_dyn; d_sinks = src.d_sinks; d_gate_attn = src.d_gate_attn; d_rel_table = src.d_rel_table;
+        d_attn_out = src.d_attn_out; d_wo_raw = src.d_wo_raw; d_moe_in = src.d_moe_in; d_moe_raw = src.d_moe_raw; d_h_norm = src.d_h_norm;
+        for (int i = 0; i < 4; ++i) d_taps[i] = src.d_taps[i];
+        d_ctrl_cat = src.d_ctrl_cat; d_ctrl_gate = src.d_ctrl_gate; d_ctrl_gain = src.d_ctrl_gain; d_ctrl_forget = src.d_ctrl_forget;
+        d_x_bf16 = src.d_x_bf16;
+    }
+
+    void use_prefill_arena() {
+        if (!m.d_unembed_arena || in_prefill_arena) return;
+        m.unembed_resident = false;
+        apply_ptrs(pf_ptrs);
+        moe_ws.bind_external(max_batch, pf_moe_base);
+        in_prefill_arena = true;
+    }
+
+    void ensure_decode_ready() {
+        if (!m.d_unembed_arena) return;
+        if (in_prefill_arena) {
+            apply_ptrs(dec_ptrs);
+            moe_ws.unbind_external();
+            in_prefill_arena = false;
+        }
+        m.restore_unembed(st);
+    }
+
+    bool ptr_in_unembed_arena(const void* p) const {
+        if (!m.d_unembed_arena || !p) return false;
+        const uintptr_t u = reinterpret_cast<uintptr_t>(p);
+        const uintptr_t lo = reinterpret_cast<uintptr_t>(m.d_unembed_arena);
+        return u >= lo && u < lo + m.unembed_bytes;
+    }
+
     // 48-Visit CUDA Graph cache (keyed by M, is_tree, capture_taps)
     struct GraphKey {
         int M;
@@ -591,10 +695,10 @@ struct InkCudaRunner {
             tree_cap = (max_slots <= 4 && vfree > (700ull << 20)) ? kInkMaxTree
                      : ((vtot <= (10ull << 30) && m.n_host_experts > 0) ? 8 : 16);
             max_batch = std::max(max_batch, tree_cap);
-            // On tight 8 GiB GPUs: SQ-15 (vfree < 450 MiB) caps max_batch to 128 while fitting 100% Core + 512 VRAM KV;
-            // SQ-10 (vfree >= 450 MiB) keeps full max_batch = 512 for peak prefill throughput!
+            // On tight 8 GiB GPUs: with d_unembed_arena, SQ-15 keeps full max_batch=512 (carved inside unembed);
+            // without d_unembed_arena, tight vfree (< 450 MiB) caps max_batch to 128; SQ-10 keeps full max_batch = 512!
             if (vtot <= (10ull << 30) && m.n_host_experts > 0) {
-                const int cap_b = (vfree < (450ull << 20)) ? 128 : 512;
+                const int cap_b = (m.d_unembed_arena != nullptr) ? 512 : ((vfree < (450ull << 20)) ? 128 : 512);
                 if (max_batch > cap_b) {
                     max_batch = cap_b;
                     swa_ring = (max_slots >= 16) ? (kInkSwaWin + 32) : (kInkSwaWin + max_batch);
@@ -609,6 +713,8 @@ struct InkCudaRunner {
             const size_t sconv_bytes  = (size_t)kInkVisits * max_slots * 3 * kInkSconvCh * 4;
             const size_t eff_extra    = (vfree < (450ull << 20)) ? std::min(extra_post_reserve, (size_t)(24ull << 20)) : extra_post_reserve;
             const size_t ws_reserve   = ((max_slots >= 8) ? (1400ull << 20)
+                                       : (m.d_unembed_arena != nullptr)
+                                           ? (104ull << 20)
                                        : ((vtot <= (10ull << 30) && m.n_host_experts > 0)
                                            ? ((vfree < (450ull << 20)) ? (206ull << 20) : (456ull << 20))
                                            : (480ull << 20)))
@@ -684,46 +790,48 @@ struct InkCudaRunner {
             INK_CK(cudaMemset(d_sconv_pool[v], 0, (size_t)max_slots * 3 * kInkSconvCh * sizeof(float)));
         }
 
+        decode_batch = (m.d_unembed_arena != nullptr) ? std::max(16, std::max(tree_cap, max_slots)) : max_batch;
         const size_t MB = (size_t)max_batch;
+        const size_t DB = (size_t)decode_batch;
         const int n_blk_alloc = std::min(8, (m.man.c.n_phys + m.man.c.block_size - 1) / m.man.c.block_size + 1);
         const int n_pre_alloc = std::min(2, std::max(1, (m.man.c.core_start + m.man.c.block_size - 1) / m.man.c.block_size));
         const int n_bnk_alloc = std::min(4, std::max(1, n_blk_alloc - 1));
-        d_cur       = dalloc<float>(MB * kInkHidden);
+        d_cur       = dalloc<float>(DB * kInkHidden);
         d_res       = nullptr;
-        d_prelude   = dalloc<float>(MB * kInkHidden);
-        d_bank_out  = dalloc<float>(MB * kInkHidden);
-        for (int i = 0; i < n_blk_alloc; ++i) d_blocks[i] = dalloc<float>(MB * kInkHidden);
-        for (int i = 0; i < n_pre_alloc; ++i) d_prelude_blocks[i] = dalloc<float>(MB * kInkHidden);
-        for (int i = 0; i < n_bnk_alloc; ++i) d_bank[i] = dalloc<float>(MB * kInkHidden);
-        d_mixed     = dalloc<float>(3 * MB * kInkHidden);
-        d_msgs      = dalloc<float>(4 * MB * kInkHidden);
-        d_inp0      = dalloc<float>(MB * kInkHidden);
-        d_inp1      = dalloc<float>(MB * kInkHidden);
-        d_inp2      = dalloc<float>(MB * kInkHidden);
-        d_q         = dalloc<float>(MB * kInkQDim);
-        d_k_raw     = dalloc<float>(MB * kInkKVDim);
-        d_v_raw     = dalloc<float>(MB * kInkKVDim);
-        d_k         = dalloc<float>(MB * kInkKVDim);
-        d_v         = dalloc<float>(MB * kInkKVDim);
-        d_r         = dalloc<float>(MB * kInkHeads * kInkDRel);
-        d_k_dyn     = dalloc<float>(MB * kInkKVHeads * 4);
-        d_v_dyn     = dalloc<float>(MB * kInkKVHeads * 4);
-        d_sinks     = dalloc<float>(MB * kInkHeads);
-        d_gate_attn = dalloc<float>(MB * kInkQDim);
-        d_rel_table = dalloc<float>(MB * kInkHeads * (kInkRelExtent + 1));
-        d_attn_out  = dalloc<float>(MB * kInkQDim);
+        d_prelude   = dalloc<float>(DB * kInkHidden);
+        d_bank_out  = dalloc<float>(DB * kInkHidden);
+        for (int i = 0; i < n_blk_alloc; ++i) d_blocks[i] = dalloc<float>(DB * kInkHidden);
+        for (int i = 0; i < n_pre_alloc; ++i) d_prelude_blocks[i] = dalloc<float>(DB * kInkHidden);
+        for (int i = 0; i < n_bnk_alloc; ++i) d_bank[i] = dalloc<float>(DB * kInkHidden);
+        d_mixed     = dalloc<float>(3 * DB * kInkHidden);
+        d_msgs      = dalloc<float>(4 * DB * kInkHidden);
+        d_inp0      = dalloc<float>(DB * kInkHidden);
+        d_inp1      = dalloc<float>(DB * kInkHidden);
+        d_inp2      = dalloc<float>(DB * kInkHidden);
+        d_q         = dalloc<float>(DB * kInkQDim);
+        d_k_raw     = dalloc<float>(DB * kInkKVDim);
+        d_v_raw     = dalloc<float>(DB * kInkKVDim);
+        d_k         = dalloc<float>(DB * kInkKVDim);
+        d_v         = dalloc<float>(DB * kInkKVDim);
+        d_r         = dalloc<float>(DB * kInkHeads * kInkDRel);
+        d_k_dyn     = dalloc<float>(DB * kInkKVHeads * 4);
+        d_v_dyn     = dalloc<float>(DB * kInkKVHeads * 4);
+        d_sinks     = dalloc<float>(DB * kInkHeads);
+        d_gate_attn = dalloc<float>(DB * kInkQDim);
+        d_rel_table = dalloc<float>(DB * kInkHeads * (kInkRelExtent + 1));
+        d_attn_out  = dalloc<float>(DB * kInkQDim);
         d_wo_conv   = nullptr;
-        d_moe_in    = dalloc<float>(MB * kInkHidden);
+        d_moe_in    = dalloc<float>(DB * kInkHidden);
         d_moe_conv  = nullptr;
         for (int i = 0; i < 4; ++i) {
-            d_taps[i]         = dalloc<float>(MB * kInkHidden);
+            d_taps[i]         = dalloc<float>(DB * kInkHidden);
             d_taps_compact[i] = dalloc<float>((size_t)tree_cap * kInkHidden);
         }
-        const size_t ctrl_m = std::max<size_t>(3ull * 16, MB);
+        const size_t ctrl_m = std::max<size_t>(3ull * 16, DB);
         d_ctrl_cat    = dalloc<float>(ctrl_m * 2 * kInkHidden);
         d_ctrl_gate   = dalloc<float>(ctrl_m * kInkGateRank);
-        d_ctrl_gain   = dalloc<float>(MB * kInkHidden);
-        d_ctrl_forget = dalloc<float>(MB * kInkHidden);
+        d_ctrl_gain   = dalloc<float>(DB * kInkHidden);
+        d_ctrl_forget = dalloc<float>(DB * kInkHidden);
         // Non-overlapping lifetime aliases (zero extra VRAM, freed via d_ctrl_gain / d_ctrl_forget only!)
         d_wo_raw  = d_ctrl_gain;
         d_moe_raw = d_ctrl_gain;
@@ -741,8 +849,8 @@ struct InkCudaRunner {
         d_acc_path    = dalloc<int32_t>(kInkMaxTree);
 
         const size_t x_bf16_elems = (m.sm_cc < 70)
-            ? std::max<size_t>(64 * 64, (MB * kInkQDim + 1) / 2)
-            : (MB * std::max(kInkDsparkInter, std::max(kInkQDim, kInkHidden)));
+            ? std::max<size_t>(64 * 64, (DB * kInkQDim + 1) / 2)
+            : (DB * std::max(kInkDsparkInter, std::max(kInkQDim, kInkHidden)));
         d_x_bf16    = dalloc<__nv_bfloat16>(x_bf16_elems);
         w_scratch_elems = (m.sm_cc < 70 && m.n_host_experts > 0)
             ? (4ull << 20)
@@ -798,9 +906,84 @@ struct InkCudaRunner {
         for (int il = 0; il < m.man.c.n_phys; ++il) {
             if (m.moe_info[il].has_sf4 || m.moe_info[il].has_mx8) { any_sf4_mx8 = true; break; }
         }
-        moe_ws.alloc(max_batch, any_sf4_mx8);
+        moe_ws.alloc(decode_batch, any_sf4_mx8);
+        snapshot_to(dec_ptrs);
+
+        // When d_unembed_arena is active (8 GiB SQ-15), carve the entire M=max_batch prefill workspace
+        // (activations + MoE workspace + Pascal FP32 Flash-cuBLAS attention) inside d_unembed_arena (~333 MiB <= 360 MiB)!
+        if (m.d_unembed_arena != nullptr) {
+            auto carve_arena = [&](int pm) -> size_t {
+                const size_t PM = (size_t)pm;
+                size_t off = 0;
+                auto bump = [&](size_t bytes) -> uint8_t* {
+                    off = (off + 255ull) & ~255ull;
+                    uint8_t* p = m.d_unembed_arena + off;
+                    off += bytes;
+                    return p;
+                };
+                pf_ptrs = {};
+                pf_ptrs.d_cur      = (float*)bump(PM * kInkHidden * 4);
+                pf_ptrs.d_prelude  = (float*)bump(PM * kInkHidden * 4);
+                pf_ptrs.d_bank_out = (float*)bump(PM * kInkHidden * 4);
+                for (int i = 0; i < n_blk_alloc; ++i) pf_ptrs.d_blocks[i]         = (float*)bump(PM * kInkHidden * 4);
+                for (int i = 0; i < n_pre_alloc; ++i) pf_ptrs.d_prelude_blocks[i] = (float*)bump(PM * kInkHidden * 4);
+                for (int i = 0; i < n_bnk_alloc; ++i) pf_ptrs.d_bank[i]           = (float*)bump(PM * kInkHidden * 4);
+                pf_ptrs.d_mixed     = (float*)bump(3 * PM * kInkHidden * 4);
+                pf_ptrs.d_msgs      = (float*)bump(4 * PM * kInkHidden * 4);
+                pf_ptrs.d_inp0      = (float*)bump(PM * kInkHidden * 4);
+                pf_ptrs.d_inp1      = (float*)bump(PM * kInkHidden * 4);
+                pf_ptrs.d_inp2      = (float*)bump(PM * kInkHidden * 4);
+                pf_ptrs.d_q         = (float*)bump(PM * kInkQDim * 4);
+                pf_ptrs.d_k_raw     = (float*)bump(PM * kInkKVDim * 4);
+                pf_ptrs.d_v_raw     = (float*)bump(PM * kInkKVDim * 4);
+                pf_ptrs.d_k         = (float*)bump(PM * kInkKVDim * 4);
+                pf_ptrs.d_v         = (float*)bump(PM * kInkKVDim * 4);
+                pf_ptrs.d_r         = (float*)bump(PM * kInkHeads * kInkDRel * 4);
+                pf_ptrs.d_k_dyn     = (float*)bump(PM * kInkKVHeads * 4 * 4);
+                pf_ptrs.d_v_dyn     = (float*)bump(PM * kInkKVHeads * 4 * 4);
+                pf_ptrs.d_sinks     = (float*)bump(PM * kInkHeads * 4);
+                pf_ptrs.d_gate_attn = (float*)bump(PM * kInkQDim * 4);
+                pf_ptrs.d_rel_table = (float*)bump(PM * kInkHeads * (kInkRelExtent + 1) * 4);
+                pf_ptrs.d_attn_out  = (float*)bump(PM * kInkQDim * 4);
+                pf_ptrs.d_moe_in    = (float*)bump(PM * kInkHidden * 4);
+                for (int i = 0; i < 4; ++i) pf_ptrs.d_taps[i] = (float*)bump(PM * kInkHidden * 4);
+                const size_t pf_ctrl_m = std::max<size_t>(3ull * 16, PM);
+                pf_ptrs.d_ctrl_cat    = (float*)bump(pf_ctrl_m * 2 * kInkHidden * 4);
+                pf_ptrs.d_ctrl_gate   = (float*)bump(pf_ctrl_m * kInkGateRank * 4);
+                pf_ptrs.d_ctrl_gain   = (float*)bump(PM * kInkHidden * 4);
+                pf_ptrs.d_ctrl_forget = (float*)bump(PM * kInkHidden * 4);
+                pf_ptrs.d_wo_raw  = pf_ptrs.d_ctrl_gain;
+                pf_ptrs.d_moe_raw = pf_ptrs.d_ctrl_gain;
+                pf_ptrs.d_h_norm  = pf_ptrs.d_ctrl_forget;
+                const size_t pf_x_elems = (m.sm_cc < 70)
+                    ? std::max<size_t>(64 * 64, (PM * kInkQDim + 1) / 2)
+                    : (PM * std::max(kInkDsparkInter, std::max(kInkQDim, kInkHidden)));
+                pf_ptrs.d_x_bf16 = (__nv_bfloat16*)bump(pf_x_elems * sizeof(__nv_bfloat16));
+                pf_moe_base = bump(InkMoeWorkspace::external_bytes_needed(pm));
+                constexpr int K_TILE = 1024;
+                constexpr int Q_CH   = 128;
+                d_pf32_q = (float*)bump((size_t)kInkHeads * PM * kInkHeadDim * 4);
+                d_pf32_k = (float*)bump((size_t)kInkKVHeads * K_TILE * kInkHeadDim * 4);
+                d_pf32_v = (float*)bump((size_t)kInkKVHeads * K_TILE * kInkHeadDim * 4);
+                d_pf32_s = (float*)bump((size_t)kInkKVHeads * Q_CH * K_TILE * 4);
+                d_pf32_o = (float*)bump((size_t)kInkHeads * PM * kInkHeadDim * 4);
+                d_pf32_m = (float*)bump((size_t)kInkHeads * PM * 4);
+                d_pf32_l = (float*)bump((size_t)kInkHeads * PM * 4);
+                return off;
+            };
+            size_t need = carve_arena(max_batch);
+            while (need > m.unembed_bytes && max_batch > 128) {
+                max_batch = std::max(128, max_batch - 64);
+                need = carve_arena(max_batch);
+            }
+            pf32_m_cap = max_batch;
+            pf32_in_arena = true;
+            std::fprintf(stderr, "[InkCUDA] Unembed-swap prefill arena active: M=%d (%.1f / %.1f MiB inside d_unembed_arena, decode_batch=%d)\n",
+                         max_batch, (double)need / (1024.0 * 1024.0), (double)m.unembed_bytes / (1024.0 * 1024.0), decode_batch);
+        }
+
         // Pre-allocate Tensor Core prefill attention workspace outside timed prefill loop when VRAM allows (~140 MB)!
-        if (m.sm_cc >= 60 && max_slots <= 4 && max_batch >= 128) {
+        if (m.sm_cc >= 60 && max_slots <= 4 && max_batch >= 128 && !pf32_in_arena) {
             size_t vf = 0, vt = 0;
             INK_CK(cudaMemGetInfo(&vf, &vt));
             if (vf > (640ull << 20)) ensure_pf_attn(std::min(max_ctx, std::max(max_batch, 2048)));
@@ -1050,7 +1233,7 @@ struct InkCudaRunner {
         const auto& ti = m.tinfo(tname);
         const int N = N_override > 0 ? N_override : (int)ti.rows();
         const int K = (int)ti.cols();
-        const uint8_t* W = m.d_trunk + ti.off;
+        const uint8_t* W = (tname == "model.llm.unembed.weight") ? m.unembed_ptr() : (m.d_trunk + ti.off);
 
         if (ti.fmt == FMT_BF16) {
             const bool is_fp16 = m.trunk_attn_fp16 && (tname.find(".attn.") != std::string::npos);
@@ -1225,7 +1408,12 @@ struct InkCudaRunner {
         INK_CK(cudaStreamSynchronize(st));
         auto fr = [](auto*& p) { if (p) { cudaFree(p); p = nullptr; } };
         fr(d_pf_q); fr(d_pf_k); fr(d_pf_v); fr(d_pf_p); fr(d_pf_s); fr(d_pf_o);
-        fr(d_pf32_q); fr(d_pf32_k); fr(d_pf32_v); fr(d_pf32_s); fr(d_pf32_o); fr(d_pf32_m); fr(d_pf32_l);
+        if (!pf32_in_arena) {
+            fr(d_pf32_q); fr(d_pf32_k); fr(d_pf32_v); fr(d_pf32_s); fr(d_pf32_o); fr(d_pf32_m); fr(d_pf32_l);
+        } else {
+            d_pf32_q = d_pf32_k = d_pf32_v = d_pf32_s = d_pf32_o = d_pf32_m = d_pf32_l = nullptr;
+            pf32_in_arena = false;
+        }
         pf32_m_cap = 0;
         pf_kv_cap = std::max(K_len, 2048);
         d_pf_q = dalloc<__nv_bfloat16>((size_t)kInkHeads * max_batch * kInkHeadDim);
@@ -1239,6 +1427,7 @@ struct InkCudaRunner {
     bool ensure_pf_attn_f32(int M_need) {
         constexpr int K_TILE = 1024;
         constexpr int Q_CH   = 128;
+        if (pf32_in_arena) return in_prefill_arena && M_need <= pf32_m_cap && d_pf32_q != nullptr;
         if (M_need <= pf32_m_cap && d_pf32_q) return true;
         size_t vf = 0, vt = 0;
         INK_CK(cudaMemGetInfo(&vf, &vt));
@@ -1757,6 +1946,10 @@ struct InkCudaRunner {
     // ---- Launch Full 48-Visit Forward (with Automatic CUDA Graph Capture for Decode/Batched/Tree!) ----
     void forward_seq(const int32_t* tok_ids, int p0, int M, int slot0, bool want_taps) {
         if (m.hybrid.active) m.hybrid.wait_promo();
+        if (m.d_unembed_arena != nullptr) {
+            if (M > decode_batch) use_prefill_arena();
+            else                  ensure_decode_ready();
+        }
         int32_t* slot_buf = h_meta_pin + (meta_ring_idx++ & 63ull) * meta_ring_stride;
         std::memcpy(slot_buf, tok_ids, (size_t)M * 4);
         int32_t* h_pos = slot_buf + M;
@@ -1788,6 +1981,7 @@ struct InkCudaRunner {
 
     // Speculative Tree-32 / Block-8 verify (100% CUDA-Graph capturable across ALL p0 when 100% VRAM!)
     void forward_tree_verify(const InkTreeSpec& tree, int p0, int slot0, bool want_taps) {
+        ensure_decode_ready();
         if (m.hybrid.active) m.hybrid.wait_promo();
         const int M = tree.M;
         int32_t* slot_buf = h_meta_pin + (meta_ring_idx++ & 63ull) * meta_ring_stride;
@@ -1830,6 +2024,7 @@ struct InkCudaRunner {
 
     // Batched multi-slot 1-token-per-slot step (B = 1..64 concurrent requests, captured in CUDA Graph when 100% VRAM!)
     void forward_batched(const int32_t* tok_ids, const int32_t* slot_ids, const int32_t* pos_arr, int B, bool want_taps = false) {
+        ensure_decode_ready();
         int32_t* slot_buf = h_meta_pin + (meta_ring_idx++ & 63ull) * meta_ring_stride;
         std::memcpy(slot_buf, tok_ids, (size_t)B * 4);
         std::memcpy(slot_buf + B, slot_ids, (size_t)B * 4);
@@ -1861,6 +2056,21 @@ struct InkCudaRunner {
     // Fast exact 2-stage screened argmax (0.14 ms on RTX 5090, 100.000% mathematically bit-exact up to M <= 32!)
     void head_argmax_exact(int M, int32_t* h_out_ids) {
         prof_mark_start();
+        if (in_prefill_arena) {
+            if (M <= decode_batch) {
+                INK_CK(cudaMemcpyAsync(dec_ptrs.d_h_norm, d_h_norm, (size_t)M * kInkHidden * 4, cudaMemcpyDeviceToDevice, st));
+                ensure_decode_ready();
+            } else {
+                head_logits_full(M);
+                k_ink_argmax_rows<<<M, 1024, 0, st>>>(d_logits, m.man.c.vocab_unpadded, d_argmax);
+                prof_mark_end(7);
+                INK_CK(cudaMemcpyAsync(h_out_ids, d_argmax, (size_t)M * 4, cudaMemcpyDeviceToHost, st));
+                INK_CK(cudaStreamSynchronize(st));
+                return;
+            }
+        } else {
+            ensure_decode_ready();
+        }
         const auto& ui = m.tinfo("model.llm.unembed.weight");
         if (m.unembed_screen.ready && (ui.fmt == FMT_BF16 || ui.fmt == FMT_S6_K) && M <= kInkMaxTree) {
             const int V = m.man.c.vocab_unpadded;
@@ -1888,10 +2098,10 @@ struct InkCudaRunner {
                     hm, d_h_norm2, d_dot_hat, d_max_lb, d_cand_ids, d_cand_cnt, 4096, mc, V);
                 if (ui.fmt == FMT_BF16) {
                     k_ink_screen_eval_bf16<<<mc, 256, 0, st>>>(
-                        (const uint16_t*)(m.d_trunk + ui.off), hm, d_cand_ids, d_cand_cnt, 4096, d_argmax + m0, mc);
+                        (const uint16_t*)m.unembed_ptr(), hm, d_cand_ids, d_cand_cnt, 4096, d_argmax + m0, mc);
                 } else {
                     k_ink_screen_eval_s6k<<<mc, 256, 0, st>>>(
-                        m.d_trunk + ui.off, hm, d_cand_ids, d_cand_cnt, 4096, d_argmax + m0, mc);
+                        m.unembed_ptr(), hm, d_cand_ids, d_cand_cnt, 4096, d_argmax + m0, mc);
                 }
             }
             prof_mark_end(7);
@@ -1906,7 +2116,7 @@ struct InkCudaRunner {
             (size_t)M * (kInkHidden / 64) <= (size_t)moe_ws.cap_M * (kInkHidden / 64)) {
             const int V = m.man.c.vocab_unpadded;
             const int grid = (V + 31) / 32;
-            const uint8_t* W = m.d_trunk + ui.off;
+            const uint8_t* W = m.unembed_ptr();
             const int nblk = M * (kInkHidden / 64);
             k_ink_quant_q8_1<<<(nblk + 7) / 8, 256, 0, st>>>(d_h_norm, moe_ws.xq_sk, M, kInkHidden);
             // Reuse unused d_dot_hat (8 * 200058 floats = 6.4 MB) for [M, grid] partial (val, idx) pairs (~400 KB each)
@@ -1943,6 +2153,12 @@ struct InkCudaRunner {
 
     // Full exact softcapped logits [n_want, 200058] for selected hidden rows in d_h_src -> d_logits
     void head_logits_from(const float* d_h_src, int n_want) {
+        if (in_prefill_arena && ptr_in_unembed_arena(d_h_src)) {
+            float* safe_dst = (n_want <= decode_batch) ? dec_ptrs.d_h_norm : d_img_emb;
+            INK_CK(cudaMemcpyAsync(safe_dst, d_h_src, (size_t)n_want * kInkHidden * 4, cudaMemcpyDeviceToDevice, st));
+            d_h_src = safe_dst;
+        }
+        ensure_decode_ready();
         ensure_logits(n_want);
         const int V = m.man.c.vocab_unpadded;
         linear("model.llm.unembed.weight", d_h_src, d_logits, n_want, V);
@@ -1956,6 +2172,11 @@ struct InkCudaRunner {
     }
 
     void free_all() {
+        if (in_prefill_arena) {
+            apply_ptrs(dec_ptrs);
+            moe_ws.unbind_external();
+            in_prefill_arena = false;
+        }
         for (auto& e : graph_cache) if (e.exec) cudaGraphExecDestroy(e.exec);
         graph_cache.clear();
         moe_ws.free_all();
@@ -1987,7 +2208,12 @@ struct InkCudaRunner {
         fr(d_ctrl_cat); fr(d_ctrl_gate); fr(d_ctrl_gain); fr(d_ctrl_forget);
         fr(d_attn_pm); fr(d_attn_pl); fr(d_attn_po);
         fr(d_pf_q); fr(d_pf_k); fr(d_pf_v); fr(d_pf_p); fr(d_pf_s); fr(d_pf_o);
-        fr(d_pf32_q); fr(d_pf32_k); fr(d_pf32_v); fr(d_pf32_s); fr(d_pf32_o); fr(d_pf32_m); fr(d_pf32_l);
+        if (!pf32_in_arena) {
+            fr(d_pf32_q); fr(d_pf32_k); fr(d_pf32_v); fr(d_pf32_s); fr(d_pf32_o); fr(d_pf32_m); fr(d_pf32_l);
+        } else {
+            d_pf32_q = d_pf32_k = d_pf32_v = d_pf32_s = d_pf32_o = d_pf32_m = d_pf32_l = nullptr;
+            pf32_in_arena = false;
+        }
         pf32_m_cap = 0;
         fr(d_stage_k); fr(d_stage_v); fr(d_stage_sconv);
         fr(d_kv_desc_arr); fr(d_sconv_pool_arr); fr(d_acc_path);

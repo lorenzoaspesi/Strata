@@ -83,6 +83,72 @@ struct InkMoeWorkspace {
     size_t   raw_bytes = 0;
     int      cap_M    = 0;
 
+    // Saved permanent decode-sized workspace state for zero-malloc external prefill arena binding
+    struct SavedState {
+        InkMoeTables tb{};
+        float*   r_logits = nullptr;
+        int32_t* topk_idx = nullptr;
+        float*   topk_w   = nullptr;
+        float*   h_f32    = nullptr;
+        float*   y_pair   = nullptr;
+        InkQ8_1_G64* xq_sk = nullptr;
+        InkQ8_1_G64* hq_sk = nullptr;
+        int cap_M = 0;
+        bool active = false;
+    } saved_{};
+
+    static size_t external_bytes_needed(int max_M) {
+        const size_t M = (size_t)max_M;
+        const size_t P = M * kInkTopK;
+        const size_t MT = (size_t)ink_moe_max_tiles(max_M);
+        size_t off = 0;
+        auto bump = [&](size_t bytes) { off += ink_moe_align(bytes); };
+        bump(128 * 4); bump(129 * 4); bump(128 * 4); bump(16);
+        bump(P * 4); bump(P * 4); bump(16); bump(MT * sizeof(int2));
+        bump(M * kInkExperts * 4); bump(P * 4); bump(P * 4);
+        bump(P * kInkInter * 4); bump(P * kInkHidden * 4);
+        bump(M * (kInkHidden / 64) * sizeof(InkQ8_1_G64));
+        bump(P * (kInkInter / 64) * sizeof(InkQ8_1_G64));
+        return off;
+    }
+
+    void bind_external(int max_M, uint8_t* base) {
+        if (!saved_.active) {
+            saved_.tb = tb; saved_.r_logits = r_logits; saved_.topk_idx = topk_idx; saved_.topk_w = topk_w;
+            saved_.h_f32 = h_f32; saved_.y_pair = y_pair; saved_.xq_sk = xq_sk; saved_.hq_sk = hq_sk;
+            saved_.cap_M = cap_M; saved_.active = true;
+        }
+        cap_M = max_M;
+        const size_t M = (size_t)max_M;
+        const size_t P = M * kInkTopK;
+        const size_t MT = (size_t)ink_moe_max_tiles(max_M);
+        size_t off = 0;
+        auto bump = [&](size_t bytes) -> size_t { size_t o = off; off += ink_moe_align(bytes); return o; };
+        tb.cnt     = (int32_t*)(base + bump(128 * 4));
+        tb.off     = (int32_t*)(base + bump(129 * 4));
+        tb.active  = (int32_t*)(base + bump(128 * 4));
+        tb.nact    = (int32_t*)(base + bump(16));
+        tb.pairs   = (int32_t*)(base + bump(P * 4));
+        tb.tok_idx = (int32_t*)(base + bump(P * 4));
+        tb.n_tiles = (int32_t*)(base + bump(16));
+        tb.tiles   = (int2*)(base + bump(MT * sizeof(int2)));
+        r_logits   = (float*)(base + bump(M * kInkExperts * 4));
+        topk_idx   = (int32_t*)(base + bump(P * 4));
+        topk_w     = (float*)(base + bump(P * 4));
+        h_f32      = (float*)(base + bump(P * kInkInter * 4));
+        y_pair     = (float*)(base + bump(P * kInkHidden * 4));
+        xq_sk      = (InkQ8_1_G64*)(base + bump(M * (kInkHidden / 64) * sizeof(InkQ8_1_G64)));
+        hq_sk      = (InkQ8_1_G64*)(base + bump(P * (kInkInter / 64) * sizeof(InkQ8_1_G64)));
+    }
+
+    void unbind_external() {
+        if (!saved_.active) return;
+        tb = saved_.tb; r_logits = saved_.r_logits; topk_idx = saved_.topk_idx; topk_w = saved_.topk_w;
+        h_f32 = saved_.h_f32; y_pair = saved_.y_pair; xq_sk = saved_.xq_sk; hq_sk = saved_.hq_sk;
+        cap_M = saved_.cap_M;
+        saved_.active = false;
+    }
+
     void alloc(int max_M, bool need_sgemm = true) {
         if (max_M <= cap_M && raw_buf) return;
         free_all();
