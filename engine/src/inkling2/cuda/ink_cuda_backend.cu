@@ -121,9 +121,7 @@ public:
         if (opts.kv_dtype_auto && (max_slots_ >= 16 || prop.totalGlobalMem <= (13ull << 30)) && prop.totalGlobalMem < (40ull << 30)) {
             kv_dtype_ = KvDtype::FP8_E4M3;
         }
-        const int eff_chunk = (prop.totalGlobalMem <= (10ull << 30))
-                            ? std::min(256, std::max(64, opts.chunk))
-                            : std::max(64, opts.chunk);
+        const int eff_chunk = std::max(64, opts.chunk);
         const size_t swa_r = (max_slots_ >= 16) ? (size_t)(strata::ink::kInkSwaWin + 32)
                                                 : (size_t)(strata::ink::kInkSwaWin + std::max(eff_chunk, 64));
         const size_t bpe = (kv_dtype_ == KvDtype::FP8_E4M3) ? 2ull : 4ull;

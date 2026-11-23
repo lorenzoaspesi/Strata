@@ -83,7 +83,7 @@ struct InkMoeWorkspace {
     size_t   raw_bytes = 0;
     int      cap_M    = 0;
 
-    void alloc(int max_M) {
+    void alloc(int max_M, bool need_sgemm = true) {
         if (max_M <= cap_M && raw_buf) return;
         free_all();
         cap_M = max_M;
@@ -94,7 +94,7 @@ struct InkMoeWorkspace {
         int dev = 0, cc_maj = 0;
         cudaGetDevice(&dev);
         cudaDeviceGetAttribute(&cc_maj, cudaDevAttrComputeCapabilityMajor, dev);
-        const bool need_pascal_sgemm = (cc_maj > 0 && cc_maj < 7);
+        const bool need_pascal_sgemm = need_sgemm && (cc_maj > 0 && cc_maj < 7);
         size_t off = 0;
         auto bump = [&](size_t bytes) -> size_t {
             size_t o = off;

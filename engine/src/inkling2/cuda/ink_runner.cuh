@@ -241,8 +241,8 @@ struct InkCudaModel {
         // while keeping full headroom for FP8 KV + workspaces + DSpark + CUDA Graph (spilling cleanly to Hybrid on 11 GB GPUs)!
         const bool ultra_tight_8g = (vtot <= (10ull << 30)) && (sec4_bytes > (9ull << 30));
         const size_t base_reserve = (vtot >= (20ull << 30)) ? (1600ull << 20)
-                                  : ultra_tight_8g          ? (328ull << 20)
-                                  : (vtot <= (10ull << 30)) ? (560ull << 20)
+                                  : ultra_tight_8g          ? (360ull << 20)
+                                  : (vtot <= (10ull << 30)) ? (640ull << 20)
                                   : (vtot <= (13ull << 30)) ? (780ull << 20)
                                                             : (1280ull << 20);
         const size_t reserve = ultra_tight_8g ? base_reserve : std::max(base_reserve, extra_reserve_bytes);
@@ -277,9 +277,9 @@ struct InkCudaModel {
             }
             // Reserve exact headroom for runner+KV+DSpark fixed buffers (host-mapped DSpark/KV/embed saves ~1.5 GiB on 8 GB cards!)
             const size_t hyb_post_res = ultra_tight_8g
-                ? (328ull << 20)
-                : std::max(reserve, (size_t)(vtot <= (10ull << 30) ? (560ull << 20) : (1664ull << 20)));
-            const size_t hyb_reserve = hyb_post_res + (ultra_tight_8g ? (36ull << 20) : (vtot <= (10ull << 30) ? (80ull << 20) : (256ull << 20)));
+                ? (360ull << 20)
+                : std::max(reserve, (size_t)(vtot <= (10ull << 30) ? (640ull << 20) : (1664ull << 20)));
+            const size_t hyb_reserve = hyb_post_res + (ultra_tight_8g ? (32ull << 20) : (vtot <= (10ull << 30) ? (64ull << 20) : (256ull << 20)));
             const size_t vram_budget = (vfree > hyb_reserve) ? (vfree - hyb_reserve) : 0;
             size_t vram_used = 0, host_used = 0, max_exp_bytes = 0;
             std::vector<uint8_t> in_vram(n_total, 0);
@@ -494,7 +494,8 @@ struct InkCudaRunner {
     float** d_sconv_pool_arr = nullptr;
     int32_t* d_acc_path = nullptr;
     __nv_bfloat16 *d_x_bf16 = nullptr;
-    __nv_bfloat16 *d_w_scratch = nullptr;  // [max_N, max_K] BF16 scratch for Q8_ROW / S_K cuBLAS prefill
+    __nv_bfloat16 *d_w_scratch = nullptr;  // [w_scratch_elems] BF16 scratch for Q8_ROW / S_K cuBLAS prefill
+    size_t         w_scratch_elems = (size_t)kInkDsparkInter * kInkHidden;
     // Pascal sm_61 Fixed-VRAM (24 MiB) Tiled FP32 Flash-cuBLAS Prefill Attention workspace (works up to 262K ctx!)
     float *d_pf32_q = nullptr, *d_pf32_k = nullptr, *d_pf32_v = nullptr;
     float *d_pf32_s = nullptr, *d_pf32_o = nullptr, *d_pf32_m = nullptr, *d_pf32_l = nullptr;
@@ -590,9 +591,10 @@ struct InkCudaRunner {
             tree_cap = (max_slots <= 4 && vfree > (700ull << 20)) ? kInkMaxTree
                      : ((vtot <= (10ull << 30) && m.n_host_experts > 0) ? 8 : 16);
             max_batch = std::max(max_batch, tree_cap);
-            // On tight 8 GiB GPUs with spilled experts, cap max_batch (64 for SQ-15, 256 for SQ-10) so all 12 Core layers fit in VRAM!
+            // On tight 8 GiB GPUs: SQ-15 (vfree < 450 MiB) caps max_batch to 128 while fitting 100% Core + 512 VRAM KV;
+            // SQ-10 (vfree >= 450 MiB) keeps full max_batch = 512 for peak prefill throughput!
             if (vtot <= (10ull << 30) && m.n_host_experts > 0) {
-                const int cap_b = (vfree < (450ull << 20)) ? 64 : 256;
+                const int cap_b = (vfree < (450ull << 20)) ? 128 : 512;
                 if (max_batch > cap_b) {
                     max_batch = cap_b;
                     swa_ring = (max_slots >= 16) ? (kInkSwaWin + 32) : (kInkSwaWin + max_batch);
@@ -608,7 +610,7 @@ struct InkCudaRunner {
             const size_t eff_extra    = (vfree < (450ull << 20)) ? std::min(extra_post_reserve, (size_t)(24ull << 20)) : extra_post_reserve;
             const size_t ws_reserve   = ((max_slots >= 8) ? (1400ull << 20)
                                        : ((vtot <= (10ull << 30) && m.n_host_experts > 0)
-                                           ? ((vfree < (450ull << 20)) ? (190ull << 20) : (396ull << 20))
+                                           ? ((vfree < (450ull << 20)) ? (206ull << 20) : (456ull << 20))
                                            : (480ull << 20)))
                                        + eff_extra;  // activation workspaces + DSpark + cuBLAS headroom
             int fit_ctx = 0;
@@ -683,14 +685,17 @@ struct InkCudaRunner {
         }
 
         const size_t MB = (size_t)max_batch;
+        const int n_blk_alloc = std::min(8, (m.man.c.n_phys + m.man.c.block_size - 1) / m.man.c.block_size + 1);
+        const int n_pre_alloc = std::min(2, std::max(1, (m.man.c.core_start + m.man.c.block_size - 1) / m.man.c.block_size));
+        const int n_bnk_alloc = std::min(4, std::max(1, n_blk_alloc - 1));
         d_cur       = dalloc<float>(MB * kInkHidden);
-        d_res       = dalloc<float>(MB * kInkHidden);
+        d_res       = nullptr;
         d_prelude   = dalloc<float>(MB * kInkHidden);
         d_bank_out  = dalloc<float>(MB * kInkHidden);
-        for (int i = 0; i < 8; ++i) d_blocks[i] = dalloc<float>(MB * kInkHidden);
-        for (int i = 0; i < 2; ++i) d_prelude_blocks[i] = dalloc<float>(MB * kInkHidden);
-        for (int i = 0; i < 4; ++i) d_bank[i] = dalloc<float>(MB * kInkHidden);
-        d_mixed     = dalloc<float>(4 * MB * kInkHidden);
+        for (int i = 0; i < n_blk_alloc; ++i) d_blocks[i] = dalloc<float>(MB * kInkHidden);
+        for (int i = 0; i < n_pre_alloc; ++i) d_prelude_blocks[i] = dalloc<float>(MB * kInkHidden);
+        for (int i = 0; i < n_bnk_alloc; ++i) d_bank[i] = dalloc<float>(MB * kInkHidden);
+        d_mixed     = dalloc<float>(3 * MB * kInkHidden);
         d_msgs      = dalloc<float>(4 * MB * kInkHidden);
         d_inp0      = dalloc<float>(MB * kInkHidden);
         d_inp1      = dalloc<float>(MB * kInkHidden);
@@ -707,20 +712,22 @@ struct InkCudaRunner {
         d_gate_attn = dalloc<float>(MB * kInkQDim);
         d_rel_table = dalloc<float>(MB * kInkHeads * (kInkRelExtent + 1));
         d_attn_out  = dalloc<float>(MB * kInkQDim);
-        d_wo_raw    = dalloc<float>(MB * kInkHidden);
-        d_wo_conv   = dalloc<float>(MB * kInkHidden);
+        d_wo_conv   = nullptr;
         d_moe_in    = dalloc<float>(MB * kInkHidden);
-        d_moe_raw   = dalloc<float>(MB * kInkHidden);
-        d_moe_conv  = dalloc<float>(MB * kInkHidden);
-        d_h_norm    = dalloc<float>(MB * kInkHidden);
+        d_moe_conv  = nullptr;
         for (int i = 0; i < 4; ++i) {
             d_taps[i]         = dalloc<float>(MB * kInkHidden);
             d_taps_compact[i] = dalloc<float>((size_t)tree_cap * kInkHidden);
         }
-        d_ctrl_cat    = dalloc<float>(3ull * MB * 2 * kInkHidden);
-        d_ctrl_gate   = dalloc<float>(3ull * MB * kInkGateRank);
+        const size_t ctrl_m = std::max<size_t>(3ull * 16, MB);
+        d_ctrl_cat    = dalloc<float>(ctrl_m * 2 * kInkHidden);
+        d_ctrl_gate   = dalloc<float>(ctrl_m * kInkGateRank);
         d_ctrl_gain   = dalloc<float>(MB * kInkHidden);
         d_ctrl_forget = dalloc<float>(MB * kInkHidden);
+        // Non-overlapping lifetime aliases (zero extra VRAM, freed via d_ctrl_gain / d_ctrl_forget only!)
+        d_wo_raw  = d_ctrl_gain;
+        d_moe_raw = d_ctrl_gain;
+        d_h_norm  = d_ctrl_forget;
         d_attn_pm     = dalloc<float>((size_t)tree_cap * kInkHeads * kInkAttnSplits);
         d_attn_pl     = dalloc<float>((size_t)tree_cap * kInkHeads * kInkAttnSplits);
         d_attn_po     = dalloc<float>((size_t)tree_cap * kInkHeads * kInkAttnSplits * kInkHeadDim);
@@ -733,8 +740,14 @@ struct InkCudaRunner {
         INK_CK(cudaMemcpy(d_sconv_pool_arr, d_sconv_pool, sizeof(d_sconv_pool), cudaMemcpyHostToDevice));
         d_acc_path    = dalloc<int32_t>(kInkMaxTree);
 
-        d_x_bf16    = dalloc<__nv_bfloat16>(MB * std::max(kInkDsparkInter, std::max(kInkQDim, kInkHidden)));
-        d_w_scratch = dalloc<__nv_bfloat16>((size_t)kInkDsparkInter * kInkHidden);
+        const size_t x_bf16_elems = (m.sm_cc < 70)
+            ? std::max<size_t>(64 * 64, (MB * kInkQDim + 1) / 2)
+            : (MB * std::max(kInkDsparkInter, std::max(kInkQDim, kInkHidden)));
+        d_x_bf16    = dalloc<__nv_bfloat16>(x_bf16_elems);
+        w_scratch_elems = (m.sm_cc < 70 && m.n_host_experts > 0)
+            ? (4ull << 20)
+            : ((size_t)kInkDsparkInter * kInkHidden);
+        d_w_scratch = dalloc<__nv_bfloat16>(w_scratch_elems);
 
         // Warmup cuBLAS Tensor Cores once at init (eliminates 61 ms first-call JIT tax from prompt #1!)
         {
@@ -781,7 +794,11 @@ struct InkCudaRunner {
         meta_ring_idx = 0;
         h_meta_pin  = halloc_pinned<int32_t>(64ull * meta_ring_stride);
 
-        moe_ws.alloc(max_batch);
+        bool any_sf4_mx8 = false;
+        for (int il = 0; il < m.man.c.n_phys; ++il) {
+            if (m.moe_info[il].has_sf4 || m.moe_info[il].has_mx8) { any_sf4_mx8 = true; break; }
+        }
+        moe_ws.alloc(max_batch, any_sf4_mx8);
         // Pre-allocate Tensor Core prefill attention workspace outside timed prefill loop when VRAM allows (~140 MB)!
         if (m.sm_cc >= 60 && max_slots <= 4 && max_batch >= 128) {
             size_t vf = 0, vt = 0;
@@ -943,7 +960,7 @@ struct InkCudaRunner {
         } else {
             // Pascal (sm_60 / sm_61): exact IEEE FP32 cuBLAS SGEMM (full 11 TFLOPS on GTX 1080 Ti!)
             // Non-overlapping staging inside d_w_scratch: float[0..cap/3) vs bf16[2*(cap/3)..cap)
-            const size_t cap = (size_t)kInkDsparkInter * kInkHidden;
+            const size_t cap = w_scratch_elems;
             const size_t max_elems = cap / 3;
             float* w_f32 = reinterpret_cast<float*>(d_w_scratch);
             if (w_is_scratch) {
@@ -1088,7 +1105,7 @@ struct InkCudaRunner {
             // Hardware INT8 GEMM (45 TOPS dp4a on GTX 1080 Ti sm_61!)
             if (M > 16 && m.sm_cc == 61 && (K % 4 == 0) && (N % 4 == 0) && N_override == 0) {
                 int8_t* x_i8 = reinterpret_cast<int8_t*>(d_x_bf16);
-                float*  x_sc = d_ctrl_gain;  // [max_batch * 2304] -> plenty of room for M floats!
+                float*  x_sc = d_ctrl_cat;  // [max_batch * 4608] -> never aliases Y (d_wo_raw/d_moe_raw/d_h_norm)!
                 if (!reuse_x_bf16) {
                     k_ink_quant_x_row_i8<<<M, 256, 0, st>>>(X, x_i8, x_sc, M, K);
                 }
@@ -1108,7 +1125,7 @@ struct InkCudaRunner {
                     reinterpret_cast<int32_t*>(Y), Y, w_sc, x_sc, M, N);
                 return;
             }
-            const size_t cap = (size_t)kInkDsparkInter * kInkHidden;
+            const size_t cap = w_scratch_elems;
             const size_t max_tile = (m.sm_cc < 70) ? (cap / 3) : cap;
             if (M <= 16 || (size_t)N * K > max_tile) {
                 InkMultiProj mp{};
@@ -1167,7 +1184,7 @@ struct InkCudaRunner {
                 return;
             }
             // M > 16 on Pascal sm_60/61: dequant S_K directly to FP32 (skips BF16 write+read round-trip!)
-            const size_t cap = (size_t)kInkDsparkInter * kInkHidden;
+            const size_t cap = w_scratch_elems;
             const size_t row_b = (size_t)(K / 256) * ink_sb_bytes(ti.fmt);
             if (m.sm_cc < 70) {
                 const size_t max_tile = cap / 2;
@@ -1964,8 +1981,8 @@ struct InkCudaRunner {
         fr(d_mixed); fr(d_msgs); fr(d_inp0); fr(d_inp1); fr(d_inp2);
         fr(d_q); fr(d_k_raw); fr(d_v_raw); fr(d_k); fr(d_v); fr(d_r);
         fr(d_k_dyn); fr(d_v_dyn); fr(d_sinks); fr(d_gate_attn); fr(d_rel_table);
-        fr(d_attn_out); fr(d_wo_raw); fr(d_wo_conv); fr(d_moe_in); fr(d_moe_raw); fr(d_moe_conv);
-        fr(d_h_norm);
+        fr(d_attn_out); d_wo_raw = nullptr; fr(d_wo_conv); fr(d_moe_in); d_moe_raw = nullptr; fr(d_moe_conv);
+        d_h_norm = nullptr;
         for (int i = 0; i < 4; ++i) { fr(d_taps[i]); fr(d_taps_compact[i]); }
         fr(d_ctrl_cat); fr(d_ctrl_gate); fr(d_ctrl_gain); fr(d_ctrl_forget);
         fr(d_attn_pm); fr(d_attn_pl); fr(d_attn_po);
