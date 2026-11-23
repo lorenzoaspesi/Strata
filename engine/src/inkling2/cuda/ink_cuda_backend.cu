@@ -121,7 +121,9 @@ public:
         if (opts.kv_dtype_auto && (max_slots_ >= 16 || prop.totalGlobalMem <= (13ull << 30)) && prop.totalGlobalMem < (40ull << 30)) {
             kv_dtype_ = KvDtype::FP8_E4M3;
         }
-        const int eff_chunk = std::max(64, opts.chunk);
+        const int eff_chunk = (prop.totalGlobalMem <= (10ull << 30))
+                            ? std::min(256, std::max(64, opts.chunk))
+                            : std::max(64, opts.chunk);
         const size_t swa_r = (max_slots_ >= 16) ? (size_t)(strata::ink::kInkSwaWin + 32)
                                                 : (size_t)(strata::ink::kInkSwaWin + std::max(eff_chunk, 64));
         const size_t bpe = (kv_dtype_ == KvDtype::FP8_E4M3) ? 2ull : 4ull;
@@ -131,6 +133,7 @@ public:
                                   + (size_t)8 * max_slots_ * 256 * ((size_t)strata::ink::kInkKVDim * bpe + sc_per_pos);
         const size_t ws_pad = (max_slots_ >= 8) ? (1536ull << 20)
                             : ((prop.totalGlobalMem >= (20ull << 30)) ? (1200ull << 20)
+                             : (prop.totalGlobalMem <= (10ull << 30)) ? (380ull << 20)
                              : (prop.totalGlobalMem <= (13ull << 30)) ? (260ull << 20)
                                                                       : (320ull << 20));
         const size_t min_reserve_bytes = min_kv_bytes + ws_pad;
@@ -144,8 +147,10 @@ public:
 
         runner_ = std::make_unique<strata::ink::InkCudaRunner>(model_);
         runner_->use_cuda_graph = true;
-        const size_t dspark_post_reserve = (opts.enable_dspark && model_.man.has_dspark) ? (256ull << 20) : 0ull;
-        runner_->init(max_slots_, std::max(256, opts.max_ctx), std::max(64, opts.chunk), cuda_kvd, dspark_post_reserve, opts.kv_resident);
+        const size_t dspark_post_reserve = (opts.enable_dspark && model_.man.has_dspark)
+                                         ? ((prop.totalGlobalMem <= (10ull << 30)) ? (64ull << 20) : (256ull << 20))
+                                         : 0ull;
+        runner_->init(max_slots_, std::max(256, opts.max_ctx), eff_chunk, cuda_kvd, dspark_post_reserve, opts.kv_resident);
         eff_max_ctx_ = runner_->max_ctx;
 
         if (opts.enable_dspark && model_.man.has_dspark) {

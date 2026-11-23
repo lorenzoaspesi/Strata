@@ -1666,7 +1666,7 @@ struct InkDSpark {
         const int B = kInkDsparkBlock;  // 8
         const auto& ei = m.tinfo("model.llm.embed.weight");
         k_ink_embed_norm<<<1, 256, 0, r.st>>>(
-            m.d_trunk + ei.off, ei.fmt,
+            m.embed_ptr(), ei.fmt,
             (const float*)m.trunk_ptr("model.llm.embed_norm.weight"),
             d_anchor_id, nullptr, nullptr, d_cur, 1, kInkHidden);
         const float* mask_e = (const float*)m.trunk_ptr("dspark.mask_embed");
@@ -1768,7 +1768,7 @@ struct InkDSpark {
             const float* hs = d_cur + (size_t)(s + 1) * kInkHidden;
             k_dspark_markov_prep<<<1, 256, 0, r.st>>>(
                 prev_ptr, d_rnn_state, hs, d_f_rnn, d_apos,
-                m.d_trunk + ti_mw1.off, ti_mw1.fmt, d_rnn_joint);
+                m.mw1_ptr(), ti_mw1.fmt, d_rnn_joint);
             dspark_linear_b8("dspark.markov_head.rnn_proj.weight", d_rnn_joint, d_rnn_proj, 1);
             k_dspark_markov_gru_upd<<<1, 256, 0, r.st>>>(
                 d_rnn_proj, (const float*)(m.d_trunk + ti_rpb.off), d_rnn_state, d_rnn_lat);
@@ -1819,7 +1819,7 @@ struct InkDSpark {
             const float* hs = d_cur + (size_t)(s + 1) * kInkHidden;
             k_dspark_markov_prep_batch<<<nw, 256, 0, r.st>>>(
                 d_beam_prev_tok, d_beam_state, hs, d_f_rnn, d_apos,
-                m.d_trunk + ti_mw1.off, ti_mw1.fmt, d_rnn_joint_b, nw);
+                m.mw1_ptr(), ti_mw1.fmt, d_rnn_joint_b, nw);
             dspark_linear_b8("dspark.markov_head.rnn_proj.weight", d_rnn_joint_b, d_rnn_proj_b, nw);
             k_dspark_markov_gru_upd_batch<<<nw, 256, 0, r.st>>>(
                 d_rnn_proj_b, (const float*)(m.d_trunk + ti_rpb.off),

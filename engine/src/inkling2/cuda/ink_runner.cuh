@@ -70,6 +70,10 @@ struct InkCudaModel {
     bool trunk_attn_fp16 = false;  // true on sm_70/75: .attn.* BF16 weights converted in-place to FP16 at load!
 
     uint8_t* d_trunk = nullptr;
+    uint8_t* h_embed_pinned = nullptr;  // optional host-mapped embed.weight on tight 8 GiB GPUs (+442 MiB VRAM!)
+    uint8_t* d_embed_ptr    = nullptr;
+    uint8_t* h_mw1_pinned   = nullptr;  // optional host-mapped dspark markov_w1 on tight 8 GiB GPUs (+50 MiB VRAM!)
+    uint8_t* d_mw1_ptr      = nullptr;
     uint8_t* d_sec4  = nullptr;
     uint8_t* h_sec4_pinned = nullptr;  // optional pinned overflow for 8/12/16 GB GPUs
     size_t trunk_bytes = 0, sec4_bytes = 0;
@@ -94,6 +98,12 @@ struct InkCudaModel {
     const uint8_t* trunk_ptr(const std::string& name) const {
         return d_trunk + man.get(name).off;
     }
+    const uint8_t* embed_ptr() const {
+        return d_embed_ptr ? d_embed_ptr : trunk_ptr("model.llm.embed.weight");
+    }
+    const uint8_t* mw1_ptr() const {
+        return d_mw1_ptr ? d_mw1_ptr : trunk_ptr("dspark.markov_head.markov_w1.weight");
+    }
     const TensorInfo& tinfo(const std::string& name) const {
         return man.get(name);
     }
@@ -102,11 +112,13 @@ struct InkCudaModel {
         path = strata_path;
         primary_gpu = gpu_id;
         INK_CK(cudaSetDevice(primary_gpu));
+        size_t vtot_init = 0, vfree_init = 0;
         {
             cudaDeviceProp prop{};
             INK_CK(cudaGetDeviceProperties(&prop, primary_gpu));
             sm_cc = prop.major * 10 + prop.minor;
         }
+        INK_CK(ink_cuda_mem_info(&vfree_init, &vtot_init));
         if (!rd.open(strata_path, err)) return false;
         parse_ink_manifest(rd.manifest_json(), man, true);
 
@@ -115,9 +127,62 @@ struct InkCudaModel {
         sec4_bytes  = (size_t)hdr.sections[4].byte_length;
 
         double t0 = now_s();
-        // 1. Load Section 1 (Contiguous GPU Trunk + DSpark) in one DMA transfer
-        INK_CK(cudaMalloc(&d_trunk, trunk_bytes));
-        {
+        // 1. Load Section 1 (GPU Trunk + DSpark). On tight 8 GiB GPUs where experts spill, offload lookup-only
+        //    embedding tables (model.llm.embed.weight ~442 MiB + dspark.markov_head.markov_w1.weight ~50 MiB)
+        //    to mapped pinned host RAM (only 1 row = 2.3 KB read per token -> ~0.2 us over PCIe!) to reclaim ~492 MiB VRAM!
+        const bool offload_emb = (vtot_init <= (10ull << 30)) && (vfree_init < trunk_bytes + sec4_bytes + (1024ull << 20));
+        if (offload_emb && man.trunk.count("model.llm.embed.weight")) {
+            struct TEntry { std::string name; uint64_t orig_off; uint64_t bytes; bool is_dspark; };
+            std::vector<TEntry> vram_list;
+            vram_list.reserve(man.trunk.size() + man.dspark.size());
+            size_t compact_bytes = 0;
+            for (const auto& kv : man.trunk) {
+                if (kv.first == "model.llm.embed.weight") continue;
+                vram_list.push_back({kv.first, kv.second.off, kv.second.bytes, false});
+            }
+            for (const auto& kv : man.dspark) {
+                if (kv.first == "dspark.markov_head.markov_w1.weight") continue;
+                vram_list.push_back({kv.first, kv.second.off, kv.second.bytes, true});
+            }
+            std::sort(vram_list.begin(), vram_list.end(), [](const TEntry& a, const TEntry& b) { return a.orig_off < b.orig_off; });
+            std::vector<uint64_t> new_offs(vram_list.size());
+            for (size_t i = 0; i < vram_list.size(); ++i) {
+                compact_bytes = (compact_bytes + 255ull) & ~255ull;
+                new_offs[i] = compact_bytes;
+                if (vram_list[i].is_dspark) man.dspark[vram_list[i].name].off = compact_bytes;
+                else                        man.trunk[vram_list[i].name].off  = compact_bytes;
+                compact_bytes += vram_list[i].bytes;
+            }
+            compact_bytes = (compact_bytes + 255ull) & ~255ull;
+
+            INK_CK(cudaMalloc(&d_trunk, std::max<size_t>(256, compact_bytes)));
+            const size_t CH = 64ull << 20;
+            uint8_t* hbuf = halloc_pinned<uint8_t>(CH);
+            for (size_t i = 0; i < vram_list.size(); ++i) {
+                size_t done = 0;
+                const uint64_t fbase = hdr.sections[1].file_offset + vram_list[i].orig_off;
+                while (done < vram_list[i].bytes) {
+                    const size_t want = std::min<size_t>(CH, vram_list[i].bytes - done);
+                    if (!rd.read_at(fbase + done, hbuf, want, err)) { cudaFreeHost(hbuf); return false; }
+                    INK_CK(cudaMemcpy(d_trunk + new_offs[i] + done, hbuf, want, cudaMemcpyHostToDevice));
+                    done += want;
+                }
+            }
+            INK_CK(cudaFreeHost(hbuf));
+
+            auto load_mapped = [&](std::unordered_map<std::string, TensorInfo>& tbl, const std::string& tname, uint8_t*& h_ptr, uint8_t*& d_ptr) -> bool {
+                auto it = tbl.find(tname);
+                if (it == tbl.end()) return true;
+                INK_CK(cudaHostAlloc(&h_ptr, it->second.bytes, cudaHostAllocMapped));
+                if (!rd.read_at(hdr.sections[1].file_offset + it->second.off, h_ptr, it->second.bytes, err)) return false;
+                INK_CK(cudaHostGetDevicePointer(&d_ptr, h_ptr, 0));
+                return true;
+            };
+            if (!load_mapped(man.trunk,  "model.llm.embed.weight", h_embed_pinned, d_embed_ptr)) return false;
+            if (!load_mapped(man.dspark, "dspark.markov_head.markov_w1.weight", h_mw1_pinned, d_mw1_ptr)) return false;
+            trunk_bytes = compact_bytes;
+        } else {
+            INK_CK(cudaMalloc(&d_trunk, trunk_bytes));
             const size_t CH = 64ull << 20;
             uint8_t* hbuf = halloc_pinned<uint8_t>(std::min(CH, trunk_bytes));
             size_t done = 0;
@@ -174,10 +239,13 @@ struct InkCudaModel {
         double t1 = now_s();
         // Tight on-demand VRAM reserve: lets SQ-10 fit 100% in 12 GB RTX 5070 (even under Win11 WDDM!) and SQ-15 in 16 GB RTX 5070 Ti,
         // while keeping full headroom for FP8 KV + workspaces + DSpark + CUDA Graph (spilling cleanly to Hybrid on 11 GB GPUs)!
+        const bool ultra_tight_8g = (vtot <= (10ull << 30)) && (sec4_bytes > (9ull << 30));
         const size_t base_reserve = (vtot >= (20ull << 30)) ? (1600ull << 20)
+                                  : ultra_tight_8g          ? (328ull << 20)
+                                  : (vtot <= (10ull << 30)) ? (560ull << 20)
                                   : (vtot <= (13ull << 30)) ? (780ull << 20)
                                                             : (1280ull << 20);
-        const size_t reserve = std::max(base_reserve, extra_reserve_bytes);
+        const size_t reserve = ultra_tight_8g ? base_reserve : std::max(base_reserve, extra_reserve_bytes);
         for (int il = 0; il < 24; ++il) layer_has_host[il] = false;
         if (vfree > sec4_bytes + reserve) {
             // 100% VRAM resident! Single sequential streaming DMA!
@@ -207,9 +275,11 @@ struct InkCudaModel {
                 order.resize(n_total);
                 for (int i = 0; i < n_total; ++i) order[i] = (uint16_t)i;
             }
-            // Reserve exact headroom for runner+KV+DSpark fixed buffers (host-mapped DSpark/KV overflow saves ~1 GiB on 8 GB cards!)
-            const size_t hyb_post_res = std::max(reserve, (size_t)(vtot <= (10ull << 30) ? (960ull << 20) : (1664ull << 20)));
-            const size_t hyb_reserve = hyb_post_res + (vtot <= (10ull << 30) ? (192ull << 20) : (256ull << 20));
+            // Reserve exact headroom for runner+KV+DSpark fixed buffers (host-mapped DSpark/KV/embed saves ~1.5 GiB on 8 GB cards!)
+            const size_t hyb_post_res = ultra_tight_8g
+                ? (328ull << 20)
+                : std::max(reserve, (size_t)(vtot <= (10ull << 30) ? (560ull << 20) : (1664ull << 20)));
+            const size_t hyb_reserve = hyb_post_res + (ultra_tight_8g ? (36ull << 20) : (vtot <= (10ull << 30) ? (80ull << 20) : (256ull << 20)));
             const size_t vram_budget = (vfree > hyb_reserve) ? (vfree - hyb_reserve) : 0;
             size_t vram_used = 0, host_used = 0, max_exp_bytes = 0;
             std::vector<uint8_t> in_vram(n_total, 0);
@@ -362,6 +432,8 @@ struct InkCudaModel {
         }
         if (d_sec4) { cudaFree(d_sec4); d_sec4 = nullptr; }
         if (h_sec4_pinned) { cudaFreeHost(h_sec4_pinned); h_sec4_pinned = nullptr; }
+        if (h_embed_pinned) { cudaFreeHost(h_embed_pinned); h_embed_pinned = nullptr; d_embed_ptr = nullptr; }
+        if (h_mw1_pinned)   { cudaFreeHost(h_mw1_pinned);   h_mw1_pinned = nullptr;   d_mw1_ptr = nullptr; }
         if (d_trunk) { cudaFree(d_trunk); d_trunk = nullptr; }
     }
 };
@@ -515,10 +587,17 @@ struct InkCudaRunner {
         {
             size_t vfree = 0, vtot = 0;
             INK_CK(ink_cuda_mem_info(&vfree, &vtot));
-            tree_cap = (max_slots <= 4 && vfree > (700ull << 20)) ? kInkMaxTree : 16;
+            tree_cap = (max_slots <= 4 && vfree > (700ull << 20)) ? kInkMaxTree
+                     : ((vtot <= (10ull << 30) && m.n_host_experts > 0) ? 8 : 16);
             max_batch = std::max(max_batch, tree_cap);
-            // On tight 12 GB GPUs (especially Win11 WDDM), cap max_batch to 512 so workspaces never trigger host paging!
-            if (vfree < (2200ull << 20) && max_batch > 512) {
+            // On tight 8 GiB GPUs with spilled experts, cap max_batch (64 for SQ-15, 256 for SQ-10) so all 12 Core layers fit in VRAM!
+            if (vtot <= (10ull << 30) && m.n_host_experts > 0) {
+                const int cap_b = (vfree < (450ull << 20)) ? 64 : 256;
+                if (max_batch > cap_b) {
+                    max_batch = cap_b;
+                    swa_ring = (max_slots >= 16) ? (kInkSwaWin + 32) : (kInkSwaWin + max_batch);
+                }
+            } else if (vfree < (2200ull << 20) && max_batch > 512) {
                 max_batch = 512;
                 swa_ring = (max_slots >= 16) ? (kInkSwaWin + 32) : (kInkSwaWin + max_batch);
             }
@@ -526,7 +605,12 @@ struct InkCudaRunner {
             const size_t sc_per_pos = (kv_dtype == InkKvDtype::FP8) ? (size_t)(2 * kInkKVHeads * 4) : 0;
             const size_t swa_kv_bytes = (size_t)40 * max_slots * swa_ring * ((size_t)kInkKVDim * bpe + sc_per_pos);
             const size_t sconv_bytes  = (size_t)kInkVisits * max_slots * 3 * kInkSconvCh * 4;
-            const size_t ws_reserve   = ((max_slots >= 8) ? (1400ull << 20) : (480ull << 20)) + extra_post_reserve;  // activation workspaces + DSpark + cuBLAS headroom
+            const size_t eff_extra    = (vfree < (450ull << 20)) ? std::min(extra_post_reserve, (size_t)(24ull << 20)) : extra_post_reserve;
+            const size_t ws_reserve   = ((max_slots >= 8) ? (1400ull << 20)
+                                       : ((vtot <= (10ull << 30) && m.n_host_experts > 0)
+                                           ? ((vfree < (450ull << 20)) ? (190ull << 20) : (396ull << 20))
+                                           : (480ull << 20)))
+                                       + eff_extra;  // activation workspaces + DSpark + cuBLAS headroom
             int fit_ctx = 0;
             if (vfree > swa_kv_bytes + sconv_bytes + ws_reserve) {
                 const size_t avail_glob = vfree - swa_kv_bytes - sconv_bytes - ws_reserve;
@@ -675,7 +759,10 @@ struct InkCudaRunner {
             INK_CK(cudaStreamSynchronize(st));
         }
 
-        d_dot_hat   = dalloc<float>(8ull * kInkVocabUnpad);
+        const size_t dot_hat_elems = m.unembed_screen.ready
+            ? (8ull * kInkVocabUnpad)
+            : ((size_t)std::max(16, tree_cap) * 2ull * ((kInkVocabUnpad + 31) / 32));
+        d_dot_hat   = dalloc<float>(dot_hat_elems);
         d_h_norm2   = dalloc<float>(8);
         d_max_lb    = dalloc<int>(8);
         d_cand_ids  = dalloc<int32_t>(8ull * 4096);
@@ -1529,7 +1616,7 @@ struct InkCudaRunner {
         const size_t n_hid = (size_t)M * kInkHidden;
         const auto& ei = m.tinfo("model.llm.embed.weight");
         k_ink_embed_norm<<<M, 256, 0, st>>>(
-            m.d_trunk + ei.off, ei.fmt,
+            m.embed_ptr(), ei.fmt,
             (const float*)m.trunk_ptr("model.llm.embed_norm.weight"),
             d_tok_ids, has_img_step ? d_is_img : nullptr, has_img_step ? d_img_emb : nullptr, d_cur, M, kInkHidden);
 

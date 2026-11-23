@@ -950,16 +950,19 @@ struct InkHybridEngine {
         if (!active) return;
         const size_t align_b = (max_exp_bytes + 255ull) & ~255ull;
         promo_slot_bytes = align_b;
-        // On tight 8-12 GB cards (vram_avail <= 256 MiB), use 2 x 16 MiB ping-pong buffers (5-6 experts/chunk,
-        // still saturates PCIe 3.0 x16!) so ~120+ MiB stays free for the dynamic hot-expert promotion ring!
-        if (vram_avail > (48ull << 20)) {
-            const size_t cap_each = (vram_avail <= (256ull << 20)) ? (16ull << 20) : (64ull << 20);
-            const size_t max_each = (vram_avail - (16ull << 20)) / 2;
-            pf_stage_bytes = std::min<size_t>(cap_each, std::min(max_each, std::max<size_t>(6 * align_b, 16ull << 20)));
+        // On tight 8-12 GB cards (vram_avail <= 256 MiB), use 2 x 8..16 MiB ping-pong buffers (still saturates PCIe 3.0 x16!)
+        // so spare VRAM stays free for the dynamic hot-expert promotion ring or 100% Core residency!
+        if (vram_avail >= 2 * align_b) {
+            const size_t cap_each = (vram_avail <= (48ull << 20))  ? (8ull << 20)
+                                  : (vram_avail <= (256ull << 20)) ? (16ull << 20)
+                                                                   : (64ull << 20);
+            const size_t pad = (vram_avail <= (48ull << 20)) ? 0ull : (16ull << 20);
+            const size_t max_each = (vram_avail - pad) / 2;
+            pf_stage_bytes = std::min<size_t>(cap_each, max_each);
             pf_stage_bytes = std::max(pf_stage_bytes, align_b);
             INK_CK(cudaMalloc(&d_pf_stage[0], pf_stage_bytes));
             INK_CK(cudaMalloc(&d_pf_stage[1], pf_stage_bytes));
-            vram_avail -= 2 * pf_stage_bytes;
+            vram_avail = (vram_avail > 2 * pf_stage_bytes) ? (vram_avail - 2 * pf_stage_bytes) : 0;
         }
         // Remaining spare VRAM (> 32 MiB headroom) becomes dynamic decayed-frequency promotion ring!
         if (vram_avail > (48ull << 20) && align_b > 0) {

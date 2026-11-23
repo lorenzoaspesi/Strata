@@ -632,6 +632,20 @@ __device__ __forceinline__ float dot16_h2_2acc(const __half2 (&w)[8], const __ha
     const uint4 v1 = *reinterpret_cast<const uint4*>(xh2 + 4);
     const __half2* x0 = reinterpret_cast<const __half2*>(&v0);
     const __half2* x1 = reinterpret_cast<const __half2*>(&v1);
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 610)
+    // Pascal sm_61 (GTX 1070/1080/1080 Ti) has 1/64th FP16 throughput (0.1 TFLOPS) vs full-rate FP32 (6.5+ TFLOPS)!
+    float a0 = 0.0f, a1 = 0.0f;
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        const float2 fw0 = __half22float2(w[i]);
+        const float2 fx0 = __half22float2(x0[i]);
+        const float2 fw1 = __half22float2(w[i + 4]);
+        const float2 fx1 = __half22float2(x1[i]);
+        a0 = fmaf(fw0.x, fx0.x, a0); a1 = fmaf(fw0.y, fx0.y, a1);
+        a0 = fmaf(fw1.x, fx1.x, a0); a1 = fmaf(fw1.y, fx1.y, a1);
+    }
+    return a0 + a1;
+#else
     __half2 a0 = __hmul2(w[0], x0[0]);
     __half2 a1 = __hmul2(w[1], x0[1]);
     a0 = __hfma2(w[2], x0[2], a0);
@@ -642,6 +656,7 @@ __device__ __forceinline__ float dot16_h2_2acc(const __half2 (&w)[8], const __ha
     a1 = __hfma2(w[7], x1[3], a1);
     const float2 f = __half22float2(__hadd2(a0, a1));
     return f.x + f.y;
+#endif
 }
 
 // ---- Ultra-Lean 128B-Coalesced uint4 High-Occupancy SF4/MX8 Gate+Up+SITU Kernel ----
