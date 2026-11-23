@@ -1,5 +1,6 @@
 // src/prefill/gemm.cu - see include/strata/prefill/gemm.hpp.
 #include "strata/prefill/gemm.hpp"
+#include "strata/kernels/dense_i8_tc.hpp"
 #include "strata/kernels/dequant_bf16.hpp"
 #include "strata/core/arch_defaults.hpp"   // prompt_f16_resolve (inline)
 #include "strata/core/emulate.hpp"
@@ -1540,6 +1541,14 @@ void Gemm::native(const uint16_t* X, int ggml_type, const void* W_blocks, float*
     if (ggml_type == 40 && (ldx == 0 || ldx == K) &&
         strata::prefill::dense_fp4_tc::gemm_f16_nvfp4(X, W_blocks, Y, T, N, K, ldy, beta, stream_)) {
         return;
+    }
+    if ((ggml_type == 8 || ggml_type == 12 || ggml_type == 13 || ggml_type == 14) && (ldx == 0 || ldx == K) && T >= 64 && scratch_ != nullptr) {
+        if (side_scratch_) (void) cudaStreamWaitEvent((cudaStream_t) stream_, (cudaEvent_t) side_ready_[0], 0);
+        if (strata::kernels::dense_dp4a_prefill(X, ggml_type, W_blocks, Y, T, N, K, ldy, beta,
+                                                scratch_, (size_t) scratch_elems_ * sizeof(uint16_t), stream_)) {
+            if (side_scratch_) (void) cudaEventRecord((cudaEvent_t) side_free_[0], (cudaStream_t) stream_);
+            return;
+        }
     }
 #endif
 #if !defined(__HIPCC__) && defined(STRATA_CUBLASLT_MXFP8)

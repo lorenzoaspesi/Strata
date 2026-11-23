@@ -713,17 +713,19 @@ __device__ __forceinline__ void tq_step(uint32_t s, float2& a, float2& b) {
 // Compute capability 6.0 (Tesla P100): the block's words are read with ld.global.nc (the weights are read-only; a generic
 // pointer made these LD.E), and TQK6's lane window needs only three words (34 bits from a bit offset of 0 or 8), TQK7's
 // four.  The same bits either way.
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 610
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ <= 610
 #define STRATA_TQ_LD16(p) ((uint32_t) __ldg((const unsigned short*) (p)))
+#define STRATA_TQ_LD8(p) ((uint32_t) __ldg((const unsigned char*) (p)))
 #else
 #define STRATA_TQ_LD16(p) ((uint32_t) *(p))
+#define STRATA_TQ_LD8(p) ((uint32_t) *(p))
 #endif
 template<int TY>
 __device__ __forceinline__ void tq_states4(const uint8_t* qs, int l, uint32_t s[4]) {
     const uint16_t* qs16 = (const uint16_t*) qs;
     if constexpr (TY == 144) {   // s_t = qs[(t + 31) % 32] << 8 | qs[t]
         const uint32_t w01 = STRATA_TQ_LD16(qs16 + 2 * l + 0), w23 = STRATA_TQ_LD16(qs16 + 2 * l + 1);
-        const uint32_t prev = qs[(4 * l + 31) & 31];
+        const uint32_t prev = STRATA_TQ_LD8(qs + ((4 * l + 31) & 31));
         const uint32_t b0 = w01 & 0xFF, b1 = w01 >> 8, b2 = w23 & 0xFF, b3 = w23 >> 8;
         s[0] = (prev << 8) | b0;
         s[1] = (b0 << 8) | b1;

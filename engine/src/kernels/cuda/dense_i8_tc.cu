@@ -1680,6 +1680,253 @@ __global__ void __launch_bounds__(256) dense_i8_tc_prefill_kernel(
 #endif
 }
 
+// ---- Pascal sm_61 dp4a Dense Prefill GEMM (Q8_0=8, Q4_K=12, Q5_K=13): 64x64 tile, BK=64, 12 KB SMEM (4 CTAs/SM) ----
+// Uses FP32 scale + FP32 sum per 32-element activation block (40 B) so small activations (e.g. post-GDN/gate) never
+// underflow FP16 d = amax / 127 and large sums never overflow FP16.
+struct Q81F32Block {
+    float d;
+    float sum;
+    int8_t qs[32];
+};
+static_assert(sizeof(Q81F32Block) == 40);
+
+__global__ void quantize_f16_to_q8_1_f32_kernel(const uint16_t* __restrict__ x_f16, Q81F32Block* __restrict__ out,
+                                                int64_t total_blocks) {
+    const int lane = threadIdx.x & 31;
+    const int64_t warps_per_blk = (int64_t) (blockDim.x >> 5);
+    const int64_t stride = (int64_t) gridDim.x * warps_per_blk;
+    for (int64_t b = (int64_t) blockIdx.x * warps_per_blk + (threadIdx.x >> 5); b < total_blocks; b += stride) {
+        const float rv = __half2float(__ushort_as_half(x_f16[b * 32 + lane]));
+        const float v = isfinite(rv) ? rv : 0.0f;
+        float amax = fabsf(v);
+        float sum = v;
+#pragma unroll
+        for (int o = 16; o > 0; o >>= 1) {
+            amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));
+            sum += __shfl_xor_sync(0xffffffffu, sum, o);
+        }
+        const float d_inv = (amax > 0.0f && isfinite(amax)) ? (127.0f / amax) : 0.0f;
+        const float d = (d_inv > 0.0f) ? (1.0f / d_inv) : 0.0f;
+        const int q = (d_inv > 0.0f) ? __float2int_rn(v * d_inv) : 0;
+        const int qc = max(-127, min(127, q));
+        out[b].qs[lane] = (int8_t) qc;
+        if (lane == 0) {
+            out[b].d = d;
+            out[b].sum = isfinite(sum) ? sum : 0.0f;
+        }
+    }
+}
+
+// ---- Pascal sm_61 dp4a Dense Prefill GEMM (Q8_0=8, Q4_K=12, Q5_K=13, Q6_K=14): 128 rows x 64 tokens, BK=64, 18 KB SMEM (2 CTAs/SM) ----
+// Each thread computes an 8x4 output tile (8 weight rows x 4 tokens = 32 accumulators), cutting global X traffic and LDS
+// reads per dp4a in half relative to 64x64.
+template <int GTYPE>
+__global__ void __launch_bounds__(256, 2) dense_dp4a_prefill_kernel(
+    const uint8_t* __restrict__ W, const Q81F32Block* __restrict__ Xq, float* __restrict__ Y,
+    int64_t T, int64_t N, int64_t K, int64_t ldy, float beta) {
+#if !defined(__HIPCC__) && (!defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 610)
+    constexpr bool kHasMin = (GTYPE == kTypeQ4_K || GTYPE == kTypeQ5_K);
+    constexpr bool kTwoScale = (GTYPE == kTypeQ6_K);
+    const int tid = threadIdx.x;
+    const int tx = tid & 15;
+    const int ty = tid >> 4;
+    const int64_t t0 = (int64_t) blockIdx.x * 64;
+    const int64_t n0 = (int64_t) blockIdx.y * 128;
+    const int64_t nb_k = K >> 5;           // K / 32 sub-blocks per row
+    const size_t w_row_bytes = (GTYPE == kTypeQ8_0) ? ((size_t) nb_k * 34u)
+                             : (GTYPE == kTypeQ4_K) ? ((size_t) (K >> 8) * 144u)
+                             : (GTYPE == kTypeQ5_K) ? ((size_t) (K >> 8) * 176u)
+                                                    : ((size_t) (K >> 8) * 210u);
+
+    // Stride 20 ints (80 B) gives 16-byte alignment for int4 LDS.128 and zero bank conflicts across tx=0..15.
+    __shared__ alignas(16) int s_W[128][20];
+    __shared__ alignas(16) int s_X[64][20];
+    __shared__ float s_Wd[128][2];
+    __shared__ float s_Wm[128][2];
+    __shared__ float s_Xd[64][2];
+    __shared__ float s_Xs[64][2];
+
+    float acc[8][4];
+#pragma unroll
+    for (int ir = 0; ir < 8; ++ir)
+#pragma unroll
+        for (int it = 0; it < 4; ++it) acc[ir][it] = 0.0f;
+
+    // Cooperative load indices: 256 threads load 64x2 X sub-blocks (2 threads/block) and 128x2 W sub-blocks (2 passes of 64x2).
+    const int blk_idx = tid >> 1;      // 0..127
+    const int half = tid & 1;          // 0 or 1
+    const int loc_r = blk_idx >> 1;    // 0..63
+    const int loc_b = blk_idx & 1;     // 0 or 1
+    const int64_t gr0 = n0 + loc_r;
+    const int64_t gr1 = n0 + 64 + loc_r;
+    const int64_t gt = t0 + loc_r;
+    const uint8_t* w_row0 = (gr0 < N) ? (W + (size_t) gr0 * w_row_bytes) : nullptr;
+    const uint8_t* w_row1 = (gr1 < N) ? (W + (size_t) gr1 * w_row_bytes) : nullptr;
+    const Q81F32Block* x_row = (gt < T) ? (Xq + (size_t) gt * nb_k) : nullptr;
+
+    auto load_w_half = [&](const uint8_t* w_row, int dst_r, int64_t kb) {
+        if (w_row != nullptr && kb + loc_b < nb_k) {
+            if constexpr (GTYPE == kTypeQ8_0) {
+                const uint8_t* bp = w_row + (size_t) (kb + loc_b) * 34u;
+                const uint8_t* qp = bp + 2 + half * 16;
+                const int4 v = make_int4((int) ld32_b2(qp + 0), (int) ld32_b2(qp + 4),
+                                         (int) ld32_b2(qp + 8), (int) ld32_b2(qp + 12));
+                *reinterpret_cast<int4*>(&s_W[dst_r][loc_b * 8 + half * 4]) = v;
+                if (half == 0) s_Wd[dst_r][loc_b] = ld_fp16_b2(bp);
+            } else if constexpr (GTYPE == kTypeQ6_K) {
+                const int64_t cur = kb + loc_b;
+                const int64_t sb = cur >> 3;
+                const int ib = (int) (cur & 7);
+                const int h = ib >> 2, k4 = ib & 3;
+                const uint8_t* bp = w_row + (size_t) sb * 210u;
+                const uint8_t* qlp = bp + 64 * h + 32 * (k4 & 1) + half * 16;
+                const uint8_t* qhp = bp + 128 + 32 * h + half * 16;
+                const int shl = 4 * (k4 >> 1), shh = 2 * k4;
+                auto dec6 = [&](int o) -> int {
+                    const uint32_t lo = (ld32_b2(qlp + o) >> shl) & 0x0F0F0F0Fu;
+                    const uint32_t hi = ((ld32_b2(qhp + o) >> shh) & 0x03030303u) << 4;
+                    return (int) ((((lo | hi) | 0x80808080u) - 0x20202020u) ^ 0x80808080u);
+                };
+                *reinterpret_cast<int4*>(&s_W[dst_r][loc_b * 8 + half * 4]) =
+                    make_int4(dec6(0), dec6(4), dec6(8), dec6(12));
+                const float d = ld_fp16_b2(bp + 208);
+                const float sc = (float) (int8_t) __ldg(bp + 192 + 2 * ib + half);
+                if (half == 0) s_Wd[dst_r][loc_b] = d * sc;
+                else s_Wm[dst_r][loc_b] = d * sc;
+            } else {
+                constexpr size_t kSB = (GTYPE == kTypeQ4_K) ? 144u : 176u;
+                constexpr size_t kQsOff = (GTYPE == kTypeQ4_K) ? 16u : 48u;
+                const int64_t cur = kb + loc_b;
+                const int64_t sb = cur >> 3;
+                const int ib = (int) (cur & 7);
+                const uint8_t* bp = w_row + (size_t) sb * kSB;
+                const uint32_t* qp = reinterpret_cast<const uint32_t*>(bp + kQsOff + 32 * (ib >> 1) + half * 16);
+                const int sh = 4 * (ib & 1);
+                uint32_t q0 = (__ldg(qp + 0) >> sh) & 0x0F0F0F0Fu;
+                uint32_t q1 = (__ldg(qp + 1) >> sh) & 0x0F0F0F0Fu;
+                uint32_t q2 = (__ldg(qp + 2) >> sh) & 0x0F0F0F0Fu;
+                uint32_t q3 = (__ldg(qp + 3) >> sh) & 0x0F0F0F0Fu;
+                if constexpr (GTYPE == kTypeQ5_K) {
+                    const uint32_t* qhp = reinterpret_cast<const uint32_t*>(bp + 16 + half * 16);
+                    q0 |= ((__ldg(qhp + 0) >> ib) & 0x01010101u) << 4;
+                    q1 |= ((__ldg(qhp + 1) >> ib) & 0x01010101u) << 4;
+                    q2 |= ((__ldg(qhp + 2) >> ib) & 0x01010101u) << 4;
+                    q3 |= ((__ldg(qhp + 3) >> ib) & 0x01010101u) << 4;
+                }
+                *reinterpret_cast<int4*>(&s_W[dst_r][loc_b * 8 + half * 4]) = make_int4((int) q0, (int) q1, (int) q2, (int) q3);
+                if (half == 0) {
+                    const uint8_t* sc_p = bp + 4;
+                    uint32_t sc, m;
+                    if (ib < 4) {
+                        sc = __ldg(sc_p + ib) & 63u;
+                        m  = __ldg(sc_p + ib + 4) & 63u;
+                    } else {
+                        sc = (__ldg(sc_p + ib + 4) & 15u) | ((__ldg(sc_p + ib - 4) >> 6) << 4);
+                        m  = (__ldg(sc_p + ib + 4) >> 4)  | ((__ldg(sc_p + ib) >> 6) << 4);
+                    }
+                    const float d = ld_fp16_b2(bp);
+                    const float dmin = ld_fp16_b2(bp + 2);
+                    s_Wd[dst_r][loc_b] = d * (float) sc;
+                    s_Wm[dst_r][loc_b] = -dmin * (float) m;
+                }
+            }
+        } else {
+            *reinterpret_cast<int4*>(&s_W[dst_r][loc_b * 8 + half * 4]) = make_int4(0, 0, 0, 0);
+            if (half == 0) {
+                s_Wd[dst_r][loc_b] = 0.0f;
+                if constexpr (kHasMin || kTwoScale) s_Wm[dst_r][loc_b] = 0.0f;
+            } else if constexpr (kTwoScale) {
+                s_Wm[dst_r][loc_b] = 0.0f;
+            }
+        }
+    };
+
+    for (int64_t kb = 0; kb < nb_k; kb += 2) {
+        load_w_half(w_row0, loc_r, kb);
+        load_w_half(w_row1, 64 + loc_r, kb);
+
+        // Load 64x2 Q8_1_F32 activation blocks -> s_X, s_Xd (, s_Xs)
+        if (x_row != nullptr && kb + loc_b < nb_k) {
+            const Q81F32Block* xb = x_row + kb + loc_b;
+            const int* qp = reinterpret_cast<const int*>(xb->qs) + half * 4;
+            const int4 v = make_int4(__ldg(qp + 0), __ldg(qp + 1), __ldg(qp + 2), __ldg(qp + 3));
+            *reinterpret_cast<int4*>(&s_X[loc_r][loc_b * 8 + half * 4]) = v;
+            if (half == 0) {
+                s_Xd[loc_r][loc_b] = __ldg(&xb->d);
+                if constexpr (kHasMin) s_Xs[loc_r][loc_b] = __ldg(&xb->sum);
+            }
+        } else {
+            *reinterpret_cast<int4*>(&s_X[loc_r][loc_b * 8 + half * 4]) = make_int4(0, 0, 0, 0);
+            if (half == 0) {
+                s_Xd[loc_r][loc_b] = 0.0f;
+                if constexpr (kHasMin) s_Xs[loc_r][loc_b] = 0.0f;
+            }
+        }
+        __syncthreads();
+
+#pragma unroll
+        for (int b = 0; b < 2; ++b) {
+            int4 x0[4], x1[4];
+            float xd[4], xs[4];
+#pragma unroll
+            for (int it = 0; it < 4; ++it) {
+                const int t = tx + 16 * it;
+                xd[it] = s_Xd[t][b];
+                if constexpr (kHasMin) xs[it] = s_Xs[t][b];
+                x0[it] = *reinterpret_cast<const int4*>(&s_X[t][b * 8 + 0]);
+                x1[it] = *reinterpret_cast<const int4*>(&s_X[t][b * 8 + 4]);
+            }
+#pragma unroll
+            for (int ir = 0; ir < 8; ++ir) {
+                const int r = ty + 16 * ir;
+                const float wd = s_Wd[r][b];
+                const float wm = (kHasMin || kTwoScale) ? s_Wm[r][b] : 0.0f;
+                const int4 w0 = *reinterpret_cast<const int4*>(&s_W[r][b * 8 + 0]);
+                const int4 w1 = *reinterpret_cast<const int4*>(&s_W[r][b * 8 + 4]);
+#pragma unroll
+                for (int it = 0; it < 4; ++it) {
+                    int s0 = __dp4a(w0.x, x0[it].x, 0);
+                    s0 = __dp4a(w0.y, x0[it].y, s0);
+                    s0 = __dp4a(w0.z, x0[it].z, s0);
+                    s0 = __dp4a(w0.w, x0[it].w, s0);
+                    if constexpr (kTwoScale) {
+                        int s1 = __dp4a(w1.x, x1[it].x, 0);
+                        s1 = __dp4a(w1.y, x1[it].y, s1);
+                        s1 = __dp4a(w1.z, x1[it].z, s1);
+                        s1 = __dp4a(w1.w, x1[it].w, s1);
+                        acc[ir][it] = fmaf((float) s0, wd * xd[it], acc[ir][it]);
+                        acc[ir][it] = fmaf((float) s1, wm * xd[it], acc[ir][it]);
+                    } else {
+                        s0 = __dp4a(w1.x, x1[it].x, s0);
+                        s0 = __dp4a(w1.y, x1[it].y, s0);
+                        s0 = __dp4a(w1.z, x1[it].z, s0);
+                        s0 = __dp4a(w1.w, x1[it].w, s0);
+                        acc[ir][it] = fmaf((float) s0, wd * xd[it], acc[ir][it]);
+                        if constexpr (kHasMin) acc[ir][it] = fmaf(wm, xs[it], acc[ir][it]);
+                    }
+                }
+            }
+        }
+        __syncthreads();
+    }
+
+#pragma unroll
+    for (int ir = 0; ir < 8; ++ir) {
+        const int64_t r = n0 + ty + 16 * ir;
+        if (r >= N) continue;
+#pragma unroll
+        for (int it = 0; it < 4; ++it) {
+            const int64_t t = t0 + tx + 16 * it;
+            if (t >= T) continue;
+            float* dst = Y + t * ldy + r;
+            *dst = (beta == 0.0f) ? acc[ir][it] : fmaf(beta, *dst, acc[ir][it]);
+        }
+    }
+#else
+    (void) W; (void) Xq; (void) Y; (void) T; (void) N; (void) K; (void) ldy; (void) beta;
+#endif
+}
+
 int current_cc() {
 #if defined(__HIPCC__)
     return 0;
@@ -1806,6 +2053,46 @@ bool dense_i8_tc_prefill(const uint16_t* X_f16, int ggml_type, const void* W_blo
         case kTypeIQ4_NL: dense_i8_tc_prefill_kernel<kTypeIQ4_NL><<<grid, 256, 0, s>>>(w, xq, Y, T, N, K, ldy, beta); break;
         case kTypeIQ3_S: dense_i8_tc_prefill_kernel<kTypeIQ3_S><<<grid, 256, 0, s>>>(w, xq, Y, T, N, K, ldy, beta); break;
         case kTypeIQ4_XS: dense_i8_tc_prefill_kernel<kTypeIQ4_XS><<<grid, 256, 0, s>>>(w, xq, Y, T, N, K, ldy, beta); break;
+        default: return false;
+    }
+    return cudaGetLastError() == cudaSuccess;
+}
+
+bool dense_dp4a_prefill(const uint16_t* X_f16, int ggml_type, const void* W_blocks, float* Y,
+                        int64_t T, int64_t N, int64_t K, int64_t ldy, float beta,
+                        void* scratch, size_t scratch_bytes, void* stream) {
+    static const int env = [] {
+        const char* v = std::getenv("STRATA_DENSE_Q8_DP4A");
+        return (v != nullptr && v[0] != '\0') ? (std::atoi(v) != 0 ? 1 : 0) : -1;
+    }();
+    if (env == 0) return false;
+    const int cc = current_cc();
+    if (env < 0 && cc != 61) return false;
+    if (cc < 61) return false;
+    if (ggml_type != kTypeQ8_0 && ggml_type != kTypeQ4_K && ggml_type != kTypeQ5_K && ggml_type != kTypeQ6_K) return false;
+    if (X_f16 == nullptr || W_blocks == nullptr || Y == nullptr || scratch == nullptr) return false;
+    const int align_k = (ggml_type == kTypeQ8_0) ? 32 : 256;
+    if (T < 64 || N <= 0 || K <= 0 || (K % align_k) != 0) return false;
+    if (ldy <= 0) ldy = N;
+
+    const size_t need = (size_t) T * (size_t) (K >> 5) * sizeof(Q81F32Block);
+    if (scratch_bytes < need) return false;
+
+    const cudaStream_t s = static_cast<cudaStream_t>(stream);
+    auto* xq = reinterpret_cast<Q81F32Block*>(scratch);
+    const int64_t total_blocks = T * (K >> 5);
+    const unsigned q_grid = (unsigned) std::min<int64_t>((total_blocks + 7) / 8, 0x7fffffffLL);
+    quantize_f16_to_q8_1_f32_kernel<<<q_grid, 256, 0, s>>>(X_f16, xq, total_blocks);
+
+    const unsigned gx = (unsigned) ((T + 63) / 64);
+    const unsigned gy = (unsigned) ((N + 127) / 128);
+    if (gy > 65535u) return false;
+    const auto* w = reinterpret_cast<const uint8_t*>(W_blocks);
+    switch (ggml_type) {
+        case kTypeQ8_0: dense_dp4a_prefill_kernel<kTypeQ8_0><<<dim3(gx, gy), 256, 0, s>>>(w, xq, Y, T, N, K, ldy, beta); break;
+        case kTypeQ4_K: dense_dp4a_prefill_kernel<kTypeQ4_K><<<dim3(gx, gy), 256, 0, s>>>(w, xq, Y, T, N, K, ldy, beta); break;
+        case kTypeQ5_K: dense_dp4a_prefill_kernel<kTypeQ5_K><<<dim3(gx, gy), 256, 0, s>>>(w, xq, Y, T, N, K, ldy, beta); break;
+        case kTypeQ6_K: dense_dp4a_prefill_kernel<kTypeQ6_K><<<dim3(gx, gy), 256, 0, s>>>(w, xq, Y, T, N, K, ldy, beta); break;
         default: return false;
     }
     return cudaGetLastError() == cudaSuccess;
