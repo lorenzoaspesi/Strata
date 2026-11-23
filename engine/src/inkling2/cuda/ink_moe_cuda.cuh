@@ -1429,15 +1429,15 @@ __global__ void __launch_bounds__(128) k_ink_moe_gu_sf4_mx8(
         w_outer = h01.x / h01.y;
     }
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 610)
-    __shared__ alignas(16) float s_x[MAX_M][kInkHidden];
+    // Tile s_x in 256-float chunks (4 KB for MAX_M=4 vs 36 KB untiled) so Pascal sm_61
+    // gets full multi-CTA SM occupancy alongside zero half2 conversion overhead!
+    __shared__ alignas(16) float s_x[MAX_M][256];
     for (int off_m = 0; off_m < n_total; off_m += MAX_M) {
         const int n_e = min(MAX_M, n_total - off_m);
-        for (int m = 0; m < n_e; ++m) {
-            const float4* src4 = reinterpret_cast<const float4*>(x_f32 + (size_t)tb.tok_idx[row0 + off_m + m] * kInkHidden);
-            float4* dst4 = reinterpret_cast<float4*>(s_x[m]);
-            for (int i = tid; i < (kInkHidden / 4); i += 128) dst4[i] = src4[i];
-        }
-        __syncthreads();
+        int tok_ids[MAX_M];
+#pragma unroll
+        for (int m = 0; m < MAX_M; ++m) tok_ids[m] = (m < n_e) ? tb.tok_idx[row0 + off_m + m] : 0;
+
         if (n_e == 1) {
             float ag0 = 0.0f, au0 = 0.0f;
             if (ed.gu_code == FMT_SF4) {
@@ -1449,15 +1449,21 @@ __global__ void __launch_bounds__(128) k_ink_moe_gu_sf4_mx8(
                 const uint4* up16 = reinterpret_cast<const uint4*>(base_p + (size_t)(2 * feat + 1) * W_P_ROW);
                 const uint16_t* gs2 = reinterpret_cast<const uint16_t*>(base_s + (size_t)(2 * feat) * W_S_ROW);
                 const uint16_t* us2 = reinterpret_cast<const uint16_t*>(base_s + (size_t)(2 * feat + 1) * W_S_ROW);
-                for (int i = lg; i < 72; i += 8) {
+                const float4* src4 = reinterpret_cast<const float4*>(x_f32 + (size_t)tok_ids[0] * kInkHidden);
+                float4* dst4 = reinterpret_cast<float4*>(s_x[0]);
+                for (int kt = 0; kt < 9; ++kt) {
+                    if (tid < 64) dst4[tid] = src4[kt * 64 + tid];
+                    __syncthreads();
+                    const int i = kt * 8 + lg;
                     const uint4 gv = gp16[i], uv = up16[i];
                     const float2 sg = e4m3x2_to_f32x2(gs2[i]);
                     const float2 su = e4m3x2_to_f32x2(us2[i]);
-                    const float* xf0 = s_x[0] + i * 32;
+                    const float* xf0 = s_x[0] + lg * 32;
                     ag0 = fmaf(sf4_dot16_f32(gv.x, gv.y, xf0), sg.x, ag0);
                     au0 = fmaf(sf4_dot16_f32(uv.x, uv.y, xf0), su.x, au0);
                     ag0 = fmaf(sf4_dot16_f32(gv.z, gv.w, xf0 + 16), sg.y, ag0);
                     au0 = fmaf(sf4_dot16_f32(uv.z, uv.w, xf0 + 16), su.y, au0);
+                    __syncthreads();
                 }
                 ag0 *= w_outer; au0 *= w_outer;
             } else {
@@ -1469,15 +1475,24 @@ __global__ void __launch_bounds__(128) k_ink_moe_gu_sf4_mx8(
                 const uint4* up16 = reinterpret_cast<const uint4*>(base_p + (size_t)(2 * feat + 1) * W_P_ROW);
                 const uint8_t* gs = base_s + (size_t)(2 * feat) * W_S_ROW;
                 const uint8_t* us = base_s + (size_t)(2 * feat + 1) * W_S_ROW;
-                for (int i = lg; i < 144; i += 8) {
-                    const float sg = ue8m0_to_f32(gs[i >> 1]);
-                    const float su = ue8m0_to_f32(us[i >> 1]);
-                    float2 gw[8], uw[8];
-                    mx8_decode16_f32(gp16[i], gw);
-                    mx8_decode16_f32(up16[i], uw);
-                    const float* xf = s_x[0] + i * 16;
-                    ag0 = fmaf(dot16_f32_2acc(gw, xf), sg, ag0);
-                    au0 = fmaf(dot16_f32_2acc(uw, xf), su, au0);
+                const float4* src4 = reinterpret_cast<const float4*>(x_f32 + (size_t)tok_ids[0] * kInkHidden);
+                float4* dst4 = reinterpret_cast<float4*>(s_x[0]);
+                for (int kt = 0; kt < 9; ++kt) {
+                    if (tid < 64) dst4[tid] = src4[kt * 64 + tid];
+                    __syncthreads();
+#pragma unroll
+                    for (int sub = 0; sub < 2; ++sub) {
+                        const int i = kt * 16 + sub * 8 + lg;
+                        const float sg = ue8m0_to_f32(gs[i >> 1]);
+                        const float su = ue8m0_to_f32(us[i >> 1]);
+                        float2 gw[8], uw[8];
+                        mx8_decode16_f32(gp16[i], gw);
+                        mx8_decode16_f32(up16[i], uw);
+                        const float* xf = s_x[0] + (sub * 8 + lg) * 16;
+                        ag0 = fmaf(dot16_f32_2acc(gw, xf), sg, ag0);
+                        au0 = fmaf(dot16_f32_2acc(uw, xf), su, au0);
+                    }
+                    __syncthreads();
                 }
             }
 #pragma unroll
@@ -1497,7 +1512,16 @@ __global__ void __launch_bounds__(128) k_ink_moe_gu_sf4_mx8(
                 const uint4* up16 = reinterpret_cast<const uint4*>(base_p + (size_t)(2 * feat + 1) * W_P_ROW);
                 const uint16_t* gs2 = reinterpret_cast<const uint16_t*>(base_s + (size_t)(2 * feat) * W_S_ROW);
                 const uint16_t* us2 = reinterpret_cast<const uint16_t*>(base_s + (size_t)(2 * feat + 1) * W_S_ROW);
-                for (int i = lg; i < 72; i += 8) {
+                for (int kt = 0; kt < 9; ++kt) {
+                    const int tot4 = n_e * 64;
+                    for (int idx = tid; idx < tot4; idx += 128) {
+                        const int m = idx >> 6;
+                        const int c = idx & 63;
+                        reinterpret_cast<float4*>(s_x[m])[c] =
+                            reinterpret_cast<const float4*>(x_f32 + (size_t)tok_ids[m] * kInkHidden)[kt * 64 + c];
+                    }
+                    __syncthreads();
+                    const int i = kt * 8 + lg;
                     const uint4 gv = gp16[i], uv = up16[i];
                     const float2 sg = e4m3x2_to_f32x2(gs2[i]);
                     const float2 su = e4m3x2_to_f32x2(us2[i]);
@@ -1506,7 +1530,7 @@ __global__ void __launch_bounds__(128) k_ink_moe_gu_sf4_mx8(
                     sf4_decode16_f32(uv.x, uv.y, uw);
 #pragma unroll
                     for (int m = 0; m < MAX_M; ++m) if (m < n_e) {
-                        const float* xf = s_x[m] + i * 32;
+                        const float* xf = s_x[m] + lg * 32;
                         ag[m] = fmaf(dot16_f32_2acc(gw, xf), sg.x, ag[m]);
                         au[m] = fmaf(dot16_f32_2acc(uw, xf), su.x, au[m]);
                     }
@@ -1514,10 +1538,11 @@ __global__ void __launch_bounds__(128) k_ink_moe_gu_sf4_mx8(
                     sf4_decode16_f32(uv.z, uv.w, uw);
 #pragma unroll
                     for (int m = 0; m < MAX_M; ++m) if (m < n_e) {
-                        const float* xf = s_x[m] + i * 32 + 16;
+                        const float* xf = s_x[m] + lg * 32 + 16;
                         ag[m] = fmaf(dot16_f32_2acc(gw, xf), sg.y, ag[m]);
                         au[m] = fmaf(dot16_f32_2acc(uw, xf), su.y, au[m]);
                     }
+                    __syncthreads();
                 }
 #pragma unroll
                 for (int m = 0; m < MAX_M; ++m) { ag[m] *= w_outer; au[m] *= w_outer; }
@@ -1530,18 +1555,31 @@ __global__ void __launch_bounds__(128) k_ink_moe_gu_sf4_mx8(
                 const uint4* up16 = reinterpret_cast<const uint4*>(base_p + (size_t)(2 * feat + 1) * W_P_ROW);
                 const uint8_t* gs = base_s + (size_t)(2 * feat) * W_S_ROW;
                 const uint8_t* us = base_s + (size_t)(2 * feat + 1) * W_S_ROW;
-                for (int i = lg; i < 144; i += 8) {
-                    const float sg = ue8m0_to_f32(gs[i >> 1]);
-                    const float su = ue8m0_to_f32(us[i >> 1]);
-                    float2 gw[8], uw[8];
-                    mx8_decode16_f32(gp16[i], gw);
-                    mx8_decode16_f32(up16[i], uw);
-#pragma unroll
-                    for (int m = 0; m < MAX_M; ++m) if (m < n_e) {
-                        const float* xf = s_x[m] + i * 16;
-                        ag[m] = fmaf(dot16_f32_2acc(gw, xf), sg, ag[m]);
-                        au[m] = fmaf(dot16_f32_2acc(uw, xf), su, au[m]);
+                for (int kt = 0; kt < 9; ++kt) {
+                    const int tot4 = n_e * 64;
+                    for (int idx = tid; idx < tot4; idx += 128) {
+                        const int m = idx >> 6;
+                        const int c = idx & 63;
+                        reinterpret_cast<float4*>(s_x[m])[c] =
+                            reinterpret_cast<const float4*>(x_f32 + (size_t)tok_ids[m] * kInkHidden)[kt * 64 + c];
                     }
+                    __syncthreads();
+#pragma unroll
+                    for (int sub = 0; sub < 2; ++sub) {
+                        const int i = kt * 16 + sub * 8 + lg;
+                        const float sg = ue8m0_to_f32(gs[i >> 1]);
+                        const float su = ue8m0_to_f32(us[i >> 1]);
+                        float2 gw[8], uw[8];
+                        mx8_decode16_f32(gp16[i], gw);
+                        mx8_decode16_f32(up16[i], uw);
+#pragma unroll
+                        for (int m = 0; m < MAX_M; ++m) if (m < n_e) {
+                            const float* xf = s_x[m] + (sub * 8 + lg) * 16;
+                            ag[m] = fmaf(dot16_f32_2acc(gw, xf), sg, ag[m]);
+                            au[m] = fmaf(dot16_f32_2acc(uw, xf), su, au[m]);
+                        }
+                    }
+                    __syncthreads();
                 }
             }
 #pragma unroll
@@ -1555,7 +1593,6 @@ __global__ void __launch_bounds__(128) k_ink_moe_gu_sf4_mx8(
                 if (lg == 0) h_f32[(size_t)(row0 + off_m + m) * kInkInter + feat] = situ_f32(gv, uv);
             }
         }
-        if (off_m + MAX_M < n_total) __syncthreads();
     }
     return;
 #else
