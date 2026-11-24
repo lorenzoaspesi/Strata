@@ -158,18 +158,22 @@ int main() {
         CHECK(nv_default_env(7, 0, false).size() == 21);
         unset("STRATA_SM70_PERF");
     }
-    // sm_61 (Pascal consumer/workstation): 17 bit-exact switches + ADAPT_FETCH=2 for <= 13 GiB; STRATA_DEFAULTS=026 and STRATA_SM61_PERF=0 leave it out
+    // sm_61 (Pascal consumer/workstation): 21 bit-exact switches + ADAPT_FETCH=2 for <= 13 GiB; STRATA_DEFAULTS=026 and STRATA_SM61_PERF=0 leave it out
     {
         unset("STRATA_SM61_PERF");
         const auto t = nv_default_env(6, 1, false);
-        CHECK(t.size() == 17);
+        CHECK(t.size() == 21);
         CHECK(find(t, "STRATA_DENSE_F32") && *find(t, "STRATA_DENSE_F32") == "1");
         CHECK(find(t, "STRATA_PLE_COMPACT") && *find(t, "STRATA_PLE_COMPACT") == "1");
         CHECK(find(t, "STRATA_FUSE_DECODE") && *find(t, "STRATA_FUSE_DECODE") == "1");
+        CHECK(find(t, "STRATA_TSUM") && *find(t, "STRATA_TSUM") == "1");
+        CHECK(find(t, "STRATA_GR_Q8_DOWN_MODE") && *find(t, "STRATA_GR_Q8_DOWN_MODE") == "2");
+        CHECK(find(t, "STRATA_GR_Q8_UP_COLS") && *find(t, "STRATA_GR_Q8_UP_COLS") == "16");
+        CHECK(find(t, "STRATA_GR_Q8_UP_MODE") && *find(t, "STRATA_GR_Q8_UP_MODE") == "2");
         const auto t8 = nv_default_env(6, 1, false, 8ull << 30);
-        CHECK(t8.size() == 18 && find(t8, "STRATA_ADAPT_FETCH") && *find(t8, "STRATA_ADAPT_FETCH") == "2");
+        CHECK(t8.size() == 22 && find(t8, "STRATA_ADAPT_FETCH") && *find(t8, "STRATA_ADAPT_FETCH") == "2");
         const auto t24 = nv_default_env(6, 1, false, 24ull << 30);
-        CHECK(t24.size() == 17 && !find(t24, "STRATA_ADAPT_FETCH"));
+        CHECK(t24.size() == 21 && !find(t24, "STRATA_ADAPT_FETCH"));
         CHECK(nv_default_env(6, 1, true, 8ull << 30).empty());
         put("STRATA_SM61_PERF", "0");
         CHECK(nv_default_env(6, 1, false, 8ull << 30).empty());

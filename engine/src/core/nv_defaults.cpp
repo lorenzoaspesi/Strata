@@ -184,6 +184,10 @@ std::vector<std::pair<std::string, std::string>> nv_default_env(int major, int m
             {"STRATA_FUSE_WAIT", "2"},
             {"STRATA_SELECT_LONG", "1"},
             {"STRATA_DENSE_F32", "1"},
+            {"STRATA_TSUM", "1"},
+            {"STRATA_GR_Q8_DOWN_MODE", "2"},
+            {"STRATA_GR_Q8_UP_COLS", "16"},
+            {"STRATA_GR_Q8_UP_MODE", "2"},
         };
         if (adapt_fetch_default_card(major, minor, main_vram_bytes)) t.push_back({"STRATA_ADAPT_FETCH", "2"});
     } else if (mj == 6 && mn == 0) {
