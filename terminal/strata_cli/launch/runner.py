@@ -580,7 +580,8 @@ def own_log_path(base: dict) -> str | None:
 #: launcher decides those with --mtp and --drafting), "open_browser" (strata launch sets it itself), and
 #: "vram_reserve_mib" (an engine option that already survives as a flag in "args" with its "user_args" copy).
 WEB_SETTINGS_KEYS = ("reasoning_budget_tokens", "fit_max_tokens", "anthropic_thinking", "effort_position",
-                     "aliases", "idle_unload_s", "lazy_load", "engine_silence_s", "api_monitor")
+                     "aliases", "idle_unload_s", "lazy_load", "engine_silence_s", "api_monitor",
+                     "disk_cache_gib")
 WEB_SAMPLING_KEYS = ("temperature", "top_p", "top_k", "min_p")     # the editable keys of the "sampling" block
 
 #: Advanced-table options (--set, a preset's extra table) that the server reads from the run config, not from the

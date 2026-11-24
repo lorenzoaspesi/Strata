@@ -5132,8 +5132,9 @@ class Service:
                 raise EngineDied(f"the engine could not be started: {e}") from e
             raise
         print("[strata] the engine is running again", flush=True)
-        if self.disk_cache is not None and self.disk_cache.enabled:
-            self.disk_cache.prune_incompatible(getattr(self.engine, "info", None))
+        dc = getattr(self, "disk_cache", None)
+        if dc is not None and dc.enabled:
+            dc.prune_incompatible(getattr(self.engine, "info", None))
         if self.restore_after_load:                      # an image job unloaded it: its conversation comes back
             images_api.restore_session(self)
         if self.vram_reserve is not None and hasattr(self.engine, "vram"):   # #533: the reserve asked for last

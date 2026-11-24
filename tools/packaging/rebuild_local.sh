@@ -331,7 +331,7 @@ docker run --rm \
             --build-id "$BUILD_ID" \
             --include SYSTEM-LIBS.txt \
             --include "libstrata_kq*" \
-            --include "licenses/*"
+            --include 'licenses/*'
 
         PKG_FOLDER="$OUT_DIR/${PKG_VER}-linux-x86_64-cuda-cuda12"
         python3 /src/tools/packaging/package_engine.py --verify "$PKG_FOLDER"
@@ -367,7 +367,8 @@ docker run --rm \
                 --variant cuda12 \
                 --platform linux-x86_64 \
                 --build-id "$BUILD_ID" \
-                --include SYSTEM-LIBS.txt
+                --include SYSTEM-LIBS.txt \
+                --include 'licenses/*'
             INK_PKG_FOLDER="$INK_OUT/${PKG_VER}-linux-x86_64-cuda-cuda12"
             python3 /src/tools/packaging/package_engine.py --verify "$INK_PKG_FOLDER"
             python3 /src/tools/packaging/binary_deps.py "$INK_PKG_FOLDER"

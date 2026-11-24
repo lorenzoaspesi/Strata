@@ -1,0 +1,13 @@
+libgomp.so.1: the GNU Offloading and Multi Processing Runtime Library (OpenMP), part of the GCC runtime
+
+This engine package carries an unmodified copy of libgomp.so.1 from the build machine. Local CUDA builds that link
+against OpenMP need it when deployed onto minimal Linux environments.
+
+License: the GNU General Public License, version 3 or later, with the GCC Runtime Library Exception, version 3.1
+(SPDX: GPL-3.0-or-later WITH GCC-exception-3.1).
+  GPL-3.0:                https://www.gnu.org/licenses/gpl-3.0.html (GPL-3.txt in this folder when the build machine had it)
+  GCC Runtime Exception:  https://www.gnu.org/licenses/gcc-exception-3.1.html
+Copyright: Free Software Foundation, Inc.
+
+Source code: libgomp is in the GCC source tree (https://gcc.gnu.org/, directory libgomp). The exact source of this copy is the
+source package of the distribution package named below (for Debian and Ubuntu: `apt-get source` of the gcc package that built it).
