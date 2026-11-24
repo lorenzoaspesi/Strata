@@ -1299,6 +1299,8 @@ struct InkDSpark {
     InkCudaModel& m;
     bool ready = false;
     int max_ctx = 4096;
+    double last_pred_etok = 0.0;  // the last tree step: expected tokens (1 + sum of the kept paths' probabilities) and its node count
+    int last_m = 0;
     int K_cand = 256;  // reduced-vocab L2-cached candidate pool for Markov RNN
 
     // Context KV cache for 3 DSpark layers (compact SWA rings or host-mapped FP8) + f_rnn
@@ -2005,7 +2007,7 @@ struct InkDSpark {
 
     // Draft True W=2..4 Multi-Branch Bayes-Optimal Connected Tree (M <= 16..32 nodes, CUDA Graph captured!)
     // When adaptive_moe_ratio > 0, dynamically picks M* in {4, 6, 8, 10, 12, 16} maximizing E[emit(M)] / (1 + ratio*(1-(15/16)^M))!
-    void draft_beam_tree(int32_t anchor_tok, int apos, int beam_w, int max_nodes, InkTreeSpec& out_tree, float adaptive_moe_ratio = 0.0f) {
+    void draft_beam_tree(int32_t anchor_tok, int apos, int beam_w, int max_nodes, InkTreeSpec& out_tree, float adaptive_moe_ratio = 0.0f, float plain_margin = 0.0f) {
         r.ensure_decode_ready();
         beam_w = std::max(1, std::min(kInkMaxBeam, beam_w));
         max_nodes = std::max(2, std::min(r.tree_cap, max_nodes));
@@ -2065,7 +2067,7 @@ struct InkDSpark {
         int want = std::min(max_nodes, cnt);
         if (adaptive_moe_ratio > 0.0f) {
             // Exact Sparse-MoE Bayes-Optimal Dynamic Tree Sizing across cached CUDA Graph buckets {3, 4, 5, 6, 8, 10, 12}!
-            static constexpr int kBuckets[] = {3, 4, 5, 6, 8, 10, 12, 16};
+            static constexpr int kBuckets[] = {1, 2, 3, 4, 5, 6, 8, 10, 12, 16};
             double pref_p[kInkBeamPoolCap + 1];
             pref_p[0] = 1.0;  // root always emits 1 token
             for (int i = 0; i < n_cand; ++i) {
@@ -2076,13 +2078,17 @@ struct InkDSpark {
             int best_m = std::min(3, cnt);
             for (int mb : kBuckets) {
                 if (mb > max_nodes || mb > cnt) continue;
+                if (mb < 3 && plain_margin <= 0.0f) continue;  // the 1 and 2 node trees exist only when the caller lets the step fall back to plain decoding
                 const double e_tok = pref_p[mb - 1];
                 const double exp_frac = 1.0 - std::pow(15.0 / 16.0, (double)mb);
                 const double cost = 1.0 + (double)adaptive_moe_ratio * exp_frac;
-                const double rate = e_tok / cost;
+                double rate = e_tok / cost;
+                if (mb < 3) rate *= (double)plain_margin;
                 if (rate > best_rate) { best_rate = rate; best_m = mb; }
             }
             want = best_m;
+            last_pred_etok = pref_p[best_m - 1];
+            last_m = best_m;
         }
 
         uint8_t keep[kInkBeamPoolCap] = {};
