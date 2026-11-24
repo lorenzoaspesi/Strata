@@ -159,6 +159,13 @@ void native_mmvq(int ggml_type, const void* weights, const void* x_q8_1, float* 
 bool native_mmvq_pair(int ggml_type, const void* w1, const void* w2, const void* x_q8_1, float* y1, float* y2,
                       int n_in, int n_out, int ncols, void* stream);
 
+/// Indirect-row MMVQ: reads row `row_map[r]` of `weights` for each output row `r` in [0, n_out), writing
+/// `y[col * n_out + r]`. Bitwise equal to gathering `row_map` rows into a contiguous matrix and calling
+/// `native_mmvq`, without allocating a copy of the gathered rows in VRAM.
+bool native_mmvq_indexed_supported(int ggml_type) noexcept;
+void native_mmvq_indexed(int ggml_type, const void* weights, const int32_t* row_map, const void* x_q8_1, float* y,
+                         int n_in, int n_out, int ncols, void* stream);
+
 // Fork F4 (Eddoursul): 2..4 columns also INTERLEAVED, so one 16-byte load reads a position of every column: CP = 2 (2
 // columns) or 4 (3-4), zero-padded; nb = n_in / 32 blocks; int32 bm[nb][8][CP] (block-major), int32 pm[8][nb][CP]
 // (position-major), float d[nb][CP] (each block's scale as the dots read it, __low2float of ds).

@@ -186,7 +186,21 @@ __global__ void copy_rows_kernel(const float* __restrict__ in, float* __restrict
 // S = Q K^T in 4 x 4 register tiles (64 threads), the online softmax per query, O += P V in 4 x 8 register tiles (128 threads).
 constexpr int AS = 132;   // smem row stride of the Q / K / V tiles (float4 aligned, conflict-free for the 4 x 4 tiles)
 constexpr int PS = 36;    // stride of the transposed probabilities P[key][query]
-__global__ void __launch_bounds__(128) attn_part_kernel(const float* __restrict__ q, const float* __restrict__ kring, const float* __restrict__ vring,
+
+template <typename RingT>
+__device__ __forceinline__ float4 df2_load_ring4(const RingT* ring, size_t off) {
+    if constexpr (std::is_same_v<RingT, float>) {
+        return *reinterpret_cast<const float4*>(ring + off);
+    } else {
+        const uint2 raw = *reinterpret_cast<const uint2*>(ring + off);
+        const float2 f0 = __half22float2(*reinterpret_cast<const __half2*>(&raw.x));
+        const float2 f1 = __half22float2(*reinterpret_cast<const __half2*>(&raw.y));
+        return make_float4(f0.x, f0.y, f1.x, f1.y);
+    }
+}
+
+template <typename RingT>
+__global__ void __launch_bounds__(128) attn_part_kernel(const float* __restrict__ q, const RingT* __restrict__ kring, const RingT* __restrict__ vring,
                                                        const float* __restrict__ kblk, const float* __restrict__ vblk,
                                                        const int32_t* __restrict__ anchor_pos, int ring_slots, int window, float* __restrict__ part, int variant,
                                                        const int64_t* __restrict__ tag, const int32_t* __restrict__ epoch_ptr) {
@@ -225,12 +239,12 @@ __global__ void __launch_bounds__(128) attn_part_kernel(const float* __restrict_
     const int qg_pv = tid >> 4, dg_pv = tid & 15;   // PV: queries qg*4 .. +3, dims dg*8 .. +7
     const int k_end = min(k_begin + kDf2Chunk, nkeys);
     // a tile is 32 keys x 128 dims = 1024 float4: eight per thread, loaded into registers ahead of their use
-    auto fetch = [&](int k0, float4 (&reg)[8], const float* ring, const float* blk) {
+    auto fetch = [&](int k0, float4 (&reg)[8], const RingT* ring, const float* blk) {
 #pragma unroll
         for (int u = 0; u < 8; ++u) {
             const int i = tid + u * 128, t = i / (HD / 4), d4 = i % (HD / 4), k = k0 + t;
             float4 v = make_float4(0.f, 0.f, 0.f, 0.f);
-            if (k < nctx) v = *reinterpret_cast<const float4*>(ring + ((size_t) kvh * ring_slots + (lo + k) % ring_slots) * HD + d4 * 4);
+            if (k < nctx) v = df2_load_ring4(ring, ((size_t) kvh * ring_slots + (lo + k) % ring_slots) * HD + d4 * 4);
             else if (k < nkeys) v = *reinterpret_cast<const float4*>(blk + ((size_t) (k - nctx) * kDf2Kv + kvh) * HD + d4 * 4);
             reg[u] = v;
         }
@@ -369,8 +383,9 @@ constexpr int AS_H = 136;   // 16-byte aligned FP16 Q/K stride (272 B)
 constexpr int VS_H = 40;    // 16-byte aligned FP16 transposed V[d][t] stride (80 B = 32 keys + 8 pad)
 constexpr int PS_H = 40;    // 16-byte aligned FP16 P[q][t] stride (80 B = 32 keys + 8 pad)
 
+template <typename RingT>
 __global__ void __launch_bounds__(128) attn_part_wmma_gfx11_kernel(
-    const float* __restrict__ q, const float* __restrict__ kring, const float* __restrict__ vring,
+    const float* __restrict__ q, const RingT* __restrict__ kring, const RingT* __restrict__ vring,
     const float* __restrict__ kblk, const float* __restrict__ vblk,
     const int32_t* __restrict__ anchor_pos, int ring_slots, int window, float* __restrict__ part,
     const int64_t* __restrict__ tag, const int32_t* __restrict__ epoch_ptr) {
@@ -417,12 +432,12 @@ __global__ void __launch_bounds__(128) attn_part_wmma_gfx11_kernel(
     for (int dt = 0; dt < 4; ++dt) O[dt] = df2_f8{0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
 
     const int k_end = min(k_begin + kDf2Chunk, nkeys);
-    auto fetch = [&](int k0, float4 (&reg)[8], const float* ring, const float* blk) {
+    auto fetch = [&](int k0, float4 (&reg)[8], const RingT* ring, const float* blk) {
 #pragma unroll
         for (int u = 0; u < 8; ++u) {
             const int i = tid + u * 128, t = i / (HD / 4), d4 = i % (HD / 4), k = k0 + t;
             float4 v = make_float4(0.f, 0.f, 0.f, 0.f);
-            if (k < nctx) v = *reinterpret_cast<const float4*>(ring + ((size_t) kvh * ring_slots + (lo + k) % ring_slots) * HD + d4 * 4);
+            if (k < nctx) v = df2_load_ring4(ring, ((size_t) kvh * ring_slots + (lo + k) % ring_slots) * HD + d4 * 4);
             else if (k < nkeys) v = *reinterpret_cast<const float4*>(blk + ((size_t) (k - nctx) * kDf2Kv + kvh) * HD + d4 * 4);
             reg[u] = v;
         }
@@ -583,8 +598,9 @@ __device__ __forceinline__ void df2_mma_bf16_m16n8k16(float (&d)[4], uint32_t a0
 
 constexpr int AS16 = 136;   // 128 bf16 + 8 pad (16-byte aligned, bank-conflict-free)
 constexpr int VS16 = 36;    // 32 bf16 + 4 pad (8-byte aligned)
+template <typename RingT>
 __global__ void __launch_bounds__(128) attn_part_tc_kernel(
-    const float* __restrict__ q, const float* __restrict__ kring, const float* __restrict__ vring,
+    const float* __restrict__ q, const RingT* __restrict__ kring, const RingT* __restrict__ vring,
     const float* __restrict__ kblk, const float* __restrict__ vblk,
     const int32_t* __restrict__ anchor_pos, int ring_slots, int window, float* __restrict__ part, int variant,
     const int64_t* __restrict__ tag, const int32_t* __restrict__ epoch_ptr) {
@@ -641,12 +657,12 @@ __global__ void __launch_bounds__(128) attn_part_tc_kernel(
     for (int nd = 0; nd < 8; ++nd) { O[nd][0] = 0.0f; O[nd][1] = 0.0f; O[nd][2] = 0.0f; O[nd][3] = 0.0f; }
 
     const int k_end = min(k_begin + kDf2Chunk, nkeys);
-    auto fetch = [&](int k0, float4 (&reg)[8], const float* ring, const float* blk) {
+    auto fetch = [&](int k0, float4 (&reg)[8], const RingT* ring, const float* blk) {
 #pragma unroll
         for (int u = 0; u < 8; ++u) {
             const int i = tid + u * 128, t = i / (HD / 4), d4 = i % (HD / 4), k = k0 + t;
             float4 v = make_float4(0.f, 0.f, 0.f, 0.f);
-            if (k < nctx) v = *reinterpret_cast<const float4*>(ring + ((size_t) kvh * ring_slots + (lo + k) % ring_slots) * HD + d4 * 4);
+            if (k < nctx) v = df2_load_ring4(ring, ((size_t) kvh * ring_slots + (lo + k) % ring_slots) * HD + d4 * 4);
             else if (k < nkeys) v = *reinterpret_cast<const float4*>(blk + ((size_t) (k - nctx) * kDf2Kv + kvh) * HD + d4 * 4);
             reg[u] = v;
         }
@@ -1426,8 +1442,9 @@ __global__ void norm_rope_qk_kernel(const float* __restrict__ q, const float* __
 }
 
 // the context update's ring write: K norm + rope of (row, head) and the V copy, both into the head-major ring slot pos % slots
+template <typename RingT>
 __global__ void kv_ring_kernel(const float* __restrict__ kin, const float* __restrict__ vin, const float* __restrict__ gk, const int32_t* __restrict__ pos,
-                               const float* __restrict__ table, float* __restrict__ kring, float* __restrict__ vring, int slots, int heads, float eps,
+                               const float* __restrict__ table, RingT* __restrict__ kring, RingT* __restrict__ vring, int slots, int heads, float eps,
                                int64_t* __restrict__ tag, const int32_t* __restrict__ epoch_ptr) {
     const int r = blockIdx.x, h = blockIdx.y, d = threadIdx.x;
     __shared__ float red[4];
@@ -1444,8 +1461,15 @@ __global__ void kv_ring_kernel(const float* __restrict__ kin, const float* __res
     const float c = table[(r * 2 + 0) * 64 + i], sn = table[(r * 2 + 1) * 64 + i];
     const int slot = (int) (pos[r] % slots);
     const size_t at = ((size_t) h * slots + slot) * HD + d;
-    kring[at] = d < 64 ? v * c - y[d + 64] * sn : v * c + y[d - 64] * sn;
-    vring[at] = vin[((size_t) r * heads + h) * HD + d];
+    const float kv = d < 64 ? v * c - y[d + 64] * sn : v * c + y[d - 64] * sn;
+    const float vv = vin[((size_t) r * heads + h) * HD + d];
+    if constexpr (std::is_same_v<RingT, float>) {
+        kring[at] = kv;
+        vring[at] = vv;
+    } else {
+        kring[at] = __half_as_ushort(__float2half(kv));
+        vring[at] = __half_as_ushort(__float2half(vv));
+    }
     if (tag != nullptr && h == 0 && d == 0) tag[slot] = ((int64_t) *epoch_ptr << 32) | (int64_t) pos[r];
 }
 
@@ -1693,11 +1717,13 @@ void df2_copy_rows(const float* in, float* out, const int32_t* pos, int slot_mod
     check("copy_rows");
 }
 
-void df2_attention(const float* q, const float* kring, const float* vring, const float* kblk, const float* vblk, const int32_t* anchor_pos,
-                   int ring_slots, int window, float* part, void* xq, float* xd, void* stream, const int64_t* tag, const int32_t* epoch) {
+namespace {
+template <typename RingT>
+void df2_attention_impl(const float* q, const RingT* kring, const RingT* vring, const float* kblk, const float* vblk, const int32_t* anchor_pos,
+                        int ring_slots, int window, float* part, void* xq, float* xd, void* stream, const int64_t* tag, const int32_t* epoch) {
 #if defined(__HIP_PLATFORM_AMD__)
     if (g_attn_variant == 0 && df2_attn_wmma_enabled()) {
-        attn_part_wmma_gfx11_kernel<<<dim3(kDf2Kv, kDf2MaxChunks), 128, 0, (cudaStream_t) stream>>>(q, kring, vring, kblk, vblk, anchor_pos, ring_slots, window, part, tag, epoch);
+        attn_part_wmma_gfx11_kernel<RingT><<<dim3(kDf2Kv, kDf2MaxChunks), 128, 0, (cudaStream_t) stream>>>(q, kring, vring, kblk, vblk, anchor_pos, ring_slots, window, part, tag, epoch);
         check("attn_part_wmma_gfx11");
     } else
 #elif !defined(__HIPCC__)
@@ -1712,16 +1738,27 @@ void df2_attention(const float* q, const float* kring, const float* vring, const
         return major >= 8;
     }();
     if (tc_ok) {
-        attn_part_tc_kernel<<<dim3(kDf2Kv, kDf2MaxChunks), 128, 0, (cudaStream_t) stream>>>(q, kring, vring, kblk, vblk, anchor_pos, ring_slots, window, part, g_attn_variant, tag, epoch);
+        attn_part_tc_kernel<RingT><<<dim3(kDf2Kv, kDf2MaxChunks), 128, 0, (cudaStream_t) stream>>>(q, kring, vring, kblk, vblk, anchor_pos, ring_slots, window, part, g_attn_variant, tag, epoch);
         check("attn_part_tc");
     } else
 #endif
     {
-        attn_part_kernel<<<dim3(kDf2Kv, kDf2MaxChunks), 128, 0, (cudaStream_t) stream>>>(q, kring, vring, kblk, vblk, anchor_pos, ring_slots, window, part, g_attn_variant, tag, epoch);
+        attn_part_kernel<RingT><<<dim3(kDf2Kv, kDf2MaxChunks), 128, 0, (cudaStream_t) stream>>>(q, kring, vring, kblk, vblk, anchor_pos, ring_slots, window, part, g_attn_variant, tag, epoch);
         check("attn_part");
     }
     attn_merge_kernel<<<kDf2Kv * 32, HD, 0, (cudaStream_t) stream>>>(part, static_cast<int8_t*>(xq), xd);
     check("attn_merge");
+}
+}  // namespace
+
+void df2_attention(const float* q, const float* kring, const float* vring, const float* kblk, const float* vblk, const int32_t* anchor_pos,
+                   int ring_slots, int window, float* part, void* xq, float* xd, void* stream, const int64_t* tag, const int32_t* epoch) {
+    df2_attention_impl<float>(q, kring, vring, kblk, vblk, anchor_pos, ring_slots, window, part, xq, xd, stream, tag, epoch);
+}
+
+void df2_attention_f16(const float* q, const uint16_t* kring, const uint16_t* vring, const float* kblk, const float* vblk, const int32_t* anchor_pos,
+                       int ring_slots, int window, float* part, void* xq, float* xd, void* stream, const int64_t* tag, const int32_t* epoch) {
+    df2_attention_impl<uint16_t>(q, kring, vring, kblk, vblk, anchor_pos, ring_slots, window, part, xq, xd, stream, tag, epoch);
 }
 
 void df2_conv_rms_quant(const float* x, const float* dyn, int dyn_stride, const float* base, float* h, const float* gamma, float* xn, int rows, int H, int group,
@@ -1739,8 +1776,14 @@ void df2_norm_rope_qk(const float* q, const float* k, const float* gq, const flo
 
 void df2_kv_ring(const float* kin, const float* vin, const float* gk, const int32_t* pos, const float* table, float* kring, float* vring, int slots, int rows,
                  int heads, float eps, void* stream, int64_t* tag, const int32_t* epoch) {
-    kv_ring_kernel<<<dim3(rows, heads), HD, 0, (cudaStream_t) stream>>>(kin, vin, gk, pos, table, kring, vring, slots, heads, eps, tag, epoch);
+    kv_ring_kernel<float><<<dim3(rows, heads), HD, 0, (cudaStream_t) stream>>>(kin, vin, gk, pos, table, kring, vring, slots, heads, eps, tag, epoch);
     check("kv_ring");
+}
+
+void df2_kv_ring_f16(const float* kin, const float* vin, const float* gk, const int32_t* pos, const float* table, uint16_t* kring, uint16_t* vring, int slots, int rows,
+                     int heads, float eps, void* stream, int64_t* tag, const int32_t* epoch) {
+    kv_ring_kernel<uint16_t><<<dim3(rows, heads), HD, 0, (cudaStream_t) stream>>>(kin, vin, gk, pos, table, kring, vring, slots, heads, eps, tag, epoch);
+    check("kv_ring_f16");
 }
 
 void df2_rope_inv(float theta, double* inv, void* stream) {

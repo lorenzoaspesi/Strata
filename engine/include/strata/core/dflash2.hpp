@@ -53,7 +53,11 @@ public:
     /// copied over once, so the drafter can sit on the first stage's card.
     bool bind(const WeightTable& wt, const NativeHead* head, const std::string& vocab_file, std::string& err, int head_device = -1);
     /// STRATA_DF2_HEAD=native (CUDA / HIP): bind() ignores the vocabulary file and runs the draft head on the target's whole head (no pruned copy).
+    /// STRATA_DF2_HEAD=copy: force the legacy gathered pruned-head copy in VRAM instead of indirect row-indexed reads into the resident head.
     static bool head_native() { const char* e = std::getenv("STRATA_DF2_HEAD"); return e != nullptr && e[0] == 'n'; }
+    static bool head_copy() { const char* e = std::getenv("STRATA_DF2_HEAD"); return e != nullptr && e[0] == 'c'; }
+    static bool head_indexed_for(int head_type);
+    static bool kv_f16_enabled() { const char* e = std::getenv("STRATA_DF2_KV_F32"); return !(e != nullptr && e[0] == '1'); }
     /// DF-05: before bind, the MTP drafter's gathered draft-head rows and vocabulary (device pointers it keeps owning) when they are the same bytes this
     /// drafter would gather; bind then uses them instead of a second copy (about 213 MiB on Flash-Next) and checks the vocabulary against the file.
     struct SharedHead { const uint8_t* rows = nullptr; const int32_t* vocab_dev = nullptr; const std::vector<int32_t>* vocab_host = nullptr; int64_t n = 0; int type = -1; };
@@ -207,6 +211,8 @@ private:
     uint8_t* dhead_ = nullptr;      ///< the draft vocabulary's head rows (owned), or null with head_w_ the whole head
     SharedHead shared_;             ///< offered by the MTP drafter (DF-05)
     bool dhead_shared_ = false;     ///< dhead_ / dvocab_ are the MTP drafter's, not freed here
+    bool head_indexed_ = false;     ///< true: head_w_ is the resident full head, indexed via dvocab_ (zero extra head VRAM)
+    bool kv_f16_ = true;            ///< true: kring_/vring_ store FP16 (uint16_t); false: FP32 (float)
     bool bound_ = false;
 
     // device buffers
@@ -215,7 +221,7 @@ private:
     int32_t* m_meta_ = nullptr;
     int32_t* h_out_ = nullptr;      ///< pinned: 7 draft tokens then 7 probabilities
     float* hp_out_ = nullptr;
-    float *kring_[8] = {}, *vring_[8] = {};
+    void *kring_[8] = {}, *vring_[8] = {};
     float *rt_ctx_ = nullptr, *rt_blk_ = nullptr;   ///< rope tables of the context rows and of the block rows: one allocation, rt_blk_ = rt_ctx_ + 8 * 128
     double* rope_inv_ = nullptr;   ///< theta^(-2 i / 128), once
     cudaEvent_t ev_hs_[2] = {};     ///< the selector's projection runs beside the head

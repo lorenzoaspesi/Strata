@@ -8422,14 +8422,21 @@ int main(int argc, char** argv) {
         if (df2_expect_share) return 0;   // (its logits are in the 48 MiB the callers add)
         if (strata::core::Dflash2Drafter::head_native()) return (int64_t) 7 * n_vocab * (int64_t) sizeof(float);   // STRATA_DF2_HEAD=native: no pruned copy, the logits of every row
         if (!df2_solo) return (int64_t) mtp.bind_bytes(native_head.row_bytes(), n_vocab);
-        int64_t bytes = (int64_t) std::min(o.spec, (int) strata::kernels::kVerifyNarrowT) * n_vocab * (int64_t) sizeof(float);
+        const bool indexed_ok = !multi_gpu && stages.empty() && !native_head.is_split() &&
+                                strata::core::Dflash2Drafter::head_indexed_for(native_head.type());
+        int64_t bytes = 0;
         if (FILE* f = std::fopen(df2_vocab_path().c_str(), "rb")) {
             std::fseek(f, 0, SEEK_END);
             const long size = std::ftell(f);
             std::fclose(f);
-            if (size >= 4 && size % 4 == 0) bytes += (int64_t) (size / 4) * (int64_t) native_head.row_bytes() + (int64_t) size;
+            if (size >= 4 && size % 4 == 0) {
+                const int64_t nv = (int64_t) (size / 4);
+                bytes = (int64_t) 7 * nv * (int64_t) sizeof(float) + (int64_t) size;
+                if (!indexed_ok) bytes += nv * (int64_t) native_head.row_bytes();
+                return bytes;
+            }
         }
-        return bytes;
+        return (int64_t) 7 * n_vocab * (int64_t) sizeof(float);
     };
     float* d_logits = nullptr;
     if (cudaMalloc(&d_logits, (size_t) n_vocab * 4) != cudaSuccess) {
@@ -8806,7 +8813,7 @@ int main(int argc, char** argv) {
                         int64_t mtp_b = (!o.mtp.empty() && native_head.loaded())
                                             ? (int64_t) mtp.bind_bytes(native_head.row_bytes(), n_vocab) : 0;
 #if defined(STRATA_HAVE_DFLASH2)
-                        if (use_df2 && native_head.loaded()) mtp_b += df2_head_bytes() + (48 << 20) + (o.serve ? (112 << 20) : 0);   // DFlash2's own draft head and logits (serve: and the prompt staging)
+                        if (use_df2 && native_head.loaded()) mtp_b += df2_head_bytes() + (df2_solo ? (16 << 20) : ((48 << 20) + (o.serve ? (112 << 20) : 0)));   // DFlash2's own draft head and logits (serve: and the prompt staging)
 #endif
                         if (stages.empty())
                             for (const auto& d : slot_mtp) mtp_b += (int64_t) d->bind_bytes(native_head.row_bytes(), n_vocab);
@@ -9197,7 +9204,7 @@ int main(int argc, char** argv) {
             for (const auto& d : slot_mtp)
                 mtp_bind += (int64_t) d->bind_bytes(native_head.row_bytes(), n_vocab);
 #if defined(STRATA_HAVE_DFLASH2)
-        if (use_df2 && native_head.loaded()) mtp_bind += df2_head_bytes() + (48 << 20) + (o.serve ? (112 << 20) : 0);   // DFlash2's own draft head and logits (serve: and the prompt staging), bound after this
+        if (use_df2 && native_head.loaded()) mtp_bind += df2_head_bytes() + (df2_solo ? (16 << 20) : ((48 << 20) + (o.serve ? (112 << 20) : 0)));   // DFlash2's own draft head and logits (serve: and the prompt staging), bound after this
 #endif
         const int64_t reserve = (((int64_t) o.vram_reserve_mib + prefill_mib) << 20) + mtp_bind + pipe_first;
         const int64_t max_blob = (int64_t) nibble_max_slot_bytes();   // max_blob (STRATA_EXPERT_NIBBLE: or a larger 4-bit slot)

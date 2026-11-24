@@ -6361,6 +6361,39 @@
    "retired_in": ""
   },
   {
+   "name": "STRATA_DF2_KV_F32",
+   "backends": [
+    "cuda-hip"
+   ],
+   "reads": [
+    {
+     "file": "engine/include/strata/core/dflash2.hpp",
+     "line": 59,
+     "backend": "cuda-hip",
+     "fn": "getenv"
+    }
+   ],
+   "parse": "flag",
+   "default_state": "off",
+   "code_default": null,
+   "engine_sets": [],
+   "engine_defaults": [],
+   "launch_files": [],
+   "launch_sets": [],
+   "launch_reads": [],
+   "doc_mentions": [],
+   "first_commit": "",
+   "first_date": "",
+   "since": "",
+   "last_commit": "",
+   "last_date": "",
+   "status": "lab",
+   "owner": "core",
+   "note": "set 1 to store DFlash2 context K/V ring in FP32 instead of FP16 (default FP16 saves 40 MiB VRAM)",
+   "retire_after": "",
+   "retired_in": ""
+  },
+  {
    "name": "STRATA_DF2_LOG_MIB",
    "backends": [
     "cuda-hip",

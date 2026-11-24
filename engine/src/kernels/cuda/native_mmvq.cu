@@ -3819,6 +3819,156 @@ void native_mmvq(int ggml_type, const void* weights, const void* x_q8_1, float* 
     }
 }
 
+namespace {
+template<typename F, int NCOLS, int NW, int ROWS, bool TS = false>
+__launch_bounds__(NW * WARP, (ROWS <= 2 ? 4 : 1))
+__global__ void native_mmvq_indexed_kernel(const typename F::Block* __restrict__ w, const int32_t* __restrict__ row_map,
+                                           const Q81Block* __restrict__ x, float* __restrict__ y,
+                                           int n_in, int n_out) {
+    constexpr int BPI = F::BPI * NW / WARPS;
+    const int tid = WARP * int(threadIdx.y) + int(threadIdx.x);
+    const int row0 = ROWS * int(blockIdx.x);
+    int src_rows[ROWS];
+#pragma unroll
+    for (int i = 0; i < ROWS; ++i) src_rows[i] = (row0 + i < n_out) ? row_map[row0 + i] : 0;
+    const int blocks_per_row = n_in / F::DIV;
+    const int x_stride = n_in / Q8K;
+    float tmp[NCOLS][ROWS] = {};
+    for (int kbx = tid / F::T; kbx < blocks_per_row; kbx += BPI) {
+        const int kby = kbx * F::KBY;
+        const int kqs = F::kqs(tid);
+#pragma unroll
+        for (int i = 0; i < ROWS; ++i) {
+            if (row0 + i < n_out) {
+                const std::size_t block = std::size_t(src_rows[i]) * blocks_per_row + kbx;
+                const typename F::W wv = F::load(w + block, kqs);
+#pragma unroll
+                for (int j = 0; j < NCOLS; ++j)
+                    tmp[j][i] += F::apply(wv, x + std::size_t(j) * x_stride + kby, kqs);
+            }
+        }
+    }
+    __shared__ float partial[NW - 1 > 0 ? NW - 1 : 1][NCOLS][ROWS][WARP];
+    if (threadIdx.y > 0) {
+#pragma unroll
+        for (int j = 0; j < NCOLS; ++j)
+#pragma unroll
+            for (int i = 0; i < ROWS; ++i) partial[threadIdx.y - 1][j][i][threadIdx.x] = tmp[j][i];
+    }
+    __syncthreads();
+    if (threadIdx.y > 0) return;
+    if constexpr (TS) {
+        constexpr int V = NCOLS * ROWS, P = s26ts::pow2_ceil(V);
+        float v[P];
+#pragma unroll
+        for (int j = 0; j < NCOLS; ++j)
+#pragma unroll
+            for (int i = 0; i < ROWS; ++i) {
+#pragma unroll
+                for (int l = 0; l < NW - 1; ++l) tmp[j][i] += partial[l][j][i][threadIdx.x];
+                v[j * ROWS + i] = tmp[j][i];
+            }
+#pragma unroll
+        for (int k = V; k < P; ++k) v[k] = 0.0f;
+        const float sum = s26ts::tsum<P>(v, int(threadIdx.x));
+        const int k = s26ts::tsum_token<P>(int(threadIdx.x));
+        const int j = k / ROWS, i = k % ROWS;
+        if (int(threadIdx.x) == s26ts::tsum_lane<P>(k) && k < V && row0 + i < n_out) y[std::size_t(j) * n_out + row0 + i] = sum;
+        return;
+    }
+#pragma unroll
+    for (int j = 0; j < NCOLS; ++j) {
+#pragma unroll
+        for (int i = 0; i < ROWS; ++i) {
+#pragma unroll
+            for (int l = 0; l < NW - 1; ++l) tmp[j][i] += partial[l][j][i][threadIdx.x];
+            tmp[j][i] = warp_sum(tmp[j][i]);
+            if (threadIdx.x == i && row0 + i < n_out) y[std::size_t(j) * n_out + row0 + i] = tmp[j][i];
+        }
+    }
+}
+
+template<typename F, int NCOLS>
+void indexed_launch_cols(const typename F::Block* w, const int32_t* row_map, const Q81Block* x, float* y,
+                         int n_in, int n_out, cudaStream_t s) {
+    constexpr int NW = WARPS;
+    const bool use_rows1 = q8_0_rows1<F>(n_in, n_out);
+    const bool ts = s26_tsum_on();
+    if (use_rows1) {
+        const dim3 grid(unsigned(n_out), 1, 1);
+        const dim3 block(WARP, NW, 1);
+        if (ts)
+            native_mmvq_indexed_kernel<F, NCOLS, NW, 1, true><<<grid, block, 0, s>>>(w, row_map, x, y, n_in, n_out);
+        else
+            native_mmvq_indexed_kernel<F, NCOLS, NW, 1, false><<<grid, block, 0, s>>>(w, row_map, x, y, n_in, n_out);
+    } else {
+        constexpr int ROWS = 2;
+        const dim3 grid(unsigned((n_out + ROWS - 1) / ROWS), 1, 1);
+        const dim3 block(WARP, NW, 1);
+        if (ts)
+            native_mmvq_indexed_kernel<F, NCOLS, NW, ROWS, true><<<grid, block, 0, s>>>(w, row_map, x, y, n_in, n_out);
+        else
+            native_mmvq_indexed_kernel<F, NCOLS, NW, ROWS, false><<<grid, block, 0, s>>>(w, row_map, x, y, n_in, n_out);
+    }
+}
+
+template<typename F>
+void indexed_mmvq_dispatch(const void* weights, const int32_t* row_map, const void* x_q8_1, float* y,
+                           int n_in, int n_out, int ncols, void* stream) {
+    validate_shape(n_in, ncols, F::DIV);
+    if (n_out <= 0) throw std::invalid_argument("native MMVQ indexed requires n_out > 0");
+    validate_pointer(weights);
+    validate_pointer(row_map);
+    validate_pointer(x_q8_1);
+    validate_pointer(y);
+    validate_stream(stream);
+    const auto* w = static_cast<const typename F::Block*>(weights);
+    const auto* x = static_cast<const Q81Block*>(x_q8_1);
+    const auto s = static_cast<cudaStream_t>(stream);
+    switch (ncols) {
+    case 1: indexed_launch_cols<F, 1>(w, row_map, x, y, n_in, n_out, s); break;
+    case 2: indexed_launch_cols<F, 2>(w, row_map, x, y, n_in, n_out, s); break;
+    case 3: indexed_launch_cols<F, 3>(w, row_map, x, y, n_in, n_out, s); break;
+    case 4: indexed_launch_cols<F, 4>(w, row_map, x, y, n_in, n_out, s); break;
+    case 5: indexed_launch_cols<F, 5>(w, row_map, x, y, n_in, n_out, s); break;
+    case 6: indexed_launch_cols<F, 6>(w, row_map, x, y, n_in, n_out, s); break;
+    case 7: indexed_launch_cols<F, 7>(w, row_map, x, y, n_in, n_out, s); break;
+    default: indexed_launch_cols<F, 8>(w, row_map, x, y, n_in, n_out, s); break;
+    }
+    launch_check();
+}
+}  // namespace
+
+bool native_mmvq_indexed_supported(int ggml_type) noexcept {
+    return ggml_type == 2 || ggml_type == 8 || ggml_type == 11 ||
+           ggml_type == 12 || ggml_type == 13 || ggml_type == 14 || ggml_type == 20 || ggml_type == 23;
+}
+
+void native_mmvq_indexed(int ggml_type, const void* weights, const int32_t* row_map, const void* x_q8_1, float* y,
+                         int n_in, int n_out, int ncols, void* stream) {
+    if (ncols > 8) {
+        const std::size_t col_blocks = std::size_t(n_in / Q8K);
+        for (int j = 0; j < ncols; j += 8) {
+            const int nj = (ncols - j < 8) ? (ncols - j) : 8;
+            native_mmvq_indexed(ggml_type, weights, row_map,
+                                static_cast<const Q81Block*>(x_q8_1) + std::size_t(j) * col_blocks,
+                                y + std::size_t(j) * std::size_t(n_out), n_in, n_out, nj, stream);
+        }
+        return;
+    }
+    switch (ggml_type) {
+    case 2:  indexed_mmvq_dispatch<SmallTraits<Q40Block, 4>>(weights, row_map, x_q8_1, y, n_in, n_out, ncols, stream); break;
+    case 8:  indexed_mmvq_dispatch<SmallTraits<Q80Block, 8>>(weights, row_map, x_q8_1, y, n_in, n_out, ncols, stream); break;
+    case 11: indexed_mmvq_dispatch<Q3KTraits>(weights, row_map, x_q8_1, y, n_in, n_out, ncols, stream); break;
+    case 12: indexed_mmvq_dispatch<Q4KTraits>(weights, row_map, x_q8_1, y, n_in, n_out, ncols, stream); break;
+    case 13: indexed_mmvq_dispatch<Q5KTraits>(weights, row_map, x_q8_1, y, n_in, n_out, ncols, stream); break;
+    case 14: indexed_mmvq_dispatch<Q6KTraits>(weights, row_map, x_q8_1, y, n_in, n_out, ncols, stream); break;
+    case 20: indexed_mmvq_dispatch<SmallTraits<IQ4NLBlock, 4>>(weights, row_map, x_q8_1, y, n_in, n_out, ncols, stream); break;
+    case 23: indexed_mmvq_dispatch<IQ4XSTraits>(weights, row_map, x_q8_1, y, n_in, n_out, ncols, stream); break;
+    default: throw std::invalid_argument("unsupported native MMVQ indexed GGML type");
+    }
+}
+
 #if !defined(__HIPCC__)
 std::size_t native_q8_1_il_bytes(int n_in, int ncols) {
     validate_shape(n_in, ncols);
