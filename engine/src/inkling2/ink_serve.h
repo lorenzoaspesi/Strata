@@ -491,7 +491,7 @@ struct ServeConfig {
     std::string draft_mode = "auto";  // auto | dspark | off
     bool force_cpu = false;
     bool anti_loop = true;
-    std::string version = "0.1.67";
+    std::string version = "0.1.69";
     int64_t conversation_cache_mib = 0;   // --conversation-cache-mib N (RAM LRU tier)
     int64_t conversation_spill_mib = 0;   // --conversation-spill-mib M (ephemeral SSD spill tier)
     std::string conversation_spill_dir;   // --conversation-spill-dir DIR
