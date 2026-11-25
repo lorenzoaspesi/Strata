@@ -500,18 +500,30 @@ int64_t ExpertCache::slots_within(int64_t bytes) const {
     return (int64_t) (std::upper_bound(off_.begin() + 1, off_.end(), (uint64_t) bytes) - (off_.begin() + 1));
 }
 
-bool ExpertCache::shrink(int64_t keep_bytes, std::string& err) {
+int64_t ExpertCache::shrink_keep_segments(const std::vector<int64_t>& seg_sizes, int64_t keep_bytes, bool round_down) {
+    int64_t keep = 0, at = 0;
+    if (keep_bytes <= 0) return 0;
+    if (round_down) {
+        while (keep < (int64_t) seg_sizes.size() && at + seg_sizes[(size_t) keep] <= keep_bytes)
+            at += seg_sizes[(size_t) keep++];
+    } else {
+        while (keep < (int64_t) seg_sizes.size() && at < keep_bytes) at += seg_sizes[(size_t) keep++];
+    }
+    return keep;
+}
+
+bool ExpertCache::shrink(int64_t keep_bytes, std::string& err, bool round_down) {
     if (segs_.empty()) {
         err = "the expert cache is not segmented (the engine needs --vram-elastic)";
         return false;
     }
 #if defined(STRATA_EC_NO_VMM)
     (void) keep_bytes;
+    (void) round_down;
     return false;
 #else
     const Vmm& v = vmm();
-    int64_t keep = 0, at = 0;   // the segments [0, keep) hold the first keep_bytes
-    while (keep < (int64_t) segs_.size() && at < keep_bytes) at += seg_size_[(size_t) keep++];
+    const int64_t keep = shrink_keep_segments(seg_size_, keep_bytes, round_down);
     if (keep >= mapped_segs_) return true;
     if (cudaDeviceSynchronize() != cudaSuccess) {
         err = std::string("the device failed before the cache shrank: ") + cudaGetErrorString(cudaGetLastError());

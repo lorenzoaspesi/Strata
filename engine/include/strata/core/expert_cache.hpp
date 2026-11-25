@@ -138,10 +138,13 @@ public:
     int64_t segment_bytes() const { return seg_; }
     /// Bytes of the arena backed by VRAM now (a whole number of segments; the arena when not segmented).
     int64_t mapped_bytes() const;
-    /// Unmaps every segment past the first `keep_bytes` (rounded UP to a segment boundary): `slots()` becomes the
-    /// slots wholly inside what stays.  Waits for the device first.  False with `err` when not segmented or a driver
-    /// call failed.
-    bool shrink(int64_t keep_bytes, std::string& err);
+    /// Number of leading segments to keep for `keep_bytes`: rounded UP by default (never drops below `keep_bytes`),
+    /// or rounded DOWN when `round_down` is true (guarantees `mapped_after <= keep_bytes`, e.g. idle vision drain).
+    static int64_t shrink_keep_segments(const std::vector<int64_t>& seg_sizes, int64_t keep_bytes, bool round_down);
+    /// Unmaps every segment past the first `keep_bytes` (rounded UP to a segment boundary, or DOWN when `round_down`
+    /// is true): `slots()` becomes the slots wholly inside what stays.  Waits for the device first.  False with `err`
+    /// when not segmented or a driver call failed.
+    bool shrink(int64_t keep_bytes, std::string& err, bool round_down = false);
     /// Maps segments again up to `want_bytes` (rounded DOWN to a segment, at most the arena; the last, shorter
     /// segment only when `want_bytes` covers the arena).  Stops at the first segment the driver cannot back (false,
     /// `err`: what was mapped by then stays).  The new slots are empty until the caller fills them.

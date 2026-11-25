@@ -29,6 +29,7 @@ All benchmark runs use the harness [tools/gyro_bench.py](../tools/gyro_bench.py)
 | **P2** | `114` | Code Generation | *"Write a C++20 header-only ring buffer class template RingBuffer<T, N> with lock-free single-producer single-consumer push and pop using std::atomic acquire/release memory ordering. Include full implementation and brief comments."* |
 | **P3** | `3,383` | Medium Prefill (~3.4K) | `build_long_spec(32)` in `tools/gyro_bench.py`: 32 deterministic numbered subsystem specification sections + *"Summarize the top 5 architectural bottlenecks in the specification above and propose one concrete mitigation for each."* |
 | **P4** | `33,232` | Long Prefill (>32K + KV Streaming) | `build_long_spec(320)` in `tools/gyro_bench.py`: 320 deterministic numbered subsystem specification sections (>32K context, 4x larger than the 8,192-token VRAM KV ring so KV streaming from pinned RAM is exercised) + the same 5-bottleneck summary question. |
+| **V1** | `~1,003` | Vision Encode (`1280x720` PNG) | Deterministic `1280x720` 4-quadrant RGB PNG generated in `tools/gyro_bench.py` (top-left 4 pixels stamped with run nonce under `--fresh` to bypass `.sve` image cache) + *"Describe the geometric shapes and colors in this image concisely."* (`max_tokens=64`). Run **after P4** to verify GPU vision swap succeeds even with long-context verify graphs resident. |
 
 ---
 
@@ -41,8 +42,8 @@ All benchmark runs use the harness [tools/gyro_bench.py](../tools/gyro_bench.py)
 systemctl --user restart strata.service
 /home/lori/.local/bin/strata runtime status --profile launch-gyro-m-256k
 
-# Run full P1–P4 suite (reads api_key from launch JSON without printing it)
-python3 tools/gyro_bench.py --model m --prompts P1,P2,P3,P4 --fresh
+# Run full P1–P4 + V1 suite (reads api_key from launch JSON without printing it)
+python3 tools/gyro_bench.py --model m --prompts P1,P2,P3,P4,V1 --fresh
 ```
 
 ### 3.2 Benchmark Gyro-S (`launch-gyro-s-256k`)
@@ -51,7 +52,7 @@ python3 tools/gyro_bench.py --model m --prompts P1,P2,P3,P4 --fresh
 # Stop Gyro-M so the 8 GiB GPU is free, start Gyro-S, benchmark, then restore Gyro-M
 systemctl --user stop strata.service
 STRATA_ENGINE_BACKEND=cuda /home/lori/.local/bin/strata runtime start --profile launch-gyro-s-256k
-python3 tools/gyro_bench.py --model s --prompts P1,P2,P3,P4 --fresh
+python3 tools/gyro_bench.py --model s --prompts P1,P2,P3,P4,V1 --fresh
 /home/lori/.local/bin/strata runtime stop --profile launch-gyro-s-256k
 systemctl --user start strata.service
 ```
@@ -72,7 +73,8 @@ The harness parses the engine log (`gyro-{m,s}-256k.engine.log`) after each requ
 | :--- | :--- | :---: | :---: | :---: | :---: | :---: | :---: |
 | `0.1.67.100` (pre-VRAM-opt) | `--kv-resident 20480`, BF16 draft head, BF16 DFlash2 KV | 701 (`0.85 GiB`) | 256 | — / `17.2 tok/s` *(legacy 74t)* | — | — | — |
 | `0.1.69.100` (`2a40b2eb8`, baseline) | Tier 1 (`--kv-resident 8192`, warm=0) + indexed draft head + FP16 DFlash2 KV | 1,045 (`1.27 GiB`) | 1024 | `83.9` / `22.4 tok/s`<br>*(69.7% hit, 71/83)* | `82.5` / `25.6 tok/s`<br>*(66.7% hit, 91/103)* | `279.5` / `20.4 tok/s`<br>*(59.4% hit, 78/100)* | — |
-| `0.1.69.100` + `rows_tqk_split` | Same Gyro-M config + `vision.exe` updated to `0.1.69.100` | 1,045 (`1.27 GiB`) | 1024 | `88.3` / `22.1 tok/s`<br>*(64.8% hit, 78/95)* | `82.4` / `26.5 tok/s`<br>*(66.2% hit, 92/98)* | `282.9` / `21.0 tok/s`<br>*(65.1% hit, 75/93)* | **`279.4` / `20.6 tok/s`**<br>*(59.9% hit, 82/103, 126.9s)* |
+| `0.1.69.100` + `rows_tqk_split` (`21d19ea88`) | Same Gyro-M config + `vision.exe` updated to `0.1.69.100` | 1,045 (`1.27 GiB`) | 1024 | `88.3` / `22.1 tok/s`<br>*(64.8% hit, 78/95)* | `82.4` / `26.5 tok/s`<br>*(66.2% hit, 92/98)* | `282.9` / `21.0 tok/s`<br>*(65.1% hit, 75/93)* | **`279.4` / `20.6 tok/s`**<br>*(59.9% hit, 82/103, 126.9s)* |
+| `0.1.69.100` + elastic drain round-down | `ExpertCache::shrink(..., round_down=true)` on `VRAM ... drain`; verified `V1` (`1280x720`) immediately after `P4` | 1,045 (`1.27 GiB`) | 1024 | — | — | — | **`280.1` / `20.6 tok/s`**<br>**V1 (`1,003t`):** `280.4` / `23.1 tok/s`, swap `93 ms`, drain `0` slots (`1,484 MiB` free), restored `1,302/1,301 MiB`, `8.1s` wall |
 
 ### 4.2 Gyro-S (`Qwen3.8-Flash-Next-Gyro-S-TQ1_0.gguf`)
 

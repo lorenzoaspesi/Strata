@@ -266,6 +266,48 @@ class VisionSwapTests(unittest.TestCase):
         self.assertEqual(eng.vram_asks, [1286, 1542, 0])
         self.assertTrue(vision.sleeping)
 
+    def test_swap_vram_passes_drain_true_on_shrink_and_false_on_restore(self):
+        fake_exe = self._write_fake_vision_exe()
+        mmproj = self.root / "mmproj.gguf"
+        model = self.root / "model.gguf"
+        mmproj.write_bytes(b"GGUF")
+        model.write_bytes(b"GGUF")
+
+        tok = srv.ByteTokenizer()
+
+        class DrainRecorderEngine(srv.MockEngine):
+            def __init__(self):
+                super().__init__(tok, ["ok"], max_context=65536)
+                self.calls: list[tuple[int, bool]] = []
+
+            def alive(self) -> bool:
+                return True
+
+            def vram(self, reserve_mib: int | None, timeout: float = 120.0, device: int | None = None, drain: bool = False) -> dict:
+                r = 0 if reserve_mib is None else int(reserve_mib)
+                self.calls.append((r, bool(drain)))
+                return {"expert_cache_mib": 0 if drain else 1301, "expert_cache_full_mib": 1301}
+
+        vision = srv.Vision(
+            {
+                "exe": str(fake_exe),
+                "mmproj": str(mmproj),
+                "model": str(model),
+                "gpu": True,
+                "swap_vram": True,
+            }
+        )
+        self.addCleanup(vision.unload)
+        eng = DrainRecorderEngine()
+        svc = srv.Service(eng, tok, ChatTemplate(Path(srv.__file__).resolve().parent / "chat_template.jinja"), vision=vision)
+
+        img_file = self.root / "pic_drain.png"
+        img_file.write_bytes(PNG_1X1)
+        msgs = [{"role": "user", "content": [{"type": "image", "source": str(img_file)}, {"type": "text", "text": "Hi"}]}]
+        svc.prepare(msgs, None, {}, max_new=16, cancel=threading.Event())
+        self.assertEqual(eng.calls, [(1286, True), (0, False)])
+        self.assertTrue(vision.sleeping)
+
 
 if __name__ == "__main__":
     unittest.main()

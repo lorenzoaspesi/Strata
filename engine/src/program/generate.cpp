@@ -16684,7 +16684,7 @@ int main(int argc, char** argv) {
                         keep = floor_b;
                         if (!drain) note = " (a cache keeps its smallest size: the prompt path's buffers)";
                     }
-                    const bool shrunk = cd.c->shrink(keep, e);
+                    const bool shrunk = cd.c->shrink(keep, e, drain);
                     strata::core::evict_slots_past(host_res, cd.c->slots(), cd.lo, cd.hi, g.n_expert, vram_evicted);
                     if (!shrunk) { relend(); res_upload(); return false; }
                 } else if (mapped < cd.c->full_bytes()) {
