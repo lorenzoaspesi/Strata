@@ -273,6 +273,68 @@ void rows_tq2_gather(const int16_t* table, const uint8_t* w, size_t row_bytes, i
     }
 }
 
+// Specialized bit-exact TQK6 (KB=6) / TQK7 (KB=7) AVX2 kernel: rows4 scalar-indexed loads split into
+// two 64-weight halves to prevent YMM register spills, with compile-time NT specialization.
+// Bit-for-bit identical to rows_t<KB>.
+template <int KB, int NT_CONST>
+void rows_tqk_split(const int16_t* table, const uint8_t* w, size_t row_bytes, int n, const TqAct* const* a, int nt_rt,
+                    float* const* out, int r0, int r1) {
+    const int nt = (NT_CONST > 0) ? NT_CONST : nt_rt;
+    const int nb = n / 128;
+    constexpr size_t bsz = 2 + 4 * KB;
+    const long long* tab = (const long long*) table;
+    auto load4 = [tab](const uint8_t* qs, uint64_t wr, int base) {
+        return rows4(tab, tq_state<KB>(qs, wr, base + 0), tq_state<KB>(qs, wr, base + 1),
+                     tq_state<KB>(qs, wr, base + 2), tq_state<KB>(qs, wr, base + 3));
+    };
+    for (int r = r0; r < r1; ++r) {
+        const uint8_t* x = w + (size_t) r * row_bytes;
+        __m128 acc[NT_CONST > 0 ? NT_CONST : kTqMaxTokens];
+        for (int t = 0; t < nt; ++t) acc[t] = _mm_setzero_ps();
+        for (int i = 0; i < nb; ++i) {
+            const uint8_t* blk = x + (size_t) i * bsz;
+            const uint8_t* qs = blk + 2;
+            const uint64_t wr = tq_wrap<KB>(qs);
+            const __m128 dx = _mm_set1_ps(tq_half_to_float(tq_ld16(blk)));
+
+            const __m256i w0 = load4(qs, wr, 0);
+            const __m256i w1 = load4(qs, wr, 4);
+            const __m256i w2 = load4(qs, wr, 8);
+            const __m256i w3 = load4(qs, wr, 12);
+            __m256i lo_h[NT_CONST > 0 ? NT_CONST : kTqMaxTokens];
+            for (int t = 0; t < nt; ++t) {
+                const __m256i* q = (const __m256i*) (a[t]->q + 128 * i);
+                const __m256i p0 = _mm256_add_epi32(_mm256_madd_epi16(w0, _mm256_load_si256(q + 0)),
+                                                    _mm256_madd_epi16(w1, _mm256_load_si256(q + 1)));
+                const __m256i p1 = _mm256_add_epi32(_mm256_madd_epi16(w2, _mm256_load_si256(q + 2)),
+                                                    _mm256_madd_epi16(w3, _mm256_load_si256(q + 3)));
+                lo_h[t] = _mm256_hadd_epi32(p0, p1);
+            }
+
+            const __m256i w4 = load4(qs, wr, 16);
+            const __m256i w5 = load4(qs, wr, 20);
+            const __m256i w6 = load4(qs, wr, 24);
+            const __m256i w7 = load4(qs, wr, 28);
+            for (int t = 0; t < nt; ++t) {
+                const __m256i* q = (const __m256i*) (a[t]->q + 128 * i);
+                const __m256i p2 = _mm256_add_epi32(_mm256_madd_epi16(w4, _mm256_load_si256(q + 4)),
+                                                    _mm256_madd_epi16(w5, _mm256_load_si256(q + 5)));
+                const __m256i p3 = _mm256_add_epi32(_mm256_madd_epi16(w6, _mm256_load_si256(q + 6)),
+                                                    _mm256_madd_epi16(w7, _mm256_load_si256(q + 7)));
+                const __m256i h = _mm256_hadd_epi32(lo_h[t], _mm256_hadd_epi32(p2, p3));
+                const __m128i s = _mm_add_epi32(_mm256_castsi256_si128(h), _mm256_extracti128_si256(h, 1));
+                const __m128 sc = _mm_mul_ps(dx, _mm_loadu_ps(a[t]->d + 4 * i));
+                acc[t] = _mm_fmadd_ps(_mm_cvtepi32_ps(s), sc, acc[t]);
+            }
+        }
+        for (int t = 0; t < nt; ++t) {
+            alignas(16) float v[4];
+            _mm_store_ps(v, acc[t]);
+            out[t][r] = ((v[0] + v[1]) + (v[2] + v[3])) * (1.0f / 8192.0f);
+        }
+    }
+}
+
 void tq_rows_avx2(int kb, const int16_t* table, const uint8_t* w, size_t row_bytes, int n, const TqAct* const* a, int nt,
                   float* const* out, int r0, int r1) {
     if (kb == 8) {
@@ -280,11 +342,21 @@ void tq_rows_avx2(int kb, const int16_t* table, const uint8_t* w, size_t row_byt
         else if (nt == 2) rows_tq2_gather<2>(table, w, row_bytes, n, a, 2, out, r0, r1);
         else if (nt == 4) rows_tq2_gather<4>(table, w, row_bytes, n, a, 4, out, r0, r1);
         else rows_tq2_gather<0>(table, w, row_bytes, n, a, nt, out, r0, r1);
+    } else if (kb == 6) {
+        if (nt == 1) rows_tqk_split<6, 1>(table, w, row_bytes, n, a, 1, out, r0, r1);
+        else if (nt == 2) rows_tqk_split<6, 2>(table, w, row_bytes, n, a, 2, out, r0, r1);
+        else if (nt == 4) rows_tqk_split<6, 4>(table, w, row_bytes, n, a, 4, out, r0, r1);
+        else rows_tqk_split<6, 0>(table, w, row_bytes, n, a, nt, out, r0, r1);
+    } else if (kb == 5) {
+        rows_t<5>(table, w, row_bytes, n, a, nt, out, r0, r1);   // experimental TQK5X
+    } else if (kb == 4) {
+        rows_t<4>(table, w, row_bytes, n, a, nt, out, r0, r1);   // experimental TQK4X
+    } else {
+        if (nt == 1) rows_tqk_split<7, 1>(table, w, row_bytes, n, a, 1, out, r0, r1);
+        else if (nt == 2) rows_tqk_split<7, 2>(table, w, row_bytes, n, a, 2, out, r0, r1);
+        else if (nt == 4) rows_tqk_split<7, 4>(table, w, row_bytes, n, a, 4, out, r0, r1);
+        else rows_tqk_split<7, 0>(table, w, row_bytes, n, a, nt, out, r0, r1);
     }
-    else if (kb == 6) rows_t<6>(table, w, row_bytes, n, a, nt, out, r0, r1);
-    else if (kb == 5) rows_t<5>(table, w, row_bytes, n, a, nt, out, r0, r1);   // experimental TQK5X
-    else if (kb == 4) rows_t<4>(table, w, row_bytes, n, a, nt, out, r0, r1);   // experimental TQK4X
-    else rows_t<7>(table, w, row_bytes, n, a, nt, out, r0, r1);
 }
 
 }  // namespace strata::kernels::cpu::tq_detail
